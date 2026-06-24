@@ -1,0 +1,498 @@
+{% extends "base.html" %}
+{% block title %}仪表盘{% endblock %}
+{% block content %}
+
+<style>
+/* ================================================================
+   DASHBOARD PAGE STYLES
+   ================================================================ */
+
+/* Page header */
+.dash-header {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+}
+.dash-header h1 {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text);
+}
+.dash-header .sub {
+    font-size: 13px;
+    color: var(--text-muted);
+}
+.dash-header .export-btn {
+    display: inline-block;
+    padding: 5px 12px;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    font-weight: 600;
+    background: var(--success);
+    color: #fff !important;
+    border: 1px solid var(--success);
+    cursor: pointer;
+    white-space: nowrap;
+    text-decoration: none;
+    transition: background var(--transition-fast);
+}
+.dash-header .export-btn:hover {
+    background: #059669 !important;
+    text-decoration: none !important;
+}
+
+/* Stats row for dashboard */
+.stats-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+}
+.stat-card {
+    --accent: var(--primary);
+    background: var(--card);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    box-shadow: var(--shadow);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    transition: transform var(--transition-base), box-shadow var(--transition-base);
+    cursor: default;
+}
+.stat-card:hover {
+    transform: translateY(-3px);
+    box-shadow: var(--shadow-lg);
+}
+.stat-icon {
+    width: 44px;
+    height: 44px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    flex-shrink: 0;
+}
+.stat-body { min-width: 0; }
+.stat-body .num {
+    font-size: 24px;
+    font-weight: 800;
+    font-family: var(--font-mono);
+    line-height: 1.2;
+    color: var(--text);
+}
+.stat-body .label {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-top: 2px;
+}
+
+/* Table header row */
+.table-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+}
+.table-header h2 { font-size: 15px; font-weight: 700; }
+.table-header .count {
+    font-size: 11px;
+    color: var(--text-muted);
+    background: var(--bg);
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-weight: 600;
+}
+
+/* Live session card */
+.card-live {
+    position: relative;
+    border-left: 3px solid var(--success);
+    background: linear-gradient(135deg, #f0fdf4, var(--card) 50%);
+    overflow: hidden;
+}
+.card-live::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 140px;
+    height: 140px;
+    background: radial-gradient(circle, rgba(16,185,129,0.06) 0%, transparent 70%);
+    pointer-events: none;
+}
+.live-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+}
+.live-dot {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--success);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+.live-dot .dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--success);
+    animation: pulse-dot 1.5s ease-in-out infinite;
+}
+@keyframes pulse-dot {
+    0%, 100% { opacity: 1; transform: scale(1); box-shadow: 0 0 0 0 rgba(16,185,129,0.5); }
+    50% { opacity: 0.5; transform: scale(1.2); box-shadow: 0 0 0 5px rgba(16,185,129,0); }
+}
+.live-header .anchor-name {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text);
+}
+.live-header .room-tag {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    background: var(--bg);
+    padding: 2px 10px;
+    border-radius: var(--radius-sm);
+}
+.live-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 14px;
+    position: relative;
+    z-index: 1;
+}
+.live-stat .lbl {
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 500;
+    display: block;
+    margin-bottom: 2px;
+}
+.live-stat .val {
+    font-weight: 700;
+    font-size: 16px;
+    font-family: var(--font-mono);
+}
+
+/* Grade / fans badges */
+.grade-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    background: var(--primary-light);
+    color: var(--primary-dark);
+}
+.fans-club-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    background: #f1f5f9;
+    color: #475569;
+    max-width: 100px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Clickable session rows */
+.row-session { cursor: pointer; }
+.row-session td { transition: background var(--transition-fast); }
+.row-session:hover td { background: var(--primary-light) !important; }
+.row-session td:last-child {
+    position: relative;
+    padding-right: 32px;
+}
+.row-session td:last-child::after {
+    content: '\2192';
+    position: absolute;
+    right: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--text-muted);
+    opacity: 0;
+    transition: opacity var(--transition-fast), transform var(--transition-fast);
+    font-size: 13px;
+}
+.row-session:hover td:last-child::after {
+    opacity: 0.35;
+    transform: translateY(-50%) translateX(3px);
+}
+
+/* Chat message truncation */
+.chat-msg {
+    max-width: 360px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: block;
+}
+
+/* Empty state inside cards */
+.card-empty {
+    text-align: center;
+    padding: 30px 12px;
+    color: var(--text-muted);
+    font-size: 13px;
+}
+.card-empty .icon {
+    font-size: 28px;
+    margin-bottom: 6px;
+    opacity: 0.45;
+}
+.card-empty .hint {
+    font-size: 12px;
+    opacity: 0.65;
+    margin-top: 4px;
+}
+
+/* DB Path footer */
+.db-footer {
+    text-align: center;
+    padding: 20px 0 10px;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    opacity: 0.6;
+}
+
+/* Responsive */
+@media (max-width: 900px) {
+    .stats-row { grid-template-columns: repeat(3, 1fr); }
+    .chat-msg { max-width: 220px; }
+}
+@media (max-width: 640px) {
+    .dash-header { margin-bottom: 16px; padding-bottom: 12px; }
+    .dash-header h1 { font-size: 18px; }
+    .stats-row { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .stat-card { padding: 12px 14px; gap: 10px; }
+    .stat-icon { width: 36px; height: 36px; font-size: 16px; }
+    .stat-body .num { font-size: 20px; }
+    .live-grid { grid-template-columns: repeat(2, 1fr); }
+    .chat-msg { max-width: 140px; }
+    .row-session td:last-child { padding-right: 24px; }
+}
+</style>
+
+<!-- Page Header -->
+<div class="dash-header">
+    <h1>仪表盘</h1>
+    <span class="sub">直播数据概览</span>
+    <div style="margin-left:auto;display:flex;gap:8px;">
+        <a href="/api/leaderboard/csv?period=session&threshold=1000" class="export-btn">&#x2B06; 导出积分榜</a>
+        <a href="/api/sessions/csv" class="export-btn">&#x2B06; 导出场次</a>
+    </div>
+</div>
+
+<!-- Stats Row -->
+<div class="stats-row">
+    <div class="stat-card" style="--accent: #e11d48;">
+        <div class="stat-icon" style="background: #ffe4e6;">&#127873;</div>
+        <div class="stat-body">
+            <div class="num">{{ stats.total_gifts }}</div>
+            <div class="label">总礼物</div>
+        </div>
+    </div>
+    <div class="stat-card" style="--accent: #2563eb;">
+        <div class="stat-icon" style="background: #dbeafe;">&#128172;</div>
+        <div class="stat-body">
+            <div class="num">{{ stats.total_chats }}</div>
+            <div class="label">总弹幕</div>
+        </div>
+    </div>
+    <div class="stat-card" style="--accent: #d97706;">
+        <div class="stat-icon" style="background: #fef3c7;">&#128200;</div>
+        <div class="stat-body">
+            <div class="num">{{ stats.today_gifts }}</div>
+            <div class="label">今日礼物</div>
+        </div>
+    </div>
+    <div class="stat-card" style="--accent: #059669;">
+        <div class="stat-icon" style="background: #d1fae5;">&#128173;</div>
+        <div class="stat-body">
+            <div class="num">{{ stats.today_chats }}</div>
+            <div class="label">今日弹幕</div>
+        </div>
+    </div>
+    <div class="stat-card" style="--accent: #7c3aed;">
+        <div class="stat-icon" style="background: #ede9fe;">&#128101;</div>
+        <div class="stat-body">
+            <div class="num">{{ stats.today_users }}</div>
+            <div class="label">今日用户</div>
+        </div>
+    </div>
+    <div class="stat-card" style="--accent: #475569;">
+        <div class="stat-icon" style="background: #f1f5f9;">&#128203;</div>
+        <div class="stat-body">
+            <div class="num">{{ stats.total_sessions }}</div>
+            <div class="label">总场次</div>
+        </div>
+    </div>
+</div>
+
+<!-- Current Live Session -->
+{% if session %}
+<div class="card card-live">
+    <div class="live-header">
+        <span class="live-dot"><span class="dot"></span>直播中</span>
+        <span class="anchor-name">{{ session.anchor_name }}</span>
+        <span class="room-tag">房间 {{ session.room_id }}</span>
+    </div>
+    <div class="live-grid">
+        <div class="live-stat">
+            <span class="lbl">开始时间</span>
+            <span class="val">{{ session.start_time }}</span>
+        </div>
+        <div class="live-stat">
+            <span class="lbl">礼物收入</span>
+            <span class="val">{{ session.total_gifts or 0 }}</span>
+        </div>
+        <div class="live-stat">
+            <span class="lbl">弹幕数</span>
+            <span class="val">{{ session.total_chats or 0 }}</span>
+        </div>
+        <div class="live-stat">
+            <span class="lbl">千分榜</span>
+            <span class="val">{{ session.user_count or 0 }}</span>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<!-- TOP 10 Contributors -->
+{% if top_users %}
+<div class="card">
+    <div class="table-header">
+        <h2>TOP 10 贡献者</h2>
+        <span class="count">{{ top_users|length }} 人</span>
+    </div>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th style="width:44px;">#</th>
+                    <th>用户</th>
+                    <th>财富等级</th>
+                    <th>粉丝团</th>
+                    <th style="text-align:right;">贡献值</th>
+                    <th style="text-align:right;">&#127873;</th>
+                    <th style="text-align:right;">&#128172;</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for u in top_users %}
+                <tr>
+                    <td>
+                        {% if loop.index == 1 %}
+                        <span class="rank-1">#1</span>
+                        {% elif loop.index == 2 %}
+                        <span class="rank-2">#2</span>
+                        {% elif loop.index == 3 %}
+                        <span class="rank-3">#3</span>
+                        {% else %}
+                        <span style="color:var(--text-muted);font-weight:600;">#{{ loop.index }}</span>
+                        {% endif %}
+                    </td>
+                    <td><a href="/user?uid={{ u.user_id }}" style="font-weight:600;">{{ u.user_name }}</a></td>
+                    <td>
+                        {% if u.grade %}
+                        <span class="grade-badge">{{ u.grade }}</span>
+                        {% else %}
+                        <span class="text-muted">-</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if u.fans_club %}
+                        <span class="fans-club-badge" title="{{ u.fans_club }}">{{ u.fans_club }}</span>
+                        {% else %}
+                        <span class="text-muted">-</span>
+                        {% endif %}
+                    </td>
+                    <td style="text-align:right;font-weight:700;font-family:var(--font-mono);">{{ u.consume }}</td>
+                    <td style="text-align:right;">{{ u.gift_count }}</td>
+                    <td style="text-align:right;">{{ u.chat_count }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% else %}
+<div class="card">
+    <div class="card-empty">
+        <div class="icon">&#127942;</div>
+        <div>暂无贡献数据</div>
+        <div class="hint">直播开始后，贡献者排行将在此显示</div>
+    </div>
+</div>
+{% endif %}
+
+<!-- Recent Sessions -->
+<div class="card">
+    <div class="table-header">
+        <h2>最近场次</h2>
+        <span class="count">{{ sessions|length }} 场</span>
+    </div>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th style="width:50px;">#</th>
+                    <th>主播</th>
+                    <th>开始时间</th>
+                    <th style="text-align:right;">&#127873;</th>
+                    <th style="text-align:right;">&#128172;</th>
+                    <th style="width:90px;">状态</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for s in sessions %}
+                <tr class="row-session" onclick="window.location='/session/{{ s.id }}'">
+                    <td style="font-weight:700;font-family:var(--font-mono);">{{ s.id }}</td>
+                    <td>{{ s.anchor_name or s.room_id }}</td>
+                    <td style="color:var(--text-muted);font-size:12px;font-family:var(--font-mono);white-space:nowrap;">{{ (s.start_time or '')[:16] }}</td>
+                    <td style="text-align:right;font-family:var(--font-mono);">{{ s.total_gifts or 0 }}</td>
+                    <td style="text-align:right;font-family:var(--font-mono);">{{ s.total_chats or 0 }}</td>
+                    <td>
+                        {% if s.status == 'live' %}
+                        <span class="badge badge-green">直播中</span>
+                        {% else %}
+                        <span class="badge badge-blue">已结束</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="6" style="text-align:center;color:var(--text-muted);padding:24px;">暂无场次记录</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- DB Path -->
+<div class="db-footer">&#128193; {{ db_path }}</div>
+
+{% endblock %}

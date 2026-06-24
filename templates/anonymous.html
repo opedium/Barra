@@ -1,0 +1,195 @@
+{% extends "base.html" %}
+{% block title %}神秘人查询{% endblock %}
+{% block content %}
+<style>
+/* ── Anonymous Page Styles ── */
+.anon-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    margin-bottom: 12px;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+.anon-header h2 { margin-bottom: 4px; }
+.anon-header .sub {
+    font-size: 13px;
+    color: var(--text-muted);
+    font-weight: 400;
+    line-height: 1.6;
+}
+.anon-header .sub strong { color: var(--primary); }
+
+/* ── Search Bar ── */
+.anon-search {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+}
+.anon-search input {
+    flex: 1;
+    min-width: 200px;
+    max-width: 400px;
+    padding: 8px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    background: var(--card);
+    color: var(--text);
+    outline: none;
+    transition: border-color .15s, box-shadow .15s;
+}
+.anon-search input:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px var(--primary-glow);
+}
+.anon-search input::placeholder { color: var(--text-muted); }
+.anon-search button {
+    padding: 8px 18px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: var(--primary);
+    color: #fff;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    transition: background .15s, transform .1s;
+    white-space: nowrap;
+    line-height: 1;
+}
+.anon-search button:hover { background: var(--primary-dark); }
+.anon-search button:active { transform: scale(0.96); }
+.anon-search .btn-outline {
+    background: var(--card);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+}
+.anon-search .btn-outline:hover {
+    background: var(--bg);
+    border-color: var(--text-muted);
+    color: var(--text);
+}
+
+/* ── Table Column Refinements ── */
+#data-table th:first-child,
+#data-table td:first-child { text-align: center; width: 48px; }
+#data-table td:nth-child(2) { font-weight: 500; }
+#data-table td:nth-child(3) { font-family: var(--font-mono); font-size: 12px; }
+#data-table td:nth-child(4) { text-align: right; font-weight: 600; }
+#data-table td:nth-child(5) { text-align: center; }
+#data-table td:nth-child(6) { font-size: 12px; color: var(--text-muted); }
+
+/* ── Anonymous Label Badge ── */
+.anon-badge {
+    display: inline-block;
+    background: linear-gradient(135deg, var(--primary-light), #e0e7ff);
+    color: var(--primary-dark);
+    padding: 2px 12px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: .01em;
+}
+
+/* ── Empty State Icon ── */
+.empty-icon {
+    font-size: 32px;
+    opacity: 0.4;
+    display: block;
+    margin-bottom: 4px;
+}
+</style>
+
+<div class="card">
+    <div class="anon-header">
+        <div>
+            <h2>🎭 神秘人查询</h2>
+            <div class="sub">
+                神秘人由抖音分配匿名名称，后台仍可追踪真实 <strong>user_id</strong>。
+            </div>
+        </div>
+    </div>
+
+    <div class="anon-search">
+        <input type="text" id="anon-search-input" placeholder="搜索匿名名或真实ID..." autocomplete="off">
+        <button onclick="loadData()">🔍 搜索</button>
+        <button onclick="clearSearch()" class="btn-outline">✕ 清除</button>
+        <button onclick="exportCSV()" style="background:var(--success);color:#fff;border-color:var(--success);font-weight:600;">&#x2B06; 导出CSV</button>
+    </div>
+
+    <div class="table-wrap">
+        <table id="data-table" style="display:none;">
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>匿名显示名</th>
+                    <th>真实用户名</th>
+                    <th>真实ID</th>
+                    <th style="text-align:right;">贡献值</th>
+                    <th style="text-align:center;">上榜次数</th>
+                    <th>最后出现</th>
+                </tr>
+            </thead>
+            <tbody id="table-body"></tbody>
+        </table>
+    </div>
+
+    <div id="loading" class="loading">
+        <div class="spinner"></div>
+        <div class="msg">加载中...</div>
+    </div>
+</div>
+
+<script>
+/* ── loadData() — IDENTICAL to original ── */
+function loadData() {
+    var q = document.getElementById('anon-search-input').value.trim();
+    var el = document.getElementById('loading');
+    var tbl = document.getElementById('data-table');
+    var tbody = document.getElementById('table-body');
+    el.style.display = 'flex'; tbl.style.display = 'none';
+    fetch('/api/anonymous?search=' + encodeURIComponent(q) + '&size=100')
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            el.style.display = 'none';
+            tbody.innerHTML = '';
+            if (!d.users || d.users.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-muted);padding:30px;">暂无神秘人</td></tr>';
+                tbl.style.display = 'table'; return;
+            }
+            d.users.forEach(function(u, i) {
+                var tr = document.createElement('tr');
+                tr.innerHTML = '<td style="font-weight:600;">' + (i+1) + '</td>' +
+                    '<td style="font-size:12px;color:var(--text-soft);">' + (u.anonymous_label || '-') + '</td>' +
+                    '<td><a href="/user?uid=' + u.real_user_id + '" style="font-weight:500;">' + (u.user_name || '') + '</a></td>' +
+                    '<td><a href="/user?uid=' + u.real_user_id + '" style="font-family:var(--font-mono);font-size:12px;color:var(--text-soft);">' + u.real_user_id + '</a></td>' +
+                    '<td style="font-weight:600;">' + (u.consume || 0).toLocaleString() + '</td>' +
+                    '<td>' + (u.sessions_count || 0) + '</td>' +
+                    '<td style="font-size:12px;color:var(--text-muted);">' + (u.last_seen || '').substring(0, 10) + '</td>';
+                tbody.appendChild(tr);
+            });
+            tbl.style.display = 'table';
+        })
+        .catch(function(err) {
+            el.style.display = 'none';
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--danger);padding:30px;">加载失败: ' + err.message + '</td></tr>';
+            tbl.style.display = 'table';
+        });
+}
+/* ── Additional helpers (safe to add outside loadData) ── */
+function clearSearch() {
+    document.getElementById('anon-search-input').value = '';
+    loadData();
+}
+function exportCSV() {
+    var q = document.getElementById('anon-search-input').value.trim();
+    var url = '/api/anonymous/csv';
+    if (q) url += '?search=' + encodeURIComponent(q);
+    window.location.href = url;
+}
+
+document.getElementById('anon-search-input').addEventListener('keydown', function(e) { if (e.key === 'Enter') loadData(); });
+loadData();
+</script>
+{% endblock %}

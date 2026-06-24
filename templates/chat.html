@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}弹幕搜索{% endblock %}
+{% block content %}
+<div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:14px;">
+        <h2 style="margin-bottom:0;">💬 弹幕搜索</h2>
+        <span id="total-count" style="font-size:12px;color:var(--text-muted);"></span>
+    </div>
+    <div class="filter-bar">
+        <input type="text" id="user-input" placeholder="用户ID">
+        <input type="text" id="keyword-input" placeholder="搜索关键词...">
+        <button onclick="loadData(1)">查询</button>
+        <button onclick="clearSearch()" style="background:var(--card);color:var(--text-muted);border-color:var(--border);">清除</button>
+        <button onclick="exportCSV()" style="background:var(--success);color:#fff;border-color:var(--success);font-weight:600;">&#x2B06; 导出CSV</button>
+    </div>
+    <div class="table-wrap">
+    <table id="data-table" style="display:none;">
+        <thead><tr>
+            <th style="width:60px;">时间</th>
+            <th>用户</th>
+            <th style="width:80px;">财富等级</th>
+            <th style="width:80px;">粉丝团</th>
+            <th>内容</th>
+            <th style="width:50px;"></th>
+        </tr></thead>
+        <tbody id="table-body"></tbody>
+    </table>
+    </div>
+    <div id="loading" class="loading"><div class="spinner"></div><div class="msg">加载中...</div></div>
+    <div id="pagination" class="pagination" style="display:none;"></div>
+</div>
+
+<script>
+var currentPage = 1;
+
+function loadData(p) {
+    currentPage = p || 1;
+    var uid = document.getElementById('user-input').value.trim();
+    var kw = document.getElementById('keyword-input').value.trim();
+    var el = document.getElementById('loading');
+    var tbl = document.getElementById('data-table');
+    var tbody = document.getElementById('table-body');
+    var pag = document.getElementById('pagination');
+    var tc = document.getElementById('total-count');
+    el.style.display = 'flex'; tbl.style.display = 'none'; pag.style.display = 'none';
+
+    var url = '/api/chat?page=' + currentPage + '&size=50';
+    if (uid) url += '&user_id=' + encodeURIComponent(uid);
+    if (kw) url += '&keyword=' + encodeURIComponent(kw);
+
+    fetch(url)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            el.style.display = 'none';
+            tc.textContent = '共 ' + data.total + ' 条';
+            tbody.innerHTML = '';
+            if (!data.chats || data.chats.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:40px;">' +
+                    (uid || kw ? '没有匹配的弹幕' : '暂无弹幕数据') + '</td></tr>';
+                tbl.style.display = 'table'; return;
+            }
+            data.chats.forEach(function(c) {
+                var tr = document.createElement('tr');
+                var t = c.time || '';
+                tr.innerHTML =
+                    '<td style="font-family:var(--font-mono);font-size:12px;color:var(--text-soft);white-space:nowrap;">' + t.substring(11, 19) + '</td>' +
+                    '<td><a href="/user?uid=' + c.user_id + '" style="font-weight:500;">' + (c.user_name || '') + '</a><br><span style="font-size:11px;color:var(--text-soft);font-family:var(--font-mono);">' + (c.user_id || '') + '</span></td>' +
+                    '<td style="font-size:12px;">' + (c.grade || '-') + '</td>' +
+                    '<td style="font-size:12px;">' + (c.fans_club || '-') + '</td>' +
+                    '<td style="max-width:300px;word-break:break-word;"><span title="' + (c.content || '').replace(/"/g, '&quot;') + '">' + (c.content || '').substring(0, 120) + '</span></td>' +
+                    '<td><a href="/user?uid=' + c.user_id + '" style="font-size:12px;white-space:nowrap;">详情 →</a></td>';
+                tbody.appendChild(tr);
+            });
+            tbl.style.display = 'table';
+
+            if (data.total > 50) {
+                var pages = Math.ceil(data.total / 50);
+                var html = '';
+                if (currentPage > 1) html += '<a href="#" onclick="loadData(' + (currentPage-1) + ');return false;">‹</a>';
+                html += '<span>' + currentPage + '/' + pages + '</span>';
+                if (currentPage < pages) html += '<a href="#" onclick="loadData(' + (currentPage+1) + ');return false;">›</a>';
+                pag.innerHTML = html; pag.style.display = 'flex';
+            }
+        })
+        .catch(function(err) {
+            el.style.display = 'none';
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--danger);padding:30px;">加载失败: ' + err.message + '</td></tr>';
+            tbl.style.display = 'table';
+        });
+}
+
+function clearSearch() {
+    document.getElementById('user-input').value = '';
+    document.getElementById('keyword-input').value = '';
+    loadData(1);
+}
+
+function exportCSV() {
+    var uid = document.getElementById('user-input').value.trim();
+    var kw = document.getElementById('keyword-input').value.trim();
+    var url = '/api/chat/csv';
+    var params = [];
+    if (uid) params.push('user_id=' + encodeURIComponent(uid));
+    if (kw) params.push('keyword=' + encodeURIComponent(kw));
+    if (params.length) url += '?' + params.join('&');
+    window.location.href = url;
+}
+
+document.querySelectorAll('#user-input, #keyword-input').forEach(function(el) {
+    el.addEventListener('keydown', function(e) { if (e.key === 'Enter') loadData(1); });
+});
+
+loadData(1);
+</script>
+{% endblock %}

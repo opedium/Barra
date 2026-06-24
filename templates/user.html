@@ -1,0 +1,507 @@
+{% extends "base.html" %}
+{% block title %}用户详情{% endblock %}
+{% block content %}
+<style>
+/* ── User Page Variables ── */
+.user-page {
+    --indigo: var(--primary);
+    --indigo-dark: var(--primary-dark);
+    --slate-100: #f1f5f9;
+    --slate-200: var(--border);
+    --slate-400: var(--text-muted);
+    --slate-600: #475569;
+    --slate-800: #1e293b;
+}
+
+/* ── User Header ── */
+.user-header-card {
+    background: linear-gradient(135deg, var(--primary-light) 0%, #fff 60%);
+    padding: 28px 24px 20px;
+    position: relative;
+    overflow: hidden;
+    border: 1px solid rgba(99,102,241,0.12);
+}
+.user-header-card::before {
+    content: '';
+    position: absolute;
+    top: -60px;
+    right: -60px;
+    width: 200px;
+    height: 200px;
+    border-radius: 50%;
+    background: radial-gradient(circle, var(--primary-glow) 0%, transparent 70%);
+    pointer-events: none;
+}
+.user-header-top {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    margin-bottom: 20px;
+    position: relative;
+    z-index: 1;
+}
+.user-avatar {
+    width: 64px;
+    height: 64px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--primary), #06b6d4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 26px;
+    font-weight: 700;
+    color: #fff;
+    flex-shrink: 0;
+    box-shadow: 0 4px 12px rgba(99,102,241,0.25);
+}
+.user-info { min-width: 0; flex: 1; }
+.user-name {
+    font-size: 22px;
+    font-weight: 800;
+    color: var(--text);
+    margin: 0;
+    line-height: 1.3;
+}
+.user-meta-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 6px;
+    align-items: center;
+}
+.user-meta-tags .badge { font-size: 11px; padding: 2px 10px; }
+
+/* ── Tab Bar ── */
+.tab-card {
+    padding: 0;
+    overflow: hidden;
+}
+.tab-bar {
+    display: flex;
+    background: var(--card);
+    position: relative;
+}
+.tab-btn {
+    flex: 1;
+    padding: 14px 12px;
+    border: none;
+    background: none;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-muted);
+    transition: color var(--transition-base), background var(--transition-base);
+    position: relative;
+    white-space: nowrap;
+}
+.tab-btn:hover {
+    background: var(--primary-light);
+    color: var(--primary);
+}
+
+/* ── Timeline Entries ── */
+#session-list > div {
+    transition: background var(--transition-fast);
+    border-radius: 6px;
+    padding-left: 4px !important;
+    padding-right: 4px !important;
+}
+#session-list > div:hover { background: var(--primary-light); }
+#session-list > div:last-child { border-bottom: none !important; }
+
+/* ── Tab Content ── */
+.tab-content .card:first-child { margin-top: 0; }
+
+/* ── Empty State ── */
+.session-empty {
+    text-align: center;
+    padding: 32px 20px;
+    color: var(--text-muted);
+    font-size: 13px;
+}
+
+/* ── Timeline filter button override ── */
+#tl-type-all,
+#tl-type-gift,
+#tl-type-chat {
+    cursor: pointer;
+}
+</style>
+
+<div class="user-page">
+
+<div id="loading" class="loading">
+    <div class="spinner"></div>
+    <div class="msg">加载中...</div>
+</div>
+
+<div id="user-content" style="display:none;">
+
+<!-- User Header -->
+<div class="card user-header-card">
+    <div class="user-header-top">
+        <div class="user-avatar" id="user-avatar">?</div>
+        <div class="user-info">
+            <h1 class="user-name" id="user-name"></h1>
+            <div class="user-meta-tags" id="user-meta"></div>
+        </div>
+    </div>
+    <div class="stats-row">
+        <div class="stat-card" style="border-left-color:var(--primary);">
+            <div class="num" id="stat-session-wave">0</div>
+            <div class="label">本场音浪</div>
+        </div>
+        <div class="stat-card" style="border-left-color:var(--success);">
+            <div class="num" id="stat-session-gifts">0</div>
+            <div class="label">本场礼物</div>
+        </div>
+        <div class="stat-card" style="border-left-color:var(--warning);">
+            <div class="num" id="stat-session-chats">0</div>
+            <div class="label">本场发言</div>
+        </div>
+        <div class="stat-card" style="border-left-color:#06b6d4;">
+            <div class="num" id="stat-total-wave">0</div>
+            <div class="label">累计音浪</div>
+        </div>
+    </div>
+</div>
+
+<!-- Tabs -->
+<div class="card tab-card">
+    <div class="tab-bar" style="border-bottom:2px solid var(--border);">
+        <button class="tab-btn active" data-tab="timeline" style="color:var(--indigo);border-bottom:2px solid var(--indigo);margin-bottom:-2px;">消费时间轴</button>
+        <button class="tab-btn" data-tab="gifts" style="color:var(--slate-400);border-bottom:2px solid transparent;margin-bottom:-2px;">送礼流水</button>
+        <button class="tab-btn" data-tab="table" style="color:var(--slate-400);border-bottom:2px solid transparent;margin-bottom:-2px;">场次记录</button>
+    </div>
+</div>
+
+<!-- Tab: Timeline -->
+<div id="tab-timeline" class="tab-content">
+    <div class="card">
+        <div class="flex-between" style="margin-bottom:8px;">
+            <h2 style="margin:0;">
+                <span>消费时间轴</span>
+                <span class="sub">按时间倒序</span>
+            </h2>
+            <button onclick="exportTimelineCSV()" style="background:var(--success);color:#fff;border:1px solid var(--success);border-radius:var(--radius-sm);padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;">&#x2B06; 导出CSV</button>
+        </div>
+        <div class="filter-bar" style="margin-bottom:12px;">
+            <div class="btn-group" id="tl-filter-group">
+                <button class="active" id="tl-type-all" onclick="filterTimeline('all')">全部</button>
+                <button id="tl-type-gift" onclick="filterTimeline('gift')">&#127873; 礼物</button>
+                <button id="tl-type-chat" onclick="filterTimeline('chat')">&#128172; 发言</button>
+            </div>
+        </div>
+        <div id="session-list"></div>
+    </div>
+</div>
+
+<!-- Tab: Gifts -->
+<div id="tab-gifts" class="tab-content" style="display:none;">
+    <div class="card">
+        <div class="flex-between" style="margin-bottom:8px;">
+            <h2 style="margin:0;">
+                <span>送礼流水</span>
+                <span class="sub">按时间倒序</span>
+            </h2>
+            <button onclick="exportUserCSV()" style="background:var(--success);color:#fff;border:1px solid var(--success);border-radius:var(--radius-sm);padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;">&#x2B06; 导出CSV</button>
+        </div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr><th>时间</th><th>礼物</th><th>数量</th><th>钻石</th></tr>
+                </thead>
+                <tbody id="gift-table-body"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Tab: Sessions -->
+<div id="tab-table" class="tab-content" style="display:none;">
+    <div class="card">
+        <div class="flex-between" style="margin-bottom:8px;">
+            <h2 style="margin:0;">
+                <span>场次记录</span>
+                <span class="sub">最近场次优先</span>
+            </h2>
+            <button onclick="exportUserCSV()" style="background:var(--success);color:#fff;border:1px solid var(--success);border-radius:var(--radius-sm);padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;">&#x2B06; 导出CSV</button>
+        </div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr><th>日期</th><th>财富等级</th><th>粉丝团</th><th>音浪</th><th>&#127873;</th><th>&#128172;</th></tr>
+                </thead>
+                <tbody id="session-table-body"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+</div><!-- /user-content -->
+</div><!-- /user-page -->
+
+<script>
+var uid = new URLSearchParams(window.location.search).get('uid') || '';
+
+function setAvatar(name) {
+    var el = document.getElementById('user-avatar');
+    if (name && name.length > 0) {
+        el.textContent = name.charAt(0).toUpperCase();
+    }
+}
+
+/* ── Tab switching ── */
+document.querySelectorAll('.tab-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+        document.querySelectorAll('.tab-btn').forEach(function(b) {
+            b.style.color = 'var(--text-muted)';
+            b.style.borderBottom = '2px solid transparent';
+        });
+        this.style.color = 'var(--indigo)';
+        this.style.borderBottom = '2px solid var(--indigo)';
+        document.querySelectorAll('.tab-content').forEach(function(t) { t.style.display = 'none'; });
+        document.getElementById('tab-' + this.dataset.tab).style.display = 'block';
+    });
+});
+
+var currentFilter = 'all';
+function filterTimeline(type) {
+    if (!allData) return;
+    currentFilter = type;
+    document.querySelectorAll('#tl-type-all, #tl-type-gift, #tl-type-chat').forEach(function(el) {
+        if (el.id === 'tl-type-' + type) {
+            el.style.background = 'var(--primary)';
+            el.style.color = '#fff';
+        } else {
+            el.style.background = '';
+            el.style.color = '';
+        }
+    });
+    renderSessions(allData);
+}
+
+var allData = null;
+
+function loadUser() {
+    fetch('/api/user?uid=' + encodeURIComponent(uid) + '&detail=1')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (data.error) {
+                document.getElementById('loading').innerHTML =
+                    '<div class="loading"><div class="msg">用户未找到: ' + uid + '</div></div>';
+                return;
+            }
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('user-content').style.display = 'block';
+            allData = data;
+
+            var name = data.user_name || '';
+            setAvatar(name);
+            document.getElementById('user-name').textContent = name || '未知用户';
+
+            /* Meta tags */
+            var metaEl = document.getElementById('user-meta');
+            metaEl.innerHTML = '';
+            if (data.user_id) {
+                var idBadge = document.createElement('span');
+                idBadge.className = 'badge badge-gray';
+                idBadge.textContent = 'ID: ' + data.user_id;
+                metaEl.appendChild(idBadge);
+            }
+            if (data.grade) {
+                var gradeBadge = document.createElement('span');
+                gradeBadge.className = 'badge badge-indigo';
+                gradeBadge.textContent = data.grade;
+                metaEl.appendChild(gradeBadge);
+            }
+            if (data.fans_club) {
+                var clubBadge = document.createElement('span');
+                clubBadge.className = 'badge badge-amber';
+                clubBadge.textContent = data.fans_club;
+                metaEl.appendChild(clubBadge);
+            } else {
+                var noClub = document.createElement('span');
+                noClub.className = 'badge badge-gray';
+                noClub.textContent = '无粉丝团';
+                metaEl.appendChild(noClub);
+            }
+
+            /* Stats */
+            var sc = data.total_consume || 0;
+            var latestSession = data.sessions && data.sessions.length > 0 ? data.sessions[0] : null;
+            document.getElementById('stat-session-wave').textContent =
+                latestSession ? (latestSession.consume || 0).toLocaleString() : '0';
+            document.getElementById('stat-session-gifts').textContent =
+                latestSession ? (latestSession.gift_count || 0) : '0';
+            document.getElementById('stat-session-chats').textContent =
+                latestSession ? (latestSession.chat_count || 0) : '0';
+            document.getElementById('stat-total-wave').textContent = sc.toLocaleString();
+
+            renderSessions(data);
+            renderGifts(data);
+            renderTable(data);
+        })
+        .catch(function(err) {
+            document.getElementById('loading').innerHTML =
+                '<div class="loading"><div class="msg" style="color:var(--danger);">加载失败: ' + err.message + '</div></div>';
+        });
+}
+
+function renderSessions(data) {
+    var el = document.getElementById('session-list');
+    el.innerHTML = '';
+    if (!data.sessions || data.sessions.length === 0) {
+        el.innerHTML = '<div class="empty-state"><div class="icon">&#128237;</div><div>暂无记录</div></div>';
+        return;
+    }
+    data.sessions.forEach(function(s) {
+        var start = (s.start_time || '').substring(0, 10);
+        var end = (s.end_time || '').substring(0, 10);
+        var dateRange = start + (end && end !== start ? ' - ' + end : '');
+        var timeRange = (s.start_time || '').substring(11, 19) + '-' + (s.end_time || '至今').substring(11, 19);
+        var isCurrent = !s.end_time;
+
+        var div = document.createElement('div');
+        div.style.cssText = 'padding:12px 0;border-bottom:1px solid var(--border);';
+
+        var header = document.createElement('div');
+        header.style.cssText = 'cursor:pointer;user-select:none;';
+        header.innerHTML =
+            '<div style="display:flex;align-items:center;gap:8px;">' +
+            '<span id="arrow-' + s.id + '" style="color:var(--text-muted);font-size:12px;transition:transform var(--transition-base);">&#9654;</span>' +
+            '<span style="font-weight:600;font-size:14px;">' + dateRange + '</span>' +
+            (isCurrent ? '<span style="font-size:11px;color:#e67e22;background:#fff3e0;padding:0 8px;border-radius:4px;">当前</span>' : '') +
+            '</div>' +
+            '<div style="font-size:12px;color:var(--text-muted);margin-left:28px;">' + timeRange + '</div>' +
+            '<div style="font-size:13px;margin:4px 0 0 28px;color:var(--text);">' +
+            (s.consume || 0).toLocaleString() + ' 音浪 <span class="text-muted">&#183;</span> ' +
+            (s.gift_count || 0) + ' 件' +
+            (s.chat_count ? ' <span class="text-muted">&#183;</span> ' + s.chat_count + ' 条发言' : '') +
+            '</div>';
+        div.appendChild(header);
+
+        var body = document.createElement('div');
+        body.style.cssText = 'margin:6px 0 0 28px;font-size:13px;display:none;';
+        body.id = 'body-' + s.id;
+
+        if (s.timeline && s.timeline.length > 0) {
+            var count = 0;
+            s.timeline.forEach(function(t) {
+                if (currentFilter !== 'all' && t.type !== currentFilter) return;
+                count++;
+                var icon = t.type === 'gift' ? '&#127873;' : '&#128172;';
+                var amt = t.amount ? parseInt(t.amount).toLocaleString() + ' 钻' : '';
+                var timeStr = (t.time || '').substring(11, 19);
+                var row = document.createElement('div');
+                row.style.cssText = 'padding:4px 0;display:flex;gap:10px;align-items:center;';
+                row.innerHTML =
+                    '<span style="color:var(--text-muted);min-width:60px;font-size:12px;">' + timeStr + '</span>' +
+                    '<span>' + icon + '</span>' +
+                    '<span style="flex:1;">' + t.content + '</span>' +
+                    (amt ? '<span style="color:#e67e22;margin-left:auto;font-weight:600;font-size:12px;">' + amt + '</span>' : '');
+                body.appendChild(row);
+            });
+            if (count === 0) {
+                body.style.display = 'none';
+            }
+        } else {
+            body.innerHTML = '<div style="color:var(--text-muted);padding:4px 0;font-size:12px;">暂无记录</div>';
+        }
+        div.appendChild(body);
+
+        header.addEventListener('click', function() {
+            var b = document.getElementById('body-' + s.id);
+            var a = document.getElementById('arrow-' + s.id);
+            var hidden = b.style.display === 'none';
+            b.style.display = hidden ? 'block' : 'none';
+            a.style.transform = hidden ? 'rotate(90deg)' : 'rotate(0deg)';
+        });
+
+        el.appendChild(div);
+    });
+}
+
+function renderGifts(data) {
+    var tbody = document.getElementById('gift-table-body');
+    if (!data.sessions) {
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:30px;color:var(--text-muted);">暂无</td></tr>';
+        return;
+    }
+    var rows = [];
+    data.sessions.forEach(function(s) {
+        if (s.timeline) {
+            s.timeline.forEach(function(t) {
+                if (t.type === 'gift') rows.push(t);
+            });
+        }
+    });
+    if (rows.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:30px;color:var(--text-muted);">暂无</td></tr>';
+        return;
+    }
+    rows.forEach(function(t) {
+        var tr = document.createElement('tr');
+        var parts = (t.content || '').split(' x ');
+        var giftName = parts[0] || t.content;
+        var giftCount = parts.length > 1 ? parts[1] : '1';
+        tr.innerHTML =
+            '<td>' + (t.time || '').substring(11, 19) + '</td>' +
+            '<td>' + giftName + '</td>' +
+            '<td>' + giftCount + '</td>' +
+            '<td>' + (t.amount || 0) + '</td>';
+        tbody.appendChild(tr);
+    });
+}
+
+function renderTable(data) {
+    var tbody = document.getElementById('session-table-body');
+    if (!data.sessions || data.sessions.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px;color:var(--text-muted);">暂无</td></tr>';
+        return;
+    }
+    data.sessions.forEach(function(s) {
+        var start = (s.start_time || '').substring(0, 10);
+        var end = (s.end_time || '').substring(0, 10);
+        var dateRange = start + (end && end !== start ? ' - ' + end : '');
+        var tr = document.createElement('tr');
+        tr.innerHTML =
+            '<td>' + dateRange + '</td>' +
+            '<td>' + (s.grade || '-') + '</td>' +
+            '<td>' + (s.fans_club || '-') + '</td>' +
+            '<td>' + (s.consume ? (s.consume / 10000).toFixed(1) + 'w' : '0') + '</td>' +
+            '<td>' + (s.gift_count || 0) + '</td>' +
+            '<td>' + (s.chat_count || 0) + '</td>';
+        tbody.appendChild(tr);
+    });
+}
+
+function renderTierBadges(value) {
+    var tiers = [
+        { threshold: 100000, cls: 'tier-100000', label: '10w+' },
+        { threshold: 10000,  cls: 'tier-10000',  label: '1w+' },
+        { threshold: 3000,   cls: 'tier-3000',   label: '3000+' },
+        { threshold: 1000,   cls: 'tier-1000',   label: '1000+' }
+    ];
+    var html = '';
+    tiers.forEach(function(t) {
+        if (value >= t.threshold) {
+            html += '<span class="tier-badge ' + t.cls + '">' + t.label + '</span>';
+        }
+    });
+    return html;
+}
+
+function exportTimelineCSV() {
+    if (!uid) { showToast('用户ID为空', 'error'); return; }
+    window.location.href = '/api/user/' + encodeURIComponent(uid) + '/timeline/csv';
+}
+
+function exportUserCSV() {
+    if (!uid) { showToast('用户ID为空', 'error'); return; }
+    window.location.href = '/api/user/' + encodeURIComponent(uid) + '/csv';
+}
+
+loadUser();
+</script>
+{% endblock %}

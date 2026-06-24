@@ -1,0 +1,441 @@
+{% extends "base.html" %}
+{% block title %}积分榜{% endblock %}
+{% block content %}
+<div class="card">
+    <!-- Header -->
+    <div class="flex-between" style="margin-bottom:16px;">
+        <h2 style="margin-bottom:0;display:flex;align-items:center;gap:10px;">
+            积分榜单
+            <span class="text-muted text-sm" style="font-weight:400;">实时贡献排行</span>
+        </h2>
+        <span id="total-count" class="total-count-badge" style="display:none;"></span>
+    </div>
+
+    <!-- Locked Session Banner -->
+    <div id="locked-banner" class="locked-banner" style="display:none;"></div>
+
+    <!-- Controls -->
+    <div class="filter-bar lb-filter-bar">
+        <div class="btn-group" id="period-group">
+            <button class="active" data-period="session">当前直播</button>
+            <button data-period="today">今日</button>
+            <button data-period="month">本月</button>
+            <button data-period="all">全部</button>
+            <button data-period="million">月百万</button>
+        </div>
+        <input type="month" id="month-picker" class="month-picker" onchange="monthChanged()">
+
+        <span class="filter-divider"></span>
+
+        <span class="threshold-label">门槛</span>
+        <select id="threshold-select">
+            <option value="1000">1,000</option>
+            <option value="3000">3,000</option>
+            <option value="10000">10,000</option>
+            <option value="100000">100,000</option>
+        </select>
+        <input type="number" id="custom-threshold" class="custom-threshold-input" placeholder="自定义">
+
+        <span class="filter-divider"></span>
+
+        <button id="sort-btn" class="sort-btn" onclick="toggleSort()">按贡献值</button>
+        <button onclick="loadData()" class="btn-refresh">&#x27F3; 刷新</button>
+        <button onclick="exportCSV()" class="btn-csv">&#x2B06; 导出CSV</button>
+    </div>
+
+    <!-- Table -->
+    <div class="table-wrap">
+        <table id="data-table" style="display:none;">
+            <thead>
+                <tr>
+                    <th>排名</th>
+                    <th>昵称</th>
+                    <th>ID</th>
+                    <th>粉丝团</th>
+                    <th>财富等级</th>
+                    <th>贡献值</th>
+                    <th>上榜次数</th>
+                    <th>操作</th>
+                </tr>
+            </thead>
+            <tbody id="table-body"></tbody>
+        </table>
+    </div>
+
+    <!-- Loading -->
+    <div id="loading" class="loading">
+        <div class="spinner"></div>
+        <div class="msg">加载中...</div>
+    </div>
+
+    <!-- Pagination -->
+    <div id="pagination" class="pagination" style="display:none;"></div>
+</div>
+
+<style>
+/* ================================================================
+   LEADERBOARD-SPECIFIC STYLES
+   ================================================================ */
+
+/* Total count badge */
+.total-count-badge {
+    font-size: 12px;
+    color: var(--text-muted);
+    background: var(--bg);
+    padding: 4px 14px;
+    border-radius: 20px;
+    font-weight: 500;
+    border: 1px solid var(--border);
+}
+
+/* Locked session banner */
+.locked-banner {
+    background: linear-gradient(135deg, #eef2ff 0%, #dbeafe 100%);
+    border: 1px solid #a5b4fc;
+    border-left: 4px solid var(--primary);
+    border-radius: var(--radius-sm);
+    padding: 12px 16px;
+    margin-bottom: 14px;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--primary-dark);
+    box-shadow: 0 1px 4px rgba(99,102,241,0.15);
+    line-height: 1.6;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+.locked-banner a {
+    font-weight: 600;
+    color: #fff;
+    background: var(--primary);
+    padding: 3px 12px;
+    border-radius: 4px;
+    transition: background var(--transition-fast);
+    white-space: nowrap;
+    font-size: 12px;
+    margin-left: auto;
+}
+.locked-banner a:hover {
+    background: var(--primary-dark);
+    text-decoration: none;
+}
+
+/* Filter bar refinements */
+.lb-filter-bar { margin-bottom: 14px; }
+
+.filter-divider {
+    display: inline-block;
+    width: 1px;
+    height: 22px;
+    background: var(--border);
+    flex-shrink: 0;
+}
+
+.threshold-label {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.month-picker { width: 150px; font-family: var(--font); }
+
+.custom-threshold-input { width: 95px; }
+
+/* Refresh button */
+.btn-refresh {
+    background: var(--card) !important;
+    color: var(--text-muted) !important;
+    border-color: var(--border) !important;
+    font-weight: 500 !important;
+}
+.btn-refresh:hover {
+    background: var(--bg) !important;
+    color: var(--text) !important;
+}
+
+.btn-csv {
+    background: var(--success) !important;
+    color: #fff !important;
+    border-color: var(--success) !important;
+    font-weight: 600 !important;
+}
+.btn-csv:hover {
+    background: #059669 !important;
+}
+
+.sort-btn { font-weight: 500; }
+
+/* Table column alignment */
+#data-table th, #data-table td { padding: 10px 10px; white-space: nowrap; }
+#data-table th:nth-child(1), #data-table td:nth-child(1) { text-align: center; width: 60px; }
+#data-table th:nth-child(2) { min-width: 120px; }
+#data-table th:nth-child(3) { width: 110px; }
+#data-table th:nth-child(4), #data-table td:nth-child(4),
+#data-table th:nth-child(5), #data-table td:nth-child(5),
+#data-table th:nth-child(7), #data-table td:nth-child(7) { text-align: center; width: 75px; }
+#data-table th:nth-child(6) { text-align: right; width: 100px; }
+#data-table td:nth-child(6) { text-align: right; }
+#data-table th:nth-child(8), #data-table td:nth-child(8) { text-align: center; width: 55px; }
+
+/* Rank highlighting */
+.rank-1::before { content: ''; margin-right: 2px; }
+.rank-2::before { content: ''; margin-right: 2px; }
+.rank-3::before { content: ''; margin-right: 2px; }
+
+/* Row highlights for top 3 */
+#data-table tbody tr:has(> td.rank-1) td { background: #fffbeb !important; }
+#data-table tbody tr:has(> td.rank-2) td { background: #f8fafc !important; }
+#data-table tbody tr:has(> td.rank-3) td { background: #fff7ed !important; }
+#data-table tbody tr:nth-child(even):has(> td.rank-1) td { background: #fffbeb !important; }
+#data-table tbody tr:nth-child(even):has(> td.rank-2) td { background: #f8fafc !important; }
+#data-table tbody tr:nth-child(even):has(> td.rank-3) td { background: #fff7ed !important; }
+#data-table tbody tr:has(> td.rank-1):hover td,
+#data-table tbody tr:has(> td.rank-2):hover td,
+#data-table tbody tr:has(> td.rank-3):hover td { filter: brightness(0.96); }
+
+#data-table tbody tr:has(> td.rank-1) td:first-child { box-shadow: inset 3px 0 0 #f59e0b; }
+#data-table tbody tr:has(> td.rank-2) td:first-child { box-shadow: inset 3px 0 0 #94a3b8; }
+#data-table tbody tr:has(> td.rank-3) td:first-child { box-shadow: inset 3px 0 0 #cd7f32; }
+
+.rank-1, .rank-2, .rank-3 { font-weight: 700 !important; border-radius: 4px; }
+.rank-1 { color: #92400e !important; }
+.rank-2 { color: #475569 !important; }
+.rank-3 { color: #92400e !important; }
+#data-table td:first-child:not(.rank-1):not(.rank-2):not(.rank-3) {
+    color: var(--text-soft) !important;
+    font-weight: 500 !important;
+}
+
+/* Pagination */
+#pagination.pagination {
+    margin-top: 18px;
+    justify-content: center;
+    gap: 4px;
+}
+#pagination.pagination span {
+    margin: 0 10px;
+    font-size: 13px;
+    color: var(--text-muted);
+}
+
+/* User link */
+#data-table td a[href^="/user"] {
+    font-weight: 500;
+    color: var(--primary);
+}
+#data-table td a[href^="/user"]:hover {
+    color: var(--primary-dark);
+}
+
+/* Empty state */
+#data-table td[colspan] {
+    padding: 40px 20px !important;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 14px;
+}
+</style>
+
+<script>
+var currentPage = 1, currentThreshold = 1000, currentPeriod = 'session', currentSort = 'consume';
+var lockedSessionId = null;
+
+// Check URL for session_id
+var params = new URLSearchParams(window.location.search);
+if (params.get('session_id')) {
+    lockedSessionId = parseInt(params.get('session_id'));
+    if (isNaN(lockedSessionId)) lockedSessionId = null;
+    if (lockedSessionId) {
+        document.getElementById('locked-banner').style.display = 'flex';
+        document.getElementById('locked-banner').innerHTML = '<span>&#128274; 查看场次 #' + lockedSessionId + ' 榜单</span><a href="/leaderboard">取消锁定</a>';
+        document.querySelectorAll('#period-group button').forEach(function(b) { b.disabled = true; b.style.opacity = '0.5'; });
+    }
+}
+
+function toggleControls(period) {
+    var isMillion = period === 'million';
+    var isMonth = period === 'month' || isMillion;
+    document.getElementById('threshold-select').style.display = isMillion ? 'none' : '';
+    document.getElementById('custom-threshold').style.display = isMillion ? 'none' : '';
+    document.getElementById('sort-btn').style.display = isMillion ? 'none' : '';
+    var picker = document.getElementById('month-picker');
+    if (!picker.value) {
+        var d = new Date();
+        picker.value = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0');
+    }
+    var thead = document.querySelector('#data-table thead tr');
+    if (isMillion) {
+        thead.innerHTML = '<th>排名</th><th>昵称</th><th>ID</th><th>月总贡献</th><th>活跃天数</th><th>操作</th>';
+    } else {
+        thead.innerHTML = '<th>排名</th><th>昵称</th><th>ID</th><th>粉丝团</th><th>财富等级</th><th>贡献值</th><th>上榜次数</th><th>操作</th>';
+    }
+}
+
+function monthChanged() {
+    currentPage = 1;
+    var ym = document.getElementById('month-picker').value || '';
+    var monthBtn = document.querySelector('[data-period="month"]');
+    var millionBtn = document.querySelector('[data-period="million"]');
+    monthBtn.textContent = ym ? ym + ' 月榜' : '本月';
+    millionBtn.textContent = ym ? '月百万' : '月百万';
+    loadData();
+}
+
+document.getElementById('period-group').addEventListener('click', function(e) {
+    if (e.target.tagName === 'BUTTON' && !e.target.disabled) {
+        this.querySelectorAll('button').forEach(function(b) { b.className = ''; });
+        e.target.className = 'active';
+        currentPeriod = e.target.dataset.period;
+        currentPage = 1;
+        toggleControls(currentPeriod);
+        if (currentPeriod !== 'month') document.querySelector('[data-period="month"]').textContent = '本月';
+        if (currentPeriod !== 'million') document.querySelector('[data-period="million"]').textContent = '月百万';
+        loadData();
+    }
+});
+
+document.getElementById('threshold-select').addEventListener('change', function() {
+    currentThreshold = parseInt(this.value);
+    currentPage = 1;
+    loadData();
+});
+
+document.getElementById('custom-threshold').addEventListener('change', function() {
+    var v = parseInt(this.value);
+    if (v > 0) { currentThreshold = v; currentPage = 1; loadData(); }
+});
+
+function toggleSort() {
+    currentSort = currentSort === 'consume' ? 'sessions' : 'consume';
+    document.getElementById('sort-btn').textContent = currentSort === 'consume' ? '按贡献值' : '按上榜次数';
+    currentPage = 1;
+    loadData();
+}
+
+function loadData() {
+    var el = document.getElementById('loading');
+    var tbl = document.getElementById('data-table');
+    var tbody = document.getElementById('table-body');
+    var pag = document.getElementById('pagination');
+    var tc = document.getElementById('total-count');
+    el.style.display = 'flex';
+    tbl.style.display = 'none';
+    pag.style.display = 'none';
+
+    var isMillion = currentPeriod === 'million';
+
+    if (isMillion) {
+        var ym = document.getElementById('month-picker').value || '';
+        fetch('/api/million?page=' + currentPage + '&size=50&year_month=' + ym)
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                el.style.display = 'none';
+                tc.textContent = '共 ' + data.total + ' 位';
+                tc.style.display = '';
+                tbody.innerHTML = '';
+                if (!data.users || data.users.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-soft);padding:30px;">本月暂无百万用户</td></tr>';
+                    tbl.style.display = 'table';
+                    return;
+                }
+                data.users.forEach(function(u) {
+                    var tr = document.createElement('tr');
+                    var rankClass = u.rank === 1 ? 'rank-1' : (u.rank === 2 ? 'rank-2' : (u.rank === 3 ? 'rank-3' : ''));
+                    tr.innerHTML = '<td class="' + rankClass + '" style="font-weight:600;">#' + u.rank + '</td>' +
+                        '<td><a href="/user?uid=' + u.user_id + '" style="font-weight:500;">' + u.user_name + '</a></td>' +
+                        '<td style="font-family:var(--font-mono);font-size:12px;color:var(--text-soft);">' + u.user_id + '</td>' +
+                        '<td style="font-weight:600;">' + (u.total_consume || 0).toLocaleString() + '</td>' +
+                        '<td>' + (u.days_active || 0) + '天</td>' +
+                        '<td><a href="/user?uid=' + u.user_id + '">详情</a></td>';
+                    tbody.appendChild(tr);
+                });
+                tbl.style.display = 'table';
+                var totalPages = Math.ceil(data.total / 50);
+                if (totalPages > 1) {
+                    var html = '';
+                    if (currentPage > 1) html += '<a href="#" onclick="gotoPage(' + (currentPage-1) + ');return false;">&#8249;</a>';
+                    html += '<span>第 ' + currentPage + ' / ' + totalPages + ' 页</span>';
+                    if (currentPage < totalPages) html += '<a href="#" onclick="gotoPage(' + (currentPage+1) + ');return false;">&#8250;</a>';
+                    pag.innerHTML = html;
+                    pag.style.display = 'flex';
+                }
+            })
+            .catch(function(err) {
+                el.style.display = 'none';
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--danger);padding:30px;">加载失败: ' + err.message + '</td></tr>';
+                tbl.style.display = 'table';
+            });
+        return;
+    }
+
+    var url = '/api/leaderboard?threshold=' + currentThreshold + '&period=' + currentPeriod + '&page=' + currentPage + '&size=50&sort_by=' + currentSort;
+    if (lockedSessionId) url += '&session_id=' + lockedSessionId;
+    if (currentPeriod === 'month' || isMillion) {
+        var ym = document.getElementById('month-picker').value || '';
+        if (ym) url += '&year_month=' + ym;
+    }
+
+    fetch(url)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            el.style.display = 'none';
+            tc.textContent = '共 ' + data.total + ' 位';
+            tc.style.display = '';
+            tbody.innerHTML = '';
+            if (!data.users || data.users.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-soft);padding:30px;">暂无数据</td></tr>';
+                tbl.style.display = 'table';
+                return;
+            }
+            data.users.forEach(function(u) {
+                var tr = document.createElement('tr');
+                var rankClass = u.rank === 1 ? 'rank-1' : (u.rank === 2 ? 'rank-2' : (u.rank === 3 ? 'rank-3' : ''));
+                tr.innerHTML = '<td class="' + rankClass + '" style="font-weight:600;">#' + u.rank + '</td>' +
+                    '<td><a href="/user?uid=' + u.user_id + '" style="font-weight:500;">' + u.user_name + '</a></td>' +
+                    '<td style="font-family:var(--font-mono);font-size:12px;color:var(--text-soft);">' + u.user_id + '</td>' +
+                    '<td style="font-size:12px;">' + (u.fans_club || '-') + '</td>' +
+                    '<td style="font-size:12px;">' + (u.grade || '-') + '</td>' +
+                    '<td style="font-weight:600;">' + (u.consume || 0).toLocaleString() + '</td>' +
+                    '<td>' + (u.sessions_count || 0) + '</td>' +
+                    '<td><a href="/user?uid=' + u.user_id + '">详情</a></td>';
+                tbody.appendChild(tr);
+            });
+            tbl.style.display = 'table';
+
+            var totalPages = Math.ceil(data.total / 50);
+            if (totalPages > 1) {
+                var html = '';
+                if (currentPage > 1) html += '<a href="#" onclick="gotoPage(' + (currentPage-1) + ');return false;">&#8249;</a>';
+                html += '<span>第 ' + currentPage + ' / ' + totalPages + ' 页</span>';
+                if (currentPage < totalPages) html += '<a href="#" onclick="gotoPage(' + (currentPage+1) + ');return false;">&#8250;</a>';
+                pag.innerHTML = html;
+                pag.style.display = 'flex';
+            }
+        })
+        .catch(function(err) {
+            el.style.display = 'none';
+            document.getElementById('table-body').innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--danger);">加载失败: ' + err.message + '</td></tr>';
+            document.getElementById('data-table').style.display = 'table';
+        });
+}
+
+function gotoPage(p) { currentPage = p; loadData(); }
+
+function exportCSV() {
+    var isMillion = currentPeriod === 'million';
+    var url = isMillion ? '/api/million/csv' : '/api/leaderboard/csv';
+    url += '?period=' + currentPeriod + '&threshold=' + currentThreshold + '&sort_by=' + currentSort;
+    if (lockedSessionId) url += '&session_id=' + lockedSessionId;
+    if (currentPeriod === 'month' || currentPeriod === 'million' || isMillion) {
+        var ym = document.getElementById('month-picker').value || '';
+        if (ym) url += '&year_month=' + ym;
+    }
+    window.location.href = url;
+}
+
+loadData();
+</script>
+{% endblock %}
