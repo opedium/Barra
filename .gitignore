@@ -35,3 +35,5 @@ logs/
 *.db
 *.log
 node_modules/
+browser_profile/
+deploy/

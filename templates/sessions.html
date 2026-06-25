@@ -2,209 +2,128 @@
 {% block title %}场次管理{% endblock %}
 {% block content %}
 <style>
-    /* ── Sessions Page Styles ── */
-
-    /* Row clickability */
     #table-body tr { cursor: pointer; }
-
-    /* Status badge dot indicators */
     .badge-green::before, .badge-blue::before {
-        content: '';
-        display: inline-block;
-        width: 7px;
-        height: 7px;
-        border-radius: 50%;
-        margin-right: 5px;
-        vertical-align: middle;
-        position: relative;
-        top: -1px;
+        content: ''; display: inline-block; width: 7px; height: 7px;
+        border-radius: 50%; margin-right: 5px; vertical-align: middle; position: relative; top: -1px;
     }
-    .badge-green::before {
-        background: var(--success);
-        box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.2);
-    }
-    .badge-blue::before {
-        background: #3b82f6;
-        box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
-    }
-
-    /* ── Summary strip ── */
-    .session-summary {
-        display: flex;
-        gap: 24px;
-        flex-wrap: wrap;
-        margin-bottom: 16px;
-        padding: 12px 16px;
-        background: var(--bg);
-        border-radius: var(--radius-sm);
-        font-size: 12px;
-    }
-    .session-summary .stat {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        color: var(--text-muted);
-    }
-    .session-summary .stat .num {
-        font-weight: 700;
-        font-family: var(--font-mono);
-        color: var(--text);
-        font-size: 15px;
-    }
+    .badge-green::before { background: var(--success); box-shadow: 0 0 0 3px rgba(16,185,129,0.2); }
+    .badge-blue::before { background: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,0.2); }
+    .session-summary { display: flex; gap: 24px; flex-wrap: wrap; margin-bottom: 16px; padding: 12px 16px; background: var(--bg); border-radius: var(--radius-sm); font-size: 12px; }
+    .session-summary .stat { display: flex; align-items: center; gap: 6px; color: var(--text-muted); }
+    .session-summary .stat .num { font-weight: 700; font-family: var(--font-mono); color: var(--text); font-size: 15px; }
     .session-summary .stat .num.live { color: var(--success); }
     .session-summary .stat .num.ended { color: #3b82f6; }
-
-    /* ── Empty-table row ── */
-    #table-body tr:only-child td[colspan] {
-        padding: 40px 20px !important;
-        font-size: 14px;
-        background: transparent !important;
-        border-bottom: none;
-    }
-
-    /* ── Anchor name styling ── */
-    #table-body td a {
-        font-weight: 500;
-        color: var(--primary);
-        text-decoration: none;
-    }
-    #table-body td a:hover {
-        color: var(--primary-dark);
-        text-decoration: underline;
-    }
-
-    /* ── Responsive ── */
-    @media (max-width: 640px) {
-        .session-summary {
-            gap: 14px;
-            padding: 10px 12px;
-            font-size: 11px;
-        }
-        .session-summary .stat .num { font-size: 13px; }
-        #table-body tr:only-child td[colspan] {
-            padding: 28px 14px !important;
-            font-size: 13px;
-        }
-    }
+    .btn-sm { padding: 3px 10px; font-size: 11px; font-weight: 600; border-radius: var(--radius-sm); border: 1px solid transparent; cursor: pointer; margin-right: 4px; white-space: nowrap; }
+    .btn-end { background: #f59e0b; color: #fff; border-color: #f59e0b; }
+    .btn-del { background: var(--danger); color: #fff; border-color: var(--danger); }
+    .modal-bg { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:99999; align-items:center; justify-content:center; }
+    .modal-bg.on { display:flex; }
+    .modal-bx { background:#fff; border-radius:8px; padding:24px; max-width:420px; width:90%; box-shadow:0 20px 60px rgba(0,0,0,0.3); }
+    .modal-bx h3 { margin-top:0; }
+    .modal-bx .btns { display:flex; gap:8px; justify-content:flex-end; margin-top:16px; }
 </style>
 
 <div class="card">
     <div class="flex-between" style="margin-bottom:8px;">
-        <div>
-            <h2 style="margin-bottom:4px;">直播场次</h2>
-            <p class="text-muted text-sm">点击场次查看详细数据与贡献榜</p>
-        </div>
-        <button onclick="exportCSV()" style="background:var(--success);color:#fff;border:1px solid var(--success);border-radius:var(--radius-sm);padding:6px 14px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;">&#x2B06; 导出CSV</button>
-    </div>
-
-    <!-- Summary strip -->
-    <div class="session-summary" id="session-summary">
-        <div class="stat">
-            总计 <span class="num" id="count-total">&#8212;</span>
-        </div>
-        <div class="stat">
-            &#128994; 直播中 <span class="num live" id="count-live">&#8212;</span>
-        </div>
-        <div class="stat">
-            &#128309; 已结束 <span class="num ended" id="count-ended">&#8212;</span>
+        <div><h2 style="margin-bottom:4px;">直播场次</h2><p class="text-muted text-sm">点击行查看详情 · 可手动结束或删除</p></div>
+        <div style="display:flex;gap:8px;align-items:center;">
+            <input type="text" id="anchor-filter" placeholder="按主播名筛选..." oninput="filterSessions()" style="width:160px;font-size:13px;">
+            <button onclick="exportCsv()" style="background:var(--success);color:#fff;border:1px solid var(--success);border-radius:var(--radius-sm);padding:6px 14px;font-size:13px;font-weight:600;cursor:pointer;">&#x2B06; CSV</button>
         </div>
     </div>
-
-    <!-- Table -->
+    <div class="session-summary" id="summary"></div>
     <div class="table-wrap">
-        <table id="data-table" style="display:none;">
-            <thead>
-                <tr>
-                    <th>#</th>
-                    <th>房间ID</th>
-                    <th>主播</th>
-                    <th>开始时间</th>
-                    <th>结束时间</th>
-                    <th>状态</th>
-                    <th>达标用户</th>
-                </tr>
-            </thead>
-            <tbody id="table-body"></tbody>
+        <table id="tbl" style="display:none;">
+            <thead><tr><th>#</th><th>房间ID</th><th>主播</th><th>开始</th><th>结束</th><th>状态</th><th>达标</th><th>操作</th></tr></thead>
+            <tbody id="tbody"></tbody>
         </table>
     </div>
+    <div id="loading" class="loading"><div class="spinner"></div><span class="msg">加载中...</span></div>
+</div>
 
-    <!-- Loading -->
-    <div id="loading" class="loading">
-        <div class="spinner"></div>
-        <span class="msg">加载中...</span>
+<div class="modal-bg" id="mdl">
+    <div class="modal-bx">
+        <h3>确认删除场次 <span id="mdl-id"></span></h3>
+        <p style="color:var(--danger);font-size:13px;">将同时删除该场次的全部礼物、弹幕和贡献数据，不可恢复。</p>
+        <div class="btns">
+            <button class="btn-sm" style="background:var(--bg);color:var(--text);border:1px solid var(--border);" onclick="closeMdl()">取消</button>
+            <button class="btn-sm btn-del" onclick="doDelete()">确认删除</button>
+        </div>
     </div>
 </div>
 
 <script>
-/* ── Update summary from table rows ── */
-function updateSummaryFromRows() {
-    var rows = document.querySelectorAll('#table-body tr');
-    var total = 0, live = 0;
-    rows.forEach(function(tr) {
-        var statusCell = tr.children[5];
-        if (statusCell) {
-            total++;
-            if (statusCell.textContent.indexOf('直播中') !== -1) { live++; }
-        }
-    });
-    document.getElementById('count-total').textContent = total;
-    document.getElementById('count-live').textContent = live;
-    document.getElementById('count-ended').textContent = total - live;
+var _delId = null;
+var _timer = null;
+function filterSessions() { clearTimeout(_timer); _timer = setTimeout(load, 300); }
+
+function endOne(id) {
+    if (!confirm('确定要手动结束场次 #' + id + ' 吗？')) return;
+    fetch('/api/sessions/' + id + '/end', {method:'POST'}).then(function(r){return r.json()}).then(function(d){
+        if (d.success) load(); else alert(d.message);
+    }).catch(function(e){ alert('请求失败: ' + e.message); });
 }
 
-var summaryObserver = new MutationObserver(function() { updateSummaryFromRows(); });
-summaryObserver.observe(document.getElementById('table-body'), { childList: true, subtree: true });
+function delOne(id) {
+    _delId = id;
+    document.getElementById('mdl-id').textContent = '#' + id;
+    document.getElementById('mdl').classList.add('on');
+}
 
-/* ── Load Data ── */
-function loadData() {
-    var el = document.getElementById('loading');
-    var tbl = document.getElementById('data-table');
-    var tbody = document.getElementById('table-body');
-    el.style.display = 'flex';
-    tbl.style.display = 'none';
+function closeMdl() { _delId = null; document.getElementById('mdl').classList.remove('on'); }
 
-    fetch('/api/sessions')
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-            el.style.display = 'none';
-            tbody.innerHTML = '';
-            if (!d || d.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-soft);padding:30px;">暂无场次</td></tr>';
-                tbl.style.display = 'table';
-                return;
-            }
-            d.forEach(function(s) {
-                var tr = document.createElement('tr');
-                tr.style.cursor = 'pointer';
-                tr.addEventListener('click', function() {
-                    window.location.href = '/session/' + s.id;
+function doDelete() {
+    if (!_delId) return;
+    fetch('/api/sessions/' + _delId, {method:'DELETE'}).then(function(r){return r.json()}).then(function(d){
+        closeMdl();
+        if (d.success) load(); else alert(d.message);
+    }).catch(function(e){ closeMdl(); alert('请求失败: ' + e.message); });
+}
+
+function exportCsv() { window.location.href = '/api/sessions/csv'; }
+
+function load() {
+    document.getElementById('loading').style.display = 'flex';
+    document.getElementById('tbl').style.display = 'none';
+    var anchor = document.getElementById('anchor-filter').value || '';
+    fetch('/api/sessions?anchor=' + encodeURIComponent(anchor)).then(function(r){return r.json()}).then(function(rows){
+        document.getElementById('loading').style.display = 'none';
+        var tbody = document.getElementById('tbody'); tbody.innerHTML = '';
+        if (!rows || !rows.length) { tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:30px;">暂无场次</td></tr>'; document.getElementById('tbl').style.display = 'table'; return; }
+        var total = 0, live = 0;
+        rows.forEach(function(s){
+            total++; if (s.status === 'live') live++;
+            var tr = document.createElement('tr'); tr.style.cursor = 'pointer';
+            tr.addEventListener('click', function(){ window.location.href = '/session/' + s.id; });
+            var act = '';
+            if (s.status === 'live') act += '<button class="btn-sm btn-end" style="margin-right:4px;">结束</button>';
+            act += '<button class="btn-sm btn-del">删除</button>';
+            tr.innerHTML = '<td style="font-weight:600;">'+s.id+'</td>'+
+                '<td><span style="font-family:var(--font-mono);font-size:12px;">'+s.room_id+'</span></td>'+
+                '<td>'+(s.anchor_name||'-')+'</td>'+
+                '<td style="font-size:12px;color:var(--text-muted);">'+(s.start_time||'').substring(0,16)+'</td>'+
+                '<td style="font-size:12px;color:var(--text-muted);">'+(s.end_time||'').substring(0,16)+'</td>'+
+                '<td>'+(s.status==='live'?'<span class="badge badge-green">直播中</span>':'<span class="badge badge-blue">已结束</span>')+'</td>'+
+                '<td style="font-weight:600;">'+(s.user_count||0)+'</td>'+
+                '<td>'+act+'</td>';
+            var btns = tr.querySelectorAll('button');
+            btns.forEach(function(b,i){
+                b.addEventListener('click', function(ev){ ev.stopPropagation();
+                    if (i===0 && s.status==='live') endOne(s.id);
+                    else if ((i===0 && s.status!=='live') || i===1) delOne(s.id);
                 });
-                var status = s.status === 'live'
-                    ? '<span class="badge badge-green">直播中</span>'
-                    : '<span class="badge badge-blue">已结束</span>';
-                tr.innerHTML =
-                    '<td style="font-weight:600;">' + s.id + '</td>' +
-                    '<td><span style="font-family:var(--font-mono);font-size:12px;">' + s.room_id + '</span></td>' +
-                    '<td>' + (s.anchor_name || '-') + '</td>' +
-                    '<td style="font-size:12px;color:var(--text-muted);">' + (s.start_time || '').substring(0, 16) + '</td>' +
-                    '<td style="font-size:12px;color:var(--text-muted);">' + (s.end_time || '').substring(0, 16) + '</td>' +
-                    '<td>' + status + '</td>' +
-                    '<td style="font-weight:600;">' + (s.user_count || 0) + '</td>';
-                tbody.appendChild(tr);
             });
-            tbl.style.display = 'table';
-        })
-        .catch(function(err) {
-            el.style.display = 'none';
-            document.getElementById('table-body').innerHTML =
-                '<tr><td colspan="7" style="text-align:center;color:var(--danger);padding:30px;">加载失败: ' + err.message + '</td></tr>';
-            document.getElementById('data-table').style.display = 'table';
+            tbody.appendChild(tr);
         });
+        document.getElementById('summary').innerHTML = '总计 <span class="num">'+total+'</span> &#128994; 直播中 <span class="num live">'+live+'</span> &#128309; 已结束 <span class="num ended">'+(total-live)+'</span>';
+        document.getElementById('tbl').style.display = 'table';
+    }).catch(function(e){
+        document.getElementById('loading').style.display = 'none';
+        document.getElementById('tbody').innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--danger);padding:30px;">加载失败: '+e.message+'</td></tr>';
+        document.getElementById('tbl').style.display = 'table';
+    });
 }
-function exportCSV() {
-    window.location.href = '/api/sessions/csv';
-}
-
-loadData();
+load();
 </script>
 {% endblock %}

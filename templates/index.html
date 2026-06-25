@@ -293,6 +293,7 @@
     .chat-msg { max-width: 140px; }
     .row-session td:last-child { padding-right: 24px; }
 }
+
 </style>
 
 <!-- Page Header -->
@@ -300,8 +301,8 @@
     <h1>仪表盘</h1>
     <span class="sub">直播数据概览</span>
     <div style="margin-left:auto;display:flex;gap:8px;">
-        <a href="/api/leaderboard/csv?period=session&threshold=1000" class="export-btn">&#x2B06; 导出积分榜</a>
-        <a href="/api/sessions/csv" class="export-btn">&#x2B06; 导出场次</a>
+        <button onclick="showCsvColumnSelector('/api/leaderboard/csv?period=session&threshold=1000', ['rank','user_id','user_name','grade','fans_club','consume','sessions_count','qualified_1000','qualified_3000','qualified_10000','qualified_100000','链接'])" class="export-btn">&#x2B06; 导出积分榜</button>
+        <button onclick="showCsvColumnSelector('/api/sessions/csv', ['id','room_id','anchor_name','start_time','end_time','status','user_count','total_diamonds','total_gifts','total_chats','链接'])" class="export-btn">&#x2B06; 导出场次</button>
     </div>
 </div>
 
@@ -351,11 +352,28 @@
     </div>
 </div>
 
+<!-- Session Selector -->
+{% if live_sessions and live_sessions|length > 1 %}
+<div class="card" style="padding:8px 16px;margin-bottom:8px;display:flex;align-items:center;gap:10px;">
+    <span style="font-size:12px;color:var(--text-muted);white-space:nowrap;">切换直播间:</span>
+    <select onchange="window.location.href='/?session_id='+this.value" style="flex:1;font-size:13px;">
+        {% for ls in live_sessions %}
+        <option value="{{ ls.id }}" {% if session and session.id==ls.id %}selected{% endif %}>
+            {{ ls.anchor_name or ls.room_id }} (#{{ ls.id }})
+        </option>
+        {% endfor %}
+    </select>
+</div>
+{% endif %}
+
 <!-- Current Live Session -->
 {% if session %}
 <div class="card card-live">
     <div class="live-header">
         <span class="live-dot"><span class="dot"></span>直播中</span>
+        {% if anchor_avatar %}
+        <img src="{{ anchor_avatar }}" style="width:36px;height:36px;border-radius:50%;object-fit:cover;border:2px solid var(--success);" alt="">
+        {% endif %}
         <span class="anchor-name">{{ session.anchor_name }}</span>
         <span class="room-tag">房间 {{ session.room_id }}</span>
     </div>
@@ -392,6 +410,7 @@
             <thead>
                 <tr>
                     <th style="width:44px;">#</th>
+                    <th style="width:40px;"></th>
                     <th>用户</th>
                     <th>财富等级</th>
                     <th>粉丝团</th>
@@ -412,6 +431,13 @@
                         <span class="rank-3">#3</span>
                         {% else %}
                         <span style="color:var(--text-muted);font-weight:600;">#{{ loop.index }}</span>
+                        {% endif %}
+                    </td>
+                    <td style="padding:3px;">
+                        {% if u.avatar_url %}
+                        <img src="{{ u.avatar_url }}" style="width:28px;height:28px;border-radius:50%;object-fit:cover;" onerror="this.style.display='none'">
+                        {% else %}
+                        <div style="width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#06b6d4);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff;">{{ u.user_name[0] if u.user_name else '?' }}</div>
                         {% endif %}
                     </td>
                     <td><a href="/user?uid={{ u.user_id }}" style="font-weight:600;">{{ u.user_name }}</a></td>
@@ -492,7 +518,114 @@
     </div>
 </div>
 
+<!-- Real-time Event Feed -->
+<div class="card" id="live-feed-card">
+    <div class="flex-between" style="margin-bottom:8px;">
+        <h2 style="margin:0;">
+            <span class="live-dot" style="font-size:13px;"><span class="dot"></span>实时动态</span>
+        </h2>
+        <span style="font-size:11px;color:var(--text-muted);" id="live-event-count"></span>
+    </div>
+    <div id="live-feed" style="max-height:400px;overflow-y:auto;">
+        <div style="text-align:center;padding:24px;color:var(--text-soft);font-size:13px;">
+            <div style="font-size:24px;margin-bottom:6px;">&#128225;</div>
+            <div>等待实时数据...</div>
+            <div style="font-size:11px;margin-top:4px;">直播开始后，新消息将实时显示</div>
+        </div>
+    </div>
+</div>
+
 <!-- DB Path -->
 <div class="db-footer">&#128193; {{ db_path }}</div>
+
+<!-- SSE Live Feed -->
+<script>
+(function() {
+    var feed = document.getElementById('live-feed');
+    var counter = document.getElementById('live-event-count');
+    var eventCount = 0;
+    var shown = false;
+
+    function addEvent(html) {
+        if (!shown) { feed.innerHTML = ''; shown = true; }
+        var div = document.createElement('div');
+        div.style.cssText = 'padding:6px 10px;border-bottom:1px solid var(--border-light);font-size:12px;animation:fadeIn 0.3s ease;';
+        div.innerHTML = html;
+        feed.insertBefore(div, feed.firstChild);
+        eventCount++;
+        counter.textContent = eventCount + ' 条';
+        while (feed.children.length > 50) { feed.removeChild(feed.lastChild); }
+    }
+
+    var es = new EventSource('/api/events');
+    es.addEventListener('chat', function(e) {
+        try {
+            var d = JSON.parse(e.data);
+            addEvent('<span style="color:var(--text-muted);">' + d.time.substring(0,8) + '</span> ' +
+                     '<span style="color:#06b6d4;">&#128172;</span> ' +
+                     '<a href="/user?uid=' + d.user_id + '" style="font-weight:600;">' +
+                     (d.user_name || d.user_id) + '</a>: ' + (d.content || ''));
+        } catch(ex) {}
+    });
+    es.addEventListener('gift', function(e) {
+        try {
+            var d = JSON.parse(e.data);
+            addEvent('<span style="color:var(--text-muted);">' + d.time.substring(0,8) + '</span> ' +
+                     '<span style="color:#f59e0b;">&#127873;</span> ' +
+                     '<a href="/user?uid=' + d.user_id + '" style="font-weight:600;">' +
+                     (d.user_name || d.user_id) + '</a> 送出 <b>' + d.gift_name + '</b> x' + d.gift_count +
+                     ' <span style="color:#e67e22;font-weight:600;">(' +
+                     (d.diamond_total || 0).toLocaleString() + '钻)</span>');
+        } catch(ex) {}
+    });
+    es.onerror = function() { /* auto-reconnect handled by EventSource */ };
+})();
+</script>
+
+{% if auto_refresh and auto_refresh > 0 %}
+<script>
+(function() {
+    var INTERVAL_SEC = {{ auto_refresh }};
+    var timer = null;
+    var wasActive = {{ 'true' if session else 'false' }};
+
+    function checkStatus() {
+        fetchWithTimeout('/api/stats', {}, 10000)
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                var isActive = data.active_session;
+                if (isActive !== wasActive) {
+                    // Session state changed — full page refresh
+                    window.location.reload();
+                }
+            })
+            .catch(function() { /* silent — retry next poll */ });
+    }
+
+    function startTimer() {
+        if (timer) return;
+        timer = setInterval(checkStatus, INTERVAL_SEC * 1000);
+    }
+
+    function stopTimer() {
+        if (timer) { clearInterval(timer); timer = null; }
+    }
+
+    // Pause when tab is hidden, resume when visible
+    document.addEventListener('visibilitychange', function() {
+        if (document.hidden) {
+            stopTimer();
+        } else {
+            // Check immediately on return, then resume polling
+            checkStatus();
+            startTimer();
+        }
+    });
+
+    // Start polling
+    startTimer();
+})();
+</script>
+{% endif %}
 
 {% endblock %}

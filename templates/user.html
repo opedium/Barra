@@ -53,6 +53,13 @@
     color: #fff;
     flex-shrink: 0;
     box-shadow: 0 4px 12px rgba(99,102,241,0.25);
+    overflow: hidden;
+}
+.user-avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: 50%;
 }
 .user-info { min-width: 0; flex: 1; }
 .user-name {
@@ -145,6 +152,34 @@
             <h1 class="user-name" id="user-name"></h1>
             <div class="user-meta-tags" id="user-meta"></div>
         </div>
+        <a id="douyin-link" href="#" target="_blank" rel="noopener"
+           style="display:none;background:var(--primary);color:#fff;border:none;
+                  border-radius:var(--radius-sm);padding:6px 14px;font-size:13px;
+                  font-weight:600;text-decoration:none;white-space:nowrap;
+                  flex-shrink:0;transition:opacity var(--transition-fast);"
+           title="在抖音查看该用户主页">跳转到主页 &#x2197;</a>
+        <button id="notes-edit-btn" onclick="toggleNotesEdit()"
+                style="background:none;border:1px solid var(--border);color:var(--text-muted);
+                       font-size:14px;cursor:pointer;padding:4px 10px;border-radius:var(--radius-sm);
+                       flex-shrink:0;transition:color var(--transition-fast);"
+                title="备注/标签">&#9998;</button>
+    </div>
+    <!-- Notes/Tags Editor -->
+    <div id="notes-editor" style="display:none;margin-bottom:16px;position:relative;z-index:1;">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
+            <div style="flex:1;min-width:140px;">
+                <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">备注</label>
+                <input id="notes-input" type="text" placeholder="添加备注..." maxlength="200"
+                       style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;background:var(--card);color:var(--text);">
+            </div>
+            <div style="flex:1;min-width:140px;">
+                <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">标签（逗号分隔）</label>
+                <input id="tags-input" type="text" placeholder="老板, 铁粉..." maxlength="200"
+                       style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;background:var(--card);color:var(--text);">
+            </div>
+            <button onclick="saveNotes()" style="background:var(--primary);color:#fff;border:none;border-radius:var(--radius-sm);padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer;">保存</button>
+            <button onclick="toggleNotesEdit()" style="background:none;border:1px solid var(--border);color:var(--text-muted);border-radius:var(--radius-sm);padding:6px 12px;font-size:12px;cursor:pointer;">取消</button>
+        </div>
     </div>
     <div class="stats-row">
         <div class="stat-card" style="border-left-color:var(--primary);">
@@ -171,6 +206,7 @@
     <div class="tab-bar" style="border-bottom:2px solid var(--border);">
         <button class="tab-btn active" data-tab="timeline" style="color:var(--indigo);border-bottom:2px solid var(--indigo);margin-bottom:-2px;">消费时间轴</button>
         <button class="tab-btn" data-tab="gifts" style="color:var(--slate-400);border-bottom:2px solid transparent;margin-bottom:-2px;">送礼流水</button>
+        <button class="tab-btn" data-tab="chats" style="color:var(--slate-400);border-bottom:2px solid transparent;margin-bottom:-2px;">弹幕记录</button>
         <button class="tab-btn" data-tab="table" style="color:var(--slate-400);border-bottom:2px solid transparent;margin-bottom:-2px;">场次记录</button>
     </div>
 </div>
@@ -209,11 +245,33 @@
         <div class="table-wrap">
             <table>
                 <thead>
-                    <tr><th>时间</th><th>礼物</th><th>数量</th><th>钻石</th></tr>
+                    <tr><th>时间</th><th>主播</th><th>礼物</th><th>数量</th><th>钻石</th></tr>
                 </thead>
                 <tbody id="gift-table-body"></tbody>
             </table>
         </div>
+    </div>
+</div>
+
+<!-- Tab: Chats -->
+<div id="tab-chats" class="tab-content" style="display:none;">
+    <div class="card">
+        <div class="flex-between" style="margin-bottom:8px;">
+            <h2 style="margin:0;">
+                <span>弹幕记录</span>
+                <span class="sub">按时间倒序</span>
+            </h2>
+            <button onclick="exportChatCSV()" style="background:var(--success);color:#fff;border:1px solid var(--success);border-radius:var(--radius-sm);padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;">&#x2B06; 导出CSV</button>
+        </div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr><th>时间</th><th>主播</th><th>内容</th><th>财富等级</th><th>粉丝团</th></tr>
+                </thead>
+                <tbody id="chat-table-body"></tbody>
+            </table>
+        </div>
+        <div id="chat-pagination" style="margin-top:12px;display:flex;justify-content:center;gap:8px;"></div>
     </div>
 </div>
 
@@ -226,6 +284,15 @@
                 <span class="sub">最近场次优先</span>
             </h2>
             <button onclick="exportUserCSV()" style="background:var(--success);color:#fff;border:1px solid var(--success);border-radius:var(--radius-sm);padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;">&#x2B06; 导出CSV</button>
+        </div>
+        <div class="flex-between" style="margin-bottom:8px;">
+            <h3 style="font-size:13px;color:var(--text-muted);margin:0;">各场次消费对比</h3>
+            <button id="user-chart-toggle" onclick="toggleUserChart()"
+                    style="background:none;border:1px solid var(--border);color:var(--text-muted);
+                           font-size:11px;cursor:pointer;padding:2px 8px;border-radius:4px;">隐藏</button>
+        </div>
+        <div id="user-chart-wrap" style="margin-bottom:16px;">
+            <canvas id="session-spend-chart" style="max-height:250px;"></canvas>
         </div>
         <div class="table-wrap">
             <table>
@@ -244,9 +311,44 @@
 <script>
 var uid = new URLSearchParams(window.location.search).get('uid') || '';
 
-function setAvatar(name) {
+function toggleNotesEdit() {
+    var editor = document.getElementById('notes-editor');
+    editor.style.display = editor.style.display === 'none' ? 'block' : 'none';
+}
+
+function saveNotes() {
+    var notes = document.getElementById('notes-input').value.trim();
+    var tags = document.getElementById('tags-input').value.trim();
+    fetchWithTimeout('/api/user/' + uid + '/notes', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({notes: notes, tags: tags})
+    }).then(function(r) { return r.json(); })
+      .then(function(d) {
+          if (d.success) {
+              showToast('备注已保存', 'success');
+              toggleNotesEdit();
+              loadUser();
+          }
+      }).catch(function(err) {
+          showToast('保存失败: ' + err.message, 'error');
+      });
+}
+
+function setAvatar(name, avatarUrl) {
     var el = document.getElementById('user-avatar');
-    if (name && name.length > 0) {
+    el.innerHTML = '';
+    if (avatarUrl) {
+        var img = document.createElement('img');
+        img.src = avatarUrl;
+        img.alt = name || '';
+        img.onerror = function() {
+            // 头像加载失败时回退到首字母
+            el.innerHTML = '';
+            el.textContent = name ? name.charAt(0).toUpperCase() : '?';
+        };
+        el.appendChild(img);
+    } else if (name && name.length > 0) {
         el.textContent = name.charAt(0).toUpperCase();
     }
 }
@@ -282,9 +384,26 @@ function filterTimeline(type) {
 }
 
 var allData = null;
+var sessionSpendChart = null;
+
+function toggleUserChart() {
+    var wrap = document.getElementById('user-chart-wrap');
+    var btn = document.getElementById('user-chart-toggle');
+    var hidden = wrap.style.display === 'none';
+    wrap.style.display = hidden ? 'block' : 'none';
+    btn.textContent = hidden ? '隐藏' : '显示';
+    localStorage.setItem('user-chart-visible', hidden ? '1' : '0');
+    if (hidden && allData) renderSpendChart(allData);
+}
+(function() {
+    if (localStorage.getItem('user-chart-visible') === '0') {
+        document.getElementById('user-chart-wrap').style.display = 'none';
+        document.getElementById('user-chart-toggle').textContent = '显示';
+    }
+})();
 
 function loadUser() {
-    fetch('/api/user?uid=' + encodeURIComponent(uid) + '&detail=1')
+    fetchWithTimeout('/api/user?uid=' + encodeURIComponent(uid) + '&detail=1')
         .then(function(r) { return r.json(); })
         .then(function(data) {
             if (data.error) {
@@ -297,8 +416,16 @@ function loadUser() {
             allData = data;
 
             var name = data.user_name || '';
-            setAvatar(name);
+            var avatarUrl = data.avatar_url || '';
+            setAvatar(name, avatarUrl);
             document.getElementById('user-name').textContent = name || '未知用户';
+
+            /* 跳转到抖音主页按钮 */
+            var douyinLink = document.getElementById('douyin-link');
+            if (data.sec_uid) {
+                douyinLink.href = 'https://www.douyin.com/user/' + data.sec_uid;
+                douyinLink.style.display = '';
+            }
 
             /* Meta tags */
             var metaEl = document.getElementById('user-meta');
@@ -326,6 +453,29 @@ function loadUser() {
                 noClub.textContent = '无粉丝团';
                 metaEl.appendChild(noClub);
             }
+            /* Notes & Tags display */
+            if (data.notes) {
+                var nBadge = document.createElement('span');
+                nBadge.className = 'badge badge-gray';
+                nBadge.textContent = '备注: ' + data.notes;
+                nBadge.title = data.notes;
+                nBadge.style.cssText = 'max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:default;';
+                metaEl.appendChild(nBadge);
+            }
+            if (data.tags) {
+                data.tags.split(',').forEach(function(t) {
+                    t = t.trim();
+                    if (!t) return;
+                    var tBadge = document.createElement('span');
+                    tBadge.className = 'badge badge-blue';
+                    tBadge.textContent = t;
+                    metaEl.appendChild(tBadge);
+                });
+            }
+
+            /* Populate notes editor */
+            document.getElementById('notes-input').value = data.notes || '';
+            document.getElementById('tags-input').value = data.tags || '';
 
             /* Stats */
             var sc = data.total_consume || 0;
@@ -339,8 +489,10 @@ function loadUser() {
             document.getElementById('stat-total-wave').textContent = sc.toLocaleString();
 
             renderSessions(data);
-            renderGifts(data);
+            loadGifts();
+            loadChats();
             renderTable(data);
+            renderSpendChart(data);
         })
         .catch(function(err) {
             document.getElementById('loading').innerHTML =
@@ -392,13 +544,14 @@ function renderSessions(data) {
                 count++;
                 var icon = t.type === 'gift' ? '&#127873;' : '&#128172;';
                 var amt = t.amount ? parseInt(t.amount).toLocaleString() + ' 钻' : '';
-                var timeStr = (t.time || '').substring(11, 19);
+                var timeStr = (t.time || '').length >= 16 ? (t.time || '').substring(5, 16) : (t.time || '').substring(11, 19);
+                var anchorStr = s.anchor_name ? ' <span style="color:var(--text-muted);font-size:11px;">@' + s.anchor_name + '</span>' : '';
                 var row = document.createElement('div');
                 row.style.cssText = 'padding:4px 0;display:flex;gap:10px;align-items:center;';
                 row.innerHTML =
-                    '<span style="color:var(--text-muted);min-width:60px;font-size:12px;">' + timeStr + '</span>' +
+                    '<span style="color:var(--text-muted);min-width:70px;font-size:12px;">' + timeStr + '</span>' +
                     '<span>' + icon + '</span>' +
-                    '<span style="flex:1;">' + t.content + '</span>' +
+                    '<span style="flex:1;">' + t.content + anchorStr + '</span>' +
                     (amt ? '<span style="color:#e67e22;margin-left:auto;font-weight:600;font-size:12px;">' + amt + '</span>' : '');
                 body.appendChild(row);
             });
@@ -422,35 +575,124 @@ function renderSessions(data) {
     });
 }
 
-function renderGifts(data) {
+function loadGifts() {
+    fetchWithTimeout('/api/user/' + encodeURIComponent(uid) + '/gifts')
+        .then(function(r) { return r.json(); })
+        .then(function(gifts) {
+            renderGifts(gifts);
+        })
+        .catch(function(err) {
+            document.getElementById('gift-table-body').innerHTML =
+                '<tr><td colspan="5" style="text-align:center;padding:30px;color:var(--danger);">加载失败</td></tr>';
+        });
+}
+
+function renderGifts(gifts) {
     var tbody = document.getElementById('gift-table-body');
-    if (!data.sessions) {
-        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:30px;color:var(--text-muted);">暂无</td></tr>';
+    if (!gifts || gifts.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px;color:var(--text-muted);">暂无</td></tr>';
         return;
     }
-    var rows = [];
-    data.sessions.forEach(function(s) {
-        if (s.timeline) {
-            s.timeline.forEach(function(t) {
-                if (t.type === 'gift') rows.push(t);
-            });
-        }
-    });
-    if (rows.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:30px;color:var(--text-muted);">暂无</td></tr>';
-        return;
-    }
-    rows.forEach(function(t) {
+    gifts.forEach(function(g) {
         var tr = document.createElement('tr');
-        var parts = (t.content || '').split(' x ');
-        var giftName = parts[0] || t.content;
-        var giftCount = parts.length > 1 ? parts[1] : '1';
+        var dt = g.created_at || '';
         tr.innerHTML =
-            '<td>' + (t.time || '').substring(11, 19) + '</td>' +
-            '<td>' + giftName + '</td>' +
-            '<td>' + giftCount + '</td>' +
-            '<td>' + (t.amount || 0) + '</td>';
+            '<td>' + (dt.length >= 16 ? dt.substring(5, 16).replace(' ', '<br>') : dt.substring(11, 19)) + '</td>' +
+            '<td>' + (g.anchor_name || '') + '</td>' +
+            '<td>' + (g.gift_name || '') + '</td>' +
+            '<td>' + (g.gift_count || 0) + '</td>' +
+            '<td>' + (g.diamond_total || 0) + '</td>';
         tbody.appendChild(tr);
+    });
+}
+
+var chatPage = 1;
+var chatSize = 50;
+var chatTotal = 0;
+
+function loadChats(page) {
+    var p = page || 1;
+    fetchWithTimeout('/api/chat?user_id=' + encodeURIComponent(uid) + '&page=' + p + '&size=' + chatSize)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            chatPage = data.page || p;
+            chatTotal = data.total || 0;
+            renderChats(data);
+            renderChatPagination();
+        })
+        .catch(function(err) {
+            document.getElementById('chat-table-body').innerHTML =
+                '<tr><td colspan="5" style="text-align:center;padding:30px;color:var(--danger);">加载失败</td></tr>';
+        });
+}
+
+function renderChats(data) {
+    var tbody = document.getElementById('chat-table-body');
+    if (!data.chats || data.chats.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px;color:var(--text-muted);">暂无弹幕记录</td></tr>';
+        return;
+    }
+    tbody.innerHTML = '';
+    data.chats.forEach(function(c) {
+        var tr = document.createElement('tr');
+        var dt = c.time || '';
+        tr.innerHTML =
+            '<td>' + (dt.length >= 16 ? dt.substring(5, 16).replace(' ', '<br>') : dt.substring(11, 19)) + '</td>' +
+            '<td>' + (c.anchor_name || '') + '</td>' +
+            '<td style="max-width:400px;word-break:break-all;">' + (c.content || '') + '</td>' +
+            '<td>' + (c.grade || '-') + '</td>' +
+            '<td>' + (c.fans_club || '-') + '</td>';
+        tbody.appendChild(tr);
+    });
+}
+
+function renderChatPagination() {
+    var el = document.getElementById('chat-pagination');
+    if (!el) return;
+    var totalPages = Math.ceil(chatTotal / chatSize);
+    if (totalPages <= 1) { el.innerHTML = ''; return; }
+    var html = '';
+    html += '<button onclick="loadChats(1)" ' + (chatPage <= 1 ? 'disabled' : '') +
+        ' style="padding:4px 12px;border:1px solid var(--border);border-radius:4px;background:var(--card);cursor:pointer;font-size:12px;">首页</button>';
+    html += '<button onclick="loadChats(' + (chatPage - 1) + ')" ' + (chatPage <= 1 ? 'disabled' : '') +
+        ' style="padding:4px 12px;border:1px solid var(--border);border-radius:4px;background:var(--card);cursor:pointer;font-size:12px;">上一页</button>';
+    html += '<span style="font-size:12px;color:var(--text-muted);padding:4px 8px;">第 ' + chatPage + ' / ' + totalPages + ' 页（共 ' + chatTotal + ' 条）</span>';
+    html += '<button onclick="loadChats(' + (chatPage + 1) + ')" ' + (chatPage >= totalPages ? 'disabled' : '') +
+        ' style="padding:4px 12px;border:1px solid var(--border);border-radius:4px;background:var(--card);cursor:pointer;font-size:12px;">下一页</button>';
+    html += '<button onclick="loadChats(' + totalPages + ')" ' + (chatPage >= totalPages ? 'disabled' : '') +
+        ' style="padding:4px 12px;border:1px solid var(--border);border-radius:4px;background:var(--card);cursor:pointer;font-size:12px;">末页</button>';
+    el.innerHTML = html;
+}
+
+function exportChatCSV() {
+    if (!uid) { showToast('用户ID为空', 'error'); return; }
+    showCsvColumnSelector('/api/chat/csv?user_id=' + encodeURIComponent(uid),
+        ['time', 'user_id', 'user_name', 'anchor_name', 'content', 'grade', 'fans_club', '链接']);
+}
+
+function renderSpendChart(data) {
+    if (sessionSpendChart) { sessionSpendChart.destroy(); sessionSpendChart = null; }
+    var sessions = (data.sessions || []).slice().reverse().slice(-15);
+    if (sessions.length < 2) return;
+    var labels = sessions.map(function(s) {
+        return (s.start_time || '').substring(0, 10) + ' #' + s.id;
+    });
+    var values = sessions.map(function(s) { return s.consume || 0; });
+    sessionSpendChart = new Chart(document.getElementById('session-spend-chart'), {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [{data: values, backgroundColor: '#6366f1', borderRadius: 4}]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            plugins: {legend: {display: false}},
+            scales: {
+                x: {ticks: {font: {size: 10}}, grid: {display: false}},
+                y: {beginAtZero: true, ticks: {font: {size: 10}, callback: function(v) { return v >= 10000 ? (v/10000).toFixed(1)+'w' : v.toLocaleString(); }}}
+            }
+        }
     });
 }
 
@@ -494,12 +736,15 @@ function renderTierBadges(value) {
 
 function exportTimelineCSV() {
     if (!uid) { showToast('用户ID为空', 'error'); return; }
-    window.location.href = '/api/user/' + encodeURIComponent(uid) + '/timeline/csv';
+    showCsvColumnSelector('/api/user/' + encodeURIComponent(uid) + '/timeline/csv',
+        ['time', 'type', 'anchor_name', 'content', 'amount', 'grade', '用户链接']);
 }
 
 function exportUserCSV() {
     if (!uid) { showToast('用户ID为空', 'error'); return; }
-    window.location.href = '/api/user/' + encodeURIComponent(uid) + '/csv';
+    showCsvColumnSelector('/api/user/' + encodeURIComponent(uid) + '/csv',
+        ['user_id', 'user_name', 'grade', 'fans_club', 'session_id', 'anchor',
+         'start_time', 'end_time', 'consume', 'gift_count', 'chat_count', '场次链接']);
 }
 
 loadUser();

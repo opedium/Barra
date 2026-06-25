@@ -14,12 +14,19 @@
     <!-- Locked Session Banner -->
     <div id="locked-banner" class="locked-banner" style="display:none;"></div>
 
+    <!-- Live Session Selector -->
+    <div id="session-selector" style="display:none;margin-bottom:10px;padding:6px 12px;background:var(--card);border:1px solid var(--border);border-radius:8px;">
+        <span style="font-size:12px;color:var(--text-muted);">切换直播间:</span>
+        <select id="session-select" onchange="onSessionChange(this.value)" style="margin-left:8px;font-size:13px;"></select>
+    </div>
+
     <!-- Controls -->
     <div class="filter-bar lb-filter-bar">
         <div class="btn-group" id="period-group">
             <button class="active" data-period="session">当前直播</button>
             <button data-period="today">今日</button>
             <button data-period="month">本月</button>
+            <button data-period="30d">近30天</button>
             <button data-period="all">全部</button>
             <button data-period="million">月百万</button>
         </div>
@@ -29,6 +36,7 @@
 
         <span class="threshold-label">门槛</span>
         <select id="threshold-select">
+            <option value="0" selected>全部</option>
             <option value="1000">1,000</option>
             <option value="3000">3,000</option>
             <option value="10000">10,000</option>
@@ -38,9 +46,32 @@
 
         <span class="filter-divider"></span>
 
+        <span class="threshold-label">最低消费</span>
+        <input type="number" id="min-consume-input" class="custom-threshold-input" placeholder="0" value="0">
+
+        <span class="filter-divider"></span>
+
+        <span class="threshold-label">Top N</span>
+        <input type="number" id="topn-input" class="custom-threshold-input" placeholder="50" value="50" min="1">
+
+        <span class="filter-divider"></span>
+
         <button id="sort-btn" class="sort-btn" onclick="toggleSort()">按贡献值</button>
         <button onclick="loadData()" class="btn-refresh">&#x27F3; 刷新</button>
         <button onclick="exportCSV()" class="btn-csv">&#x2B06; 导出CSV</button>
+    </div>
+
+    <!-- Chart -->
+    <div id="lb-chart-card" style="display:none;margin-bottom:16px;">
+        <div class="flex-between" style="margin-bottom:6px;">
+            <h3 style="font-size:13px;color:var(--text-muted);margin:0;">TOP 10 贡献对比</h3>
+            <button id="lb-chart-toggle" onclick="toggleLbChart()"
+                    style="background:none;border:1px solid var(--border);color:var(--text-muted);
+                           font-size:11px;cursor:pointer;padding:2px 8px;border-radius:4px;">隐藏</button>
+        </div>
+        <div id="lb-chart-wrap">
+            <canvas id="lb-bar-chart" style="max-height:280px;"></canvas>
+        </div>
     </div>
 
     <!-- Table -->
@@ -49,6 +80,7 @@
             <thead>
                 <tr>
                     <th>排名</th>
+                    <th>头像</th>
                     <th>昵称</th>
                     <th>ID</th>
                     <th>粉丝团</th>
@@ -240,8 +272,26 @@
 </style>
 
 <script>
-var currentPage = 1, currentThreshold = 1000, currentPeriod = 'session', currentSort = 'consume';
+var currentPage = 1, currentThreshold = 0, currentPeriod = 'session', currentSort = 'consume', currentMinConsume = 0, currentTopN = 50;
 var lockedSessionId = null;
+var lbBarChart = null;
+
+function toggleLbChart() {
+    var wrap = document.getElementById('lb-chart-wrap');
+    var btn = document.getElementById('lb-chart-toggle');
+    var hidden = wrap.style.display === 'none';
+    wrap.style.display = hidden ? 'block' : 'none';
+    btn.textContent = hidden ? '隐藏' : '显示';
+    localStorage.setItem('lb-chart-visible', hidden ? '1' : '0');
+}
+(function() {
+    if (localStorage.getItem('lb-chart-visible') === '0') {
+        var wrap = document.getElementById('lb-chart-wrap');
+        if (wrap) wrap.style.display = 'none';
+        var btn = document.getElementById('lb-chart-toggle');
+        if (btn) btn.textContent = '显示';
+    }
+})();
 
 // Check URL for session_id
 var params = new URLSearchParams(window.location.search);
@@ -253,14 +303,75 @@ if (params.get('session_id')) {
         document.getElementById('locked-banner').innerHTML = '<span>&#128274; 查看场次 #' + lockedSessionId + ' 榜单</span><a href="/leaderboard">取消锁定</a>';
         document.querySelectorAll('#period-group button').forEach(function(b) { b.disabled = true; b.style.opacity = '0.5'; });
     }
+    loadSessionSelector();
+}
+
+function loadSessionSelector() {
+    fetchWithTimeout('/api/sessions?limit=50')
+        .then(function(r) { return r.json(); })
+        .then(function(sessions) {
+            if (!sessions || sessions.length <= 1) return;
+            // Group by anchor_name, show latest session per anchor
+            var seen = {}, filtered = [];
+            sessions.forEach(function(s) {
+                var key = s.anchor_name || s.room_id;
+                if (!seen[key]) { seen[key] = true; filtered.push(s); }
+            });
+            if (filtered.length <= 1) return;
+            var sel = document.getElementById('session-select');
+            sel.innerHTML = '';
+            filtered.forEach(function(s) {
+                var opt = document.createElement('option');
+                opt.value = s.id;
+                var label = (s.anchor_name || s.room_id) + ' (#' + s.id + ')';
+                if (s.status === 'live') label = '🔴 ' + label;
+                opt.textContent = label;
+                if (lockedSessionId && s.id === lockedSessionId) opt.selected = true;
+                sel.appendChild(opt);
+            });
+            document.getElementById('session-selector').style.display = 'flex';
+        });
+}
+function onSessionChange(sid) {
+    lockedSessionId = parseInt(sid);
+    currentPage = 1;
+    document.getElementById('locked-banner').style.display = 'flex';
+    document.getElementById('locked-banner').innerHTML = '<span>&#128274; 查看场次 #' + lockedSessionId + ' 榜单</span><a href="/leaderboard">取消锁定</a>';
+    document.querySelectorAll('#period-group button').forEach(function(b) { b.disabled = true; b.style.opacity = '0.5'; });
+    loadData();
 }
 
 function toggleControls(period) {
     var isMillion = period === 'million';
-    var isMonth = period === 'month' || isMillion;
-    document.getElementById('threshold-select').style.display = isMillion ? 'none' : '';
-    document.getElementById('custom-threshold').style.display = isMillion ? 'none' : '';
-    document.getElementById('sort-btn').style.display = isMillion ? 'none' : '';
+    var isSession = period === 'session';
+    var is30d = period === '30d';
+
+    // 门槛 + 自定义: only session (uses qualified_1000/3000/10000/100000 columns)
+    var showThreshold = period === 'session';
+    document.getElementById('threshold-select').style.display = showThreshold ? '' : 'none';
+    document.getElementById('custom-threshold').style.display = showThreshold ? '' : 'none';
+
+    // 最低消费: today, month, 30d, all (simple single-input filter)
+    var showMinConsume = period === 'today' || period === 'month' || period === '30d' || period === 'all';
+    document.getElementById('min-consume-input').style.display = showMinConsume ? '' : 'none';
+
+    // 排序按钮: session, today, month, all (not 30d, not million)
+    var showSort = period === 'session' || period === 'today' || period === 'month' || period === 'all';
+    document.getElementById('sort-btn').style.display = showSort ? '' : 'none';
+
+    // Top N: today, month, 30d, all (not session, not million)
+    var showTopN = !isMillion && !isSession;
+    document.getElementById('topn-input').style.display = showTopN ? '' : 'none';
+
+    // Dividers: only show when BOTH surrounding controls are visible
+    document.querySelectorAll('.filter-divider')[0].style.display = (showThreshold && showMinConsume) ? '' : 'none';
+    document.querySelectorAll('.filter-divider')[1].style.display = showMinConsume ? '' : 'none';
+    document.querySelectorAll('.filter-divider')[2].style.display = (showTopN && showSort) ? '' : 'none';
+
+    // 月选择器: month, million, all
+    var showPicker = period === 'month' || period === 'million' || period === 'all';
+    document.getElementById('month-picker').style.display = showPicker ? '' : 'none';
+
     var picker = document.getElementById('month-picker');
     if (!picker.value) {
         var d = new Date();
@@ -290,6 +401,14 @@ document.getElementById('period-group').addEventListener('click', function(e) {
         e.target.className = 'active';
         currentPeriod = e.target.dataset.period;
         currentPage = 1;
+        // Reset filters when switching periods
+        currentMinConsume = 0;
+        document.getElementById('min-consume-input').value = '0';
+        if (currentPeriod === 'session') {
+            currentThreshold = parseInt(document.getElementById('threshold-select').value) || 1000;
+        } else {
+            currentThreshold = 1000;
+        }
         toggleControls(currentPeriod);
         if (currentPeriod !== 'month') document.querySelector('[data-period="month"]').textContent = '本月';
         if (currentPeriod !== 'million') document.querySelector('[data-period="million"]').textContent = '月百万';
@@ -306,6 +425,20 @@ document.getElementById('threshold-select').addEventListener('change', function(
 document.getElementById('custom-threshold').addEventListener('change', function() {
     var v = parseInt(this.value);
     if (v > 0) { currentThreshold = v; currentPage = 1; loadData(); }
+});
+
+document.getElementById('min-consume-input').addEventListener('change', function() {
+    var v = parseInt(this.value);
+    currentMinConsume = v > 0 ? v : 0;
+    currentPage = 1;
+    loadData();
+});
+
+document.getElementById('topn-input').addEventListener('change', function() {
+    var v = parseInt(this.value);
+    currentTopN = v > 0 ? v : 50;
+    currentPage = 1;
+    loadData();
 });
 
 function toggleSort() {
@@ -329,7 +462,7 @@ function loadData() {
 
     if (isMillion) {
         var ym = document.getElementById('month-picker').value || '';
-        fetch('/api/million?page=' + currentPage + '&size=50&year_month=' + ym)
+        fetchWithTimeout('/api/million?page=' + currentPage + '&size=50&year_month=' + ym)
             .then(function(r) { return r.json(); })
             .then(function(data) {
                 el.style.display = 'none';
@@ -353,7 +486,8 @@ function loadData() {
                     tbody.appendChild(tr);
                 });
                 tbl.style.display = 'table';
-                var totalPages = Math.ceil(data.total / 50);
+                var pageSize = currentPeriod === 'million' ? 50 : currentTopN;
+                var totalPages = Math.ceil(data.total / pageSize);
                 if (totalPages > 1) {
                     var html = '';
                     if (currentPage > 1) html += '<a href="#" onclick="gotoPage(' + (currentPage-1) + ');return false;">&#8249;</a>';
@@ -371,14 +505,14 @@ function loadData() {
         return;
     }
 
-    var url = '/api/leaderboard?threshold=' + currentThreshold + '&period=' + currentPeriod + '&page=' + currentPage + '&size=50&sort_by=' + currentSort;
+    var url = '/api/leaderboard?threshold=' + currentThreshold + '&period=' + currentPeriod + '&page=' + currentPage + '&size=' + currentTopN + '&sort_by=' + currentSort + '&min_consume=' + currentMinConsume;
     if (lockedSessionId) url += '&session_id=' + lockedSessionId;
-    if (currentPeriod === 'month' || isMillion) {
+    if (currentPeriod === 'month' || currentPeriod === '30d' || currentPeriod === 'all' || isMillion) {
         var ym = document.getElementById('month-picker').value || '';
         if (ym) url += '&year_month=' + ym;
     }
 
-    fetch(url)
+    fetchWithTimeout(url)
         .then(function(r) { return r.json(); })
         .then(function(data) {
             el.style.display = 'none';
@@ -386,14 +520,18 @@ function loadData() {
             tc.style.display = '';
             tbody.innerHTML = '';
             if (!data.users || data.users.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-soft);padding:30px;">暂无数据</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--text-soft);padding:30px;">暂无数据</td></tr>';
                 tbl.style.display = 'table';
                 return;
             }
             data.users.forEach(function(u) {
                 var tr = document.createElement('tr');
                 var rankClass = u.rank === 1 ? 'rank-1' : (u.rank === 2 ? 'rank-2' : (u.rank === 3 ? 'rank-3' : ''));
+                var avatarHtml = u.avatar_url
+                    ? '<img src="' + u.avatar_url + '" style="width:32px;height:32px;border-radius:50%;object-fit:cover;" onerror="this.style.display=\'none\'">'
+                    : '<div style="width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#06b6d4);display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:#fff;">' + (u.user_name || '?').charAt(0).toUpperCase() + '</div>';
                 tr.innerHTML = '<td class="' + rankClass + '" style="font-weight:600;">#' + u.rank + '</td>' +
+                    '<td style="padding:4px;">' + avatarHtml + '</td>' +
                     '<td><a href="/user?uid=' + u.user_id + '" style="font-weight:500;">' + u.user_name + '</a></td>' +
                     '<td style="font-family:var(--font-mono);font-size:12px;color:var(--text-soft);">' + u.user_id + '</td>' +
                     '<td style="font-size:12px;">' + (u.fans_club || '-') + '</td>' +
@@ -404,8 +542,10 @@ function loadData() {
                 tbody.appendChild(tr);
             });
             tbl.style.display = 'table';
+            renderLeaderboardChart(data.users, currentPeriod);
 
-            var totalPages = Math.ceil(data.total / 50);
+            var pageSize = currentPeriod === 'million' ? 50 : currentTopN;
+            var totalPages = Math.ceil(data.total / pageSize);
             if (totalPages > 1) {
                 var html = '';
                 if (currentPage > 1) html += '<a href="#" onclick="gotoPage(' + (currentPage-1) + ');return false;">&#8249;</a>';
@@ -417,9 +557,43 @@ function loadData() {
         })
         .catch(function(err) {
             el.style.display = 'none';
-            document.getElementById('table-body').innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--danger);">加载失败: ' + err.message + '</td></tr>';
+            document.getElementById('table-body').innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--danger);">加载失败: ' + err.message + '</td></tr>';
             document.getElementById('data-table').style.display = 'table';
         });
+}
+
+function renderLeaderboardChart(users, period) {
+    if (lbBarChart) { lbBarChart.destroy(); lbBarChart = null; }
+    var card = document.getElementById('lb-chart-card');
+    if (period === 'million' || !users || users.length < 2) {
+        card.style.display = 'none';
+        return;
+    }
+    card.style.display = 'block';
+    var top = users.slice(0, 10).reverse();
+    var labels = top.map(function(u) { return u.user_name || u.user_id; });
+    var data = top.map(function(u) { return u.consume || u.total_consume || 0; });
+    var colors = top.map(function(_, i) {
+        var idx = top.length - 1 - i;
+        if (idx === 0) return '#f59e0b';
+        if (idx === 1) return '#94a3b8';
+        if (idx === 2) return '#cd7f32';
+        return '#6366f1';
+    });
+    lbBarChart = new Chart(document.getElementById('lb-bar-chart'), {
+        type: 'bar',
+        data: {labels: labels, datasets: [{data: data, backgroundColor: colors, borderRadius: 4}]},
+        options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: true,
+            plugins: {legend: {display: false}},
+            scales: {
+                x: {ticks: {font: {size: 10}, callback: function(v) { return v >= 10000 ? (v/10000).toFixed(1)+'w' : v.toLocaleString(); }}, grid: {display: false}},
+                y: {ticks: {font: {size: 11}}}
+            }
+        }
+    });
 }
 
 function gotoPage(p) { currentPage = p; loadData(); }
@@ -428,12 +602,18 @@ function exportCSV() {
     var isMillion = currentPeriod === 'million';
     var url = isMillion ? '/api/million/csv' : '/api/leaderboard/csv';
     url += '?period=' + currentPeriod + '&threshold=' + currentThreshold + '&sort_by=' + currentSort;
+    if (currentMinConsume > 0) url += '&min_consume=' + currentMinConsume;
     if (lockedSessionId) url += '&session_id=' + lockedSessionId;
-    if (currentPeriod === 'month' || currentPeriod === 'million' || isMillion) {
+    if (currentPeriod === 'month' || currentPeriod === '30d' || currentPeriod === 'all' || isMillion) {
         var ym = document.getElementById('month-picker').value || '';
         if (ym) url += '&year_month=' + ym;
     }
-    window.location.href = url;
+    var cols = isMillion
+        ? ['rank', 'user_id', 'user_name', 'grade', 'fans_club', 'total_consume', 'days_active',
+           'sessions_1000', 'sessions_3000', 'sessions_10000', 'sessions_100000', '链接']
+        : ['rank', 'user_id', 'user_name', 'grade', 'fans_club', 'consume', 'sessions_count',
+           'qualified_1000', 'qualified_3000', 'qualified_10000', 'qualified_100000', '链接'];
+    showCsvColumnSelector(url, cols);
 }
 
 loadData();

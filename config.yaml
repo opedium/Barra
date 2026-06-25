@@ -30,7 +30,7 @@ output:
   roomstats: true               # 直播统计
   contribution: true            # 贡献用户排行（1000贡献用户列表 Top 3）
   control: true                  # 直播状态
-  file_format: csv              # 输出格式: csv / json (JSONL) / both / none
+  file_format: sqlite           # 输出格式: sqlite / csv / json (JSONL) / both / none
   file_dir: data                 # 数据输出目录
 
 # ==================== 网络配置 ====================
@@ -49,4 +49,14 @@ reconnect_max_delay: 120         # 最大重连延迟（秒），退避封顶
 
 # ==================== 统计配置 ====================
 stats_interval: 60              # 吞吐统计打印间隔（秒）
+
+# ==================== Web 面板配置 ====================
+web:
+  host: "0.0.0.0"               # Flask 绑定地址
+  port: 8080                     # Flask 端口
+  password: "xky0304"             # 面板密码（空=无需认证）
+  auto_refresh: 30               # 仪表盘自动刷新间隔（秒，0=禁用）
+  rate_limit:
+    enabled: true                  # 是否启用抖音 API 请求限流
+    max_per_minute: 30             # 每分钟最大请求数
 

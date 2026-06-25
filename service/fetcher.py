@@ -46,8 +46,7 @@ from base.utils import (
     rotate_ua,
 )
 from base.output import setup_logger, DataRecorder, ThroughputCounter, BARRAGE, RoomLogFilter, display_width, is_ci_environment
-from base.parser import get_dedup_stats, set_dedup_csv_dir, flush_dedup_stats, get_contribution_count, flush_contribution_csv
-from base.sqlite_writer import init_db, create_session, end_session, flush_to_sqlite, record_chat, record_gift, upsert_user
+from base.parser import get_dedup_stats, set_dedup_csv_dir, flush_dedup_stats, init_db, create_session, end_session, flush_to_sqlite, record_chat, record_gift, upsert_user, _get_conn
 from service.network import (
     fetch_ttwid, enter_room_api, download_image,
     build_http_headers,
@@ -163,6 +162,9 @@ class DouyinBarrage:
         self._ws = None
         self._connected_event = threading.Event()
         self._stop_event = threading.Event()
+        self._started = False
+        self._connected_at = 0.0
+        self._last_error = ''
 
         # ── 线程引用 ──
         self._loop = None
@@ -239,6 +241,44 @@ class DouyinBarrage:
         """显示用名称：优先主播名，降级为 live_id。"""
         return self.anchor_name or self.live_id
 
+    def get_status(self):
+        """返回采集器当前状态的摘要 dict，供 Web 面板展示。
+
+        Returns:
+            dict 包含 status, anchor_name, room_id, live_status,
+            message_count, uptime_seconds, last_error 等字段。
+        """
+        info = {
+            'live_id': self.live_id,
+            'anchor_name': self.anchor_name,
+            'room_id': self._room_id or '',
+            'live_status': self._room_info.get('status', 0) if self._room_info else 0,
+            'message_count': self._counter._count if hasattr(self, '_counter') else 0,
+            'last_error': getattr(self, '_last_error', ''),
+        }
+
+        # 检查后台线程是否存活
+        loop_alive = self._loop_thread is not None and self._loop_thread.is_alive()
+        if self._started and not loop_alive and not self._stop_event.is_set():
+            info['last_error'] = info['last_error'] or '后台线程意外退出，请查看日志'
+            info['status'] = 'error'
+            return info
+
+        # 连接状态
+        if not self._started:
+            info['status'] = 'stopped'
+        elif self._connected_event.is_set():
+            info['status'] = 'collecting'
+            info['uptime_seconds'] = int(time.monotonic() - self._connected_at) if hasattr(self, '_connected_at') else 0
+        elif self._room_info is None:
+            info['status'] = 'connecting'
+        elif self._room_info.get('status') == 4:
+            info['status'] = 'waiting'  # 未开播，等待中
+        else:
+            info['status'] = 'connecting'
+
+        return info
+
     # ── 懒加载属性 ────────────────────────────────
 
     @property
@@ -249,6 +289,11 @@ class DouyinBarrage:
             self.session, self.live_id,
             self._login_cookies, self._http_timeout,
         )
+        self._cookie_expire_str = ''
+        self._cookie_mtime = 0
+        if os.path.exists(self._cookie_file):
+            self._cookie_mtime = os.path.getmtime(self._cookie_file)
+
         has_cookie = bool(self._login_cookies.get('sessionid') or
                           self._login_cookies.get('sessionid_ss'))
         expire_date = ''
@@ -265,12 +310,14 @@ class DouyinBarrage:
                               'Jul':'07','Aug':'08','Sep':'09','Oct':'10','Nov':'11','Dec':'12'}
                     mon = months.get(mon_str[:3], '00')
                     expire_date = f'{year}-{mon}-{day}'
+        self._cookie_expire_str = expire_date
 
         if self._login_info['is_login']:
             nick = self._login_info['nickname']
             logger.info(f"[房间] 已登录「{nick}」")
             if expire_date:
                 logger.info(f"[房间] Cookie 有效期至 {expire_date}")
+                self._check_cookie_expiry_warning(expire_date)
         elif has_cookie:
             logger.warning("[房间] Cookie 中存在 sessionid，但服务端返回未登录状态，"
                            "cookie 可能已过期，请重新从浏览器导出")
@@ -278,6 +325,190 @@ class DouyinBarrage:
         else:
             logger.info("[房间] 无登录凭证，以游客模式采集（礼物等信息可能受限）")
         return self._ttwid
+
+    def _check_cookie_expiry_warning(self, expire_str):
+        """Check if cookie expires within 24h and warn."""
+        try:
+            expire_dt = datetime.strptime(expire_str, '%Y-%m-%d')
+            remaining = (expire_dt - datetime.now()).days
+            if remaining <= 1:
+                logger.warning(f"[Cookie] ⚠️ 将在 {remaining} 天后过期 ({expire_str})，请更新 cookie.txt")
+            elif remaining <= 3:
+                logger.info(f"[Cookie] 将在 {remaining} 天后过期 ({expire_str})")
+        except Exception:
+            pass
+
+    def _reload_cookie_if_updated(self):
+        """Reload cookie.txt if modified since last load."""
+        if not os.path.exists(self._cookie_file):
+            return False
+        try:
+            new_mtime = os.path.getmtime(self._cookie_file)
+            if new_mtime > self._cookie_mtime:
+                new_cookies = load_cookies(self._cookie_file)
+                if new_cookies and new_cookies != self._login_cookies:
+                    self._login_cookies = new_cookies
+                    self._cookie_mtime = new_mtime
+                    for name, value in new_cookies.items():
+                        self.session.cookies.set(name, value, domain='.douyin.com')
+                    self._ttwid = None  # force refresh on next use
+                    logger.info(f"[Cookie] 检测到更新，已重载 ({len(new_cookies)} 项)")
+                    return True
+        except Exception as e:
+            logger.debug(f"[Cookie] 重载检查失败: {e}")
+        return False
+
+    def _refresh_cookie_via_http(self):
+        """Hit Douyin homepage to extend cookie session lifetime."""
+        try:
+            resp = self.session.get(
+                'https://www.douyin.com/',
+                headers={'User-Agent': self._ua},
+                timeout=15, allow_redirects=True
+            )
+            if resp.status_code == 200 and 'passport' not in resp.url:
+                # Save refreshed cookies back to file
+                new_cookie_str = '; '.join(
+                    f'{k}={v}' for k, v in self.session.cookies.get_dict().items()
+                    if k in self._login_cookies or k in ('sessionid', 'sessionid_ss', 'sid_guard', 's_v_web_id')
+                )
+                if new_cookie_str:
+                    with open(self._cookie_file, 'w', encoding='utf-8') as f:
+                        f.write(new_cookie_str)
+                    self._cookie_mtime = os.path.getmtime(self._cookie_file)
+                    logger.info("[Cookie] 已刷新并保存到 cookie.txt")
+                    return True
+            logger.debug(f"[Cookie] 刷新请求异常: status={resp.status_code} url={resp.url[:60]}")
+        except Exception as e:
+            logger.debug(f"[Cookie] 刷新失败: {e}")
+        return False
+
+    def _try_playwright_refresh(self):
+        """Use Playwright browser to fully rotate cookies. Returns True on success."""
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            logger.debug("[Cookie] Playwright 未安装，跳过深度刷新")
+            return False
+
+        if not self._login_cookies:
+            return False
+
+        ua = self._ua
+        logger.info("[Cookie] Playwright 深度刷新...")
+        try:
+            with sync_playwright() as p:
+                profile_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           '..', 'browser_profile')
+                context = p.chromium.launch_persistent_context(
+                    os.path.abspath(profile_dir),
+                    headless=True, user_agent=ua,
+                    viewport={'width': 1920, 'height': 1080},
+                    locale='zh-CN',
+                )
+                cookie_objects = []
+                for name, value in self._login_cookies.items():
+                    cookie_objects.append({
+                        'name': name, 'value': value,
+                        'domain': '.douyin.com', 'path': '/',
+                        'httpOnly': False, 'secure': True,
+                    })
+                context.add_cookies(cookie_objects)
+
+                page = context.new_page()
+                page.goto('https://www.douyin.com/', wait_until='domcontentloaded', timeout=30000)
+                page.wait_for_timeout(5000)
+                page.goto('https://live.douyin.com/', wait_until='domcontentloaded', timeout=30000)
+                page.wait_for_timeout(3000)
+
+                raw = context.cookies()
+                new_cookies = {}
+                for c in raw:
+                    if 'douyin.com' in c.get('domain', '') or 'snssdk.com' in c.get('domain', ''):
+                        new_cookies[c['name']] = c['value']
+
+                # Preserve critical cookies that Playwright may drop
+                critical = ['sso_uid_tt', 'sso_uid_tt_ss', 'passport_sso_user_id',
+                           'sid_guard', 'sid_tt', 'uid_tt', 'uid_tt_ss',
+                           'sessionid', 'sessionid_ss', 'odin_tt']
+                for key in critical:
+                    if key in self._login_cookies and key not in new_cookies:
+                        new_cookies[key] = self._login_cookies[key]
+
+                context.close()
+
+                if new_cookies.get('sessionid') or new_cookies.get('sessionid_ss'):
+                    # Write back in Netscape format
+                    import time as _time
+                    expiry = int(_time.time()) + 365 * 24 * 3600
+                    lines = ['# Netscape HTTP Cookie File',
+                             '# https://curl.haxx.se/rfc/cookie_spec.html',
+                             '# This is a generated file! Do not edit.', '']
+                    for name, value in sorted(new_cookies.items()):
+                        lines.append(f'.douyin.com\tTRUE\t/\tTRUE\t{expiry}\t{name}\t{value}')
+                    tmp = self._cookie_file + '.tmp'
+                    with open(tmp, 'w', encoding='utf-8') as f:
+                        f.write('\n'.join(lines) + '\n')
+                    os.replace(tmp, self._cookie_file)
+                    logger.info(f"[Cookie] Playwright 刷新成功 ({len(self._login_cookies)}→{len(new_cookies)} cookies)")
+                    return True
+                else:
+                    logger.warning("[Cookie] Playwright 刷新后丢失 sessionid，保留旧 cookie")
+                    return False
+        except Exception as e:
+            logger.warning(f"[Cookie] Playwright 刷新失败: {e}")
+            return False
+
+    def _cookie_watchdog_loop(self):
+        """Background thread: auto-reload, HTTP keepalive, Playwright deep refresh."""
+        check_interval = 600       # 10 minutes
+        http_interval = 6 * 3600   # HTTP keepalive every 6 hours
+        playwright_interval = 24 * 3600  # Playwright deep refresh every 24 hours
+        last_http = time.time()
+        last_playwright = time.time()  # don't run immediately on startup
+        while not self._stop_event.is_set():
+            self._stop_event.wait(check_interval)
+            if self._stop_event.is_set():
+                break
+            try:
+                # 1. Reload if cookie.txt was updated externally (by Playwright or manual)
+                if self._reload_cookie_if_updated():
+                    last_http = time.time()
+                    continue
+
+                # 2. Expiry warning → trigger Playwright immediately if < 24h
+                if self._cookie_expire_str:
+                    try:
+                        expire_dt = datetime.strptime(self._cookie_expire_str, '%Y-%m-%d')
+                        remaining_hours = (expire_dt - datetime.now()).total_seconds() / 3600
+                        if remaining_hours < 12:
+                            logger.warning(f"[Cookie] ⚠️ 仅剩 {remaining_hours:.0f}h 过期，Playwright 深度刷新...")
+                            if self._try_playwright_refresh():
+                                self._ttwid = None
+                                last_http = time.time()
+                                last_playwright = time.time()
+                                if self._reload_cookie_if_updated():
+                                    continue
+                    except Exception:
+                        pass
+
+                # 3. HTTP keepalive (every 6 hours)
+                if time.time() - last_http > http_interval and self._login_cookies:
+                    logger.info("[Cookie] HTTP keepalive...")
+                    if self._refresh_cookie_via_http():
+                        last_http = time.time()
+                        self._ttwid = None
+
+                # 4. Playwright deep refresh (every 24 hours)
+                if time.time() - last_playwright > playwright_interval and self._login_cookies:
+                    if self._try_playwright_refresh():
+                        last_playwright = time.time()
+                        last_http = time.time()
+                        self._ttwid = None
+                        if self._reload_cookie_if_updated():
+                            continue
+            except Exception as e:
+                logger.debug(f"[Cookie] watchdog 异常: {e}")
 
     @property
     def room_id(self):
@@ -297,6 +528,7 @@ class DouyinBarrage:
 
     def start(self):
         """启动采集：HTTP 预请求在主线程完成，asyncio 事件循环在后台线程运行。"""
+        self._started = True
         logger.info(f"[启动] live_id: {self.live_id}")
         logger.info(f"[启动] UA: {self._ua}")
         logger.info(f"[启动] user_unique_id: {self._user_unique_id}")
@@ -320,6 +552,13 @@ class DouyinBarrage:
             target=self._run_event_loop, daemon=False, name='async-loop'
         )
         self._loop_thread.start()
+
+        # Cookie watchdog: auto-reload on file change, refresh before expiry
+        if self._login_cookies:
+            self._cookie_watchdog_thread = threading.Thread(
+                target=self._cookie_watchdog_loop, daemon=True, name='cookie-watchdog'
+            )
+            self._cookie_watchdog_thread.start()
 
     def _run_event_loop(self):
         """在后台线程运行 asyncio 事件循环。"""
@@ -410,6 +649,15 @@ class DouyinBarrage:
             if self._waiting_live:
                 return
             self._waiting_live = True
+
+        # 结束当前数据库场次，避免已结束的直播仍显示"直播中"
+        if self._session_id:
+            try:
+                end_session(self._session_id)
+            except Exception:
+                pass
+            self._session_id = None
+
         poll_interval = self.config.get('live_check_interval', 30)
         label = self.display_name
         logger.info(f'[控制] {label} 监测中（间隔 {poll_interval}s）')
@@ -669,6 +917,20 @@ class DouyinBarrage:
                     except Exception as e:
                         logger.warning(f"[DB] 创建场次失败: {e}")
 
+                # 将主播信息写入 users 表（sec_uid、头像），确保主播在榜单/用户页可见
+                if self._room_info:
+                    try:
+                        anchor_uid = self._room_info.get('anchor_user_id', '')
+                        if anchor_uid:
+                            upsert_user(
+                                anchor_uid,
+                                self._room_info.get('anchor_name', ''),
+                                sec_uid=self._room_info.get('sec_uid', ''),
+                                avatar_url=self._room_info.get('anchor_avatar', ''),
+                            )
+                    except Exception:
+                        pass
+
                 # 每次 WebSocket 连接前重新生成 user_unique_id
                 old_uid = self._user_unique_id
                 self._user_unique_id = generate_user_unique_id()
@@ -678,7 +940,8 @@ class DouyinBarrage:
                 wss = build_websocket_url(self._room_id, self._user_unique_id, self._ua_version, self._ws_host, self._ws_path)
                 signature = generate_signature(self._room_id, self._user_unique_id)
                 if not signature:
-                    logger.error("[签名] X-Bogus 签名生成失败，Node.js 未安装或 sign.js 异常，停止采集")
+                    self._last_error = "X-Bogus 签名生成失败，请确认 Node.js 已安装"
+                    logger.error(f"[签名] {self._last_error}，停止采集")
                     break
                 wss += f"&signature={signature}"
                 logger.debug(f"[签名] 生成: signature='{signature}', 长度={len(signature)}, "
@@ -721,10 +984,11 @@ class DouyinBarrage:
 
                     # ── 连接状态初始化 ──
                     self._connected_event.set()
+                    self._connected_at = time.monotonic()
+                    self._last_error = ''
                     with self._last_msg_time_lock:
                         self._last_msg_time = time.time()
                     self._ws_connected_at = time.time()
-                    self._reconnect_count = 0
                     self._last_seq_id = 0
                     self._frame_gaps = 0
                     self._frame_total = 0
@@ -824,8 +1088,10 @@ class DouyinBarrage:
                         f"  handshake-status={handshake_status}, msg={handshake_msg}, trace-id={trace_id}\n"
                         f"  请检查 sign.js 是否过期或尝试其他端点"
                     )
+                    self._last_error = f"DEVICE_BLOCKED: {handshake_msg or '签名或端点不可用'}"
                     self._stop_event.set()
                 else:
+                    self._last_error = f"WebSocket 连接失败: {str(e)[:200]}"
                     logger.error(f"[连接] WebSocket 异常: {e}")
                 self._connected_event.clear()
 
@@ -834,7 +1100,8 @@ class DouyinBarrage:
 
             self._reconnect_count += 1
             if max_reconnects > 0 and self._reconnect_count >= max_reconnects:
-                logger.error(f"[重连] 达到最大次数 ({max_reconnects})，停止")
+                self._last_error = f"达到最大重连次数 ({max_reconnects})"
+                logger.error(f"[重连] {self._last_error}，停止")
                 break
 
             # 重连前切换 UA
@@ -935,7 +1202,7 @@ class DouyinBarrage:
                     short_name = msg.method.replace('Webcast', '').replace('Message', '').lower()
                     self._counter.inc(short_name, enabled=is_enabled)
 
-                    if msg.method in INTERACTIVE_TYPES:
+                    if msg.method not in LOW_VALUE_TYPES:
                         with self._last_business_msg_time_lock:
                             prev = self._last_business_msg_time
                             self._last_business_msg_time = time.time()
@@ -960,6 +1227,13 @@ class DouyinBarrage:
                                 logger.warning("[控制] 直播间已结束，停止采集")
                                 self._stop_event.set()
                                 self._pending_signal = 'stop'
+                                # 结束当前场次，避免已结束的直播仍显示"直播中"
+                                if self._session_id:
+                                    try:
+                                        end_session(self._session_id)
+                                    except Exception:
+                                        pass
+                                    self._session_id = None
                                 return
                             elif r['action'] == 'wait_live':
                                 self._enter_wait_mode()
@@ -983,9 +1257,11 @@ class DouyinBarrage:
                                 uname = rec_data.get('user_name', '')
                                 ugrade = rec_data.get('grade', '')
                                 uclub = rec_data.get('fans_club', '')
-                                # 只要有用户信息就更新 users 表（记录财富等级、粉丝团）
+                                usec_uid = rec_data.get('sec_uid', '')
+                                uavatar = rec_data.get('avatar_url', '')
+                                # 只要有用户信息就更新 users 表（记录财富等级、粉丝团、sec_uid、头像）
                                 if uid:
-                                    upsert_user(uid, uname, ugrade, uclub)
+                                    upsert_user(uid, uname, ugrade, uclub, usec_uid, uavatar)
                                 if rec_type == 'chat' and rec_data.get('content'):
                                     record_chat(self._session_id,
                                         uid, uname,
@@ -998,8 +1274,51 @@ class DouyinBarrage:
                                         rec_data.get('gift_count', 0),
                                         rec_data.get('diamond_total', 0),
                                         ugrade, uclub)
-                            except Exception:
-                                pass
+                                elif rec_type == 'subscribe' and rec_data.get('diamond'):
+                                    # 会员/星守护订阅：从 DB 查找用户已有的 name/grade/fans_club
+                                    sub_name = rec_data.get('event', '') + rec_data.get('sub_type', '')
+                                    sub_douyin_id = rec_data.get('douyin_id', '')
+                                    sub_uname = rec_data.get('user_name', '')
+                                    sub_uid = sub_douyin_id or uid
+                                    sub_grade = ''
+                                    sub_club = ''
+                                    # Try to resolve user by name OR by douyin_id
+                                    try:
+                                        db = _get_conn()
+                                        row = None
+                                        if sub_uname:
+                                            # Lookup by name (prefer records with real data)
+                                            row = db.execute(
+                                                "SELECT user_id, user_name, grade, fans_club FROM users WHERE user_name = ? AND user_id != ? AND user_name != '' ORDER BY last_seen DESC LIMIT 1",
+                                                (sub_uname, sub_uname)
+                                            ).fetchone()
+                                        if not row and sub_douyin_id:
+                                            # Fallback: lookup by douyin_id
+                                            row = db.execute(
+                                                "SELECT user_id, user_name, grade, fans_club FROM users WHERE user_id = ? AND user_name != '' ORDER BY last_seen DESC LIMIT 1",
+                                                (sub_douyin_id,)
+                                            ).fetchone()
+                                        if row:
+                                            sub_uid = row['user_id']
+                                            sub_uname = sub_uname or row['user_name']
+                                            sub_grade = row['grade'] or ''
+                                            sub_club = row['fans_club'] or ''
+                                    except Exception:
+                                        pass
+                                    # Register/update the user record
+                                    if sub_douyin_id and sub_uname:
+                                        upsert_user(sub_douyin_id, sub_uname, sub_grade, sub_club, '', '')
+                                    elif sub_douyin_id:
+                                        upsert_user(sub_douyin_id, '用户' + sub_douyin_id[-6:], '', '', '', '')
+                                    record_gift(self._session_id,
+                                        sub_uid,
+                                        sub_uname or ('用户' + sub_douyin_id[-6:]),
+                                        sub_name or '订阅',
+                                        1,
+                                        rec_data.get('diamond', 0),
+                                        sub_grade, sub_club)
+                            except Exception as e:
+                                logger.error(f"[DB] SQLite write failed in _process_item: {e} | type={rec_type} user={uid}")
 
                         # PK 消息原始 payload dump
                         if dump_pk_raw:
@@ -1015,8 +1334,6 @@ class DouyinBarrage:
                 except Exception as e:
                     logger.error(f"[数据] 处理 {msg.method} 失败: {e}")
 
-                if self._is_waiting_live() and msg.method in INTERACTIVE_TYPES:
-                    self._on_live_started(source='ws')
             else:
                 if msg.method not in LOW_VALUE_TYPES:
                     self._counter.inc('unknown')
@@ -1181,25 +1498,17 @@ class DouyinBarrage:
                     pct = dd['rejected'] / dd['raw'] * 100 if dd['raw'] else 0
                     logger.info(f"[去重] raw={dd['raw']} passed={dd['passed']} rejected={dd['rejected']}({pct:.1f}%) "
                                 f"| repeat_zero={dd['repeat_zero']} combo_block={dd['combo_block']} "
-                                f"counter_reset={dd['counter_reset']} delta_zero={dd['delta_zero']}")
+                                f"counter_reset={dd['counter_reset']} delta_zero={dd['delta_zero']} "
+                                f"out_of_order={dd['out_of_order']} rc1_dup={dd['rc1_dup']} bulk_dup={dd['bulk_dup']}")
                 if self._frame_total > 0:
                     gap_pct = self._frame_gaps / (self._frame_total + self._frame_gaps) * 100
                     logger.info(f"[帧序] frames={self._frame_total} gaps={self._frame_gaps} loss={gap_pct:.2f}%")
-                # ── 贡献用户统计 ──
-                cc = get_contribution_count()
-                if cc > 0:
-                    logger.info(f"[贡献] 1000贡献用户: {cc} 位")
-                    if self._recorder and self._recorder._dir:
-                        import os
-                        csv_path = os.path.join(self._recorder._dir, 'contribution.csv')
-                        flush_contribution_csv(csv_path)
-                    # 同步写入 SQLite
-                    if self._session_id:
-                        from base.parser import get_contribution_users
-                        try:
-                            flush_to_sqlite(self._session_id, get_contribution_users())
-                        except Exception as e:
-                            logger.debug(f"[DB] flush 异常: {e}")
+                # ── 贡献用户写入 SQLite ──
+                if self._session_id:
+                    try:
+                        flush_to_sqlite(self._session_id)
+                    except Exception as e:
+                        logger.debug(f"[DB] flush 异常: {e}")
 
 
 

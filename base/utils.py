@@ -70,7 +70,9 @@ LOW_VALUE_TYPES = frozenset({
     'WebcastProfitGameStatusMessage',
     'WebcastProfitInteractionScoreMessage',
     'WebcastRanklistAwardMessage',
+    'WebcastRanklistHourEntranceMessage',
     'WebcastRoomCommentTopicMessage',
+    'WebcastRoomDataSyncMessage',
     'WebcastRoomNotifyMessage',
     'WebcastScreenChatMessage',
     'WebcastToastMessage',
@@ -441,3 +443,51 @@ def get_user_id(user):
     """
     s = user.id_str
     return s if s else str(user.id)
+
+
+def get_user_sec_uid(user):
+    """从 User protobuf 中提取 sec_uid。
+
+    sec_uid 是抖音用户的永久标识符（~50位字符串），可跨 session 追踪同一用户，
+    也是调用抖音公开 API 获取用户信息的必需参数。
+
+    Args:
+        user: protobuf User 对象。
+
+    Returns:
+        sec_uid 字符串，缺失时返回空字符串。
+    """
+    try:
+        su = user.sec_uid
+        return su if su else ''
+    except (AttributeError, TypeError):
+        return ''
+
+
+def get_user_avatar_url(user):
+    """从 User protobuf 中提取最佳可用头像 URL。
+
+    优先级：avatar_medium > avatar_thumb > avatar_large
+    （avatar_medium 通常是 1080p WebP 最佳；avatar_large 可能过大导致加载慢）
+
+    每个 Image 对象包含 url_list_list（重复 string 字段），
+    url_list_list[0] 通常是该分辨率级别中最高质量的 URL。
+
+    Args:
+        user: protobuf User 对象。
+
+    Returns:
+        头像 URL 字符串，缺失时返回空字符串。
+    """
+    try:
+        # 优先取中等尺寸（兼顾清晰度和加载速度）
+        for avatar in (user.avatar_medium, user.avatar_thumb, user.avatar_large):
+            try:
+                urls = avatar.url_list_list
+                if urls and urls[0]:
+                    return urls[0]
+            except (AttributeError, IndexError, TypeError):
+                continue
+    except (AttributeError, TypeError):
+        pass
+    return ''

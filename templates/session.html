@@ -2,260 +2,127 @@
 {% block title %}场次 #{{ session_id }}{% endblock %}
 {% block content %}
 <style>
-/* ── Session Page Enhancements ── */
-#gift-section {
-    overflow: hidden;
-    animation: giftFadeIn .35s cubic-bezier(0.22, 1, 0.36, 1);
-}
-@keyframes giftFadeIn {
-    from { opacity: 0; transform: translateY(-8px); }
-    to { opacity: 1; transform: translateY(0); }
-}
-
-.gift-arrow {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border-radius: 6px;
-    font-size: 11px;
-    color: var(--text-muted);
-    transition: background var(--transition-base), transform var(--transition-slow);
-    user-select: none;
-}
-.card .flex-between[onclick]:hover .gift-arrow {
-    background: var(--primary-light);
-}
-
-.stat-card.clickable {
-    cursor: pointer;
-    transition: transform var(--transition-base), box-shadow var(--transition-base), border-color var(--transition-base);
-}
-.stat-card.clickable:hover {
-    transform: translateY(-3px);
-    box-shadow: var(--shadow-lg);
-}
-.stat-card.clickable:active {
-    transform: translateY(-1px);
-}
-.stat-card[data-tier] {
-    border-left: 3px solid var(--tier-color, var(--primary));
-}
-
-/* Session header meta */
-.session-meta {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin-top: 6px;
-    color: var(--text-muted);
-    font-size: 13px;
-}
-.session-meta .sep { color: var(--border); font-size: 10px; }
-
-/* Section header with controls */
-.card-header-controls {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 8px;
-    margin-bottom: 12px;
-}
-.card-header-controls h2 { margin: 0; }
-.card-header-controls .controls-right {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-}
-.page-size-select {
-    padding: 5px 10px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    font-size: 13px;
-    background: var(--card);
-    color: var(--text);
-    outline: none;
-    cursor: pointer;
-    transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
-}
-.page-size-select:focus {
-    border-color: var(--primary);
-    box-shadow: 0 0 0 3px var(--primary-glow);
-}
-.record-count {
-    font-size: 12px;
-    color: var(--text-muted);
-    white-space: nowrap;
-}
-
-/* Session status badge in header */
-.session-status-wrap {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-}
+#gift-section { overflow: hidden; animation: giftFadeIn .35s cubic-bezier(0.22,1,0.36,1); }
+@keyframes giftFadeIn { from{opacity:0;transform:translateY(-8px);} to{opacity:1;transform:translateY(0);} }
+.gift-arrow { display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:6px;font-size:11px;color:var(--text-muted);transition:background var(--transition-base),transform var(--transition-slow);user-select:none; }
+.card .flex-between[onclick]:hover .gift-arrow { background:var(--primary-light); }
+.stat-card.clickable { cursor:pointer;transition:transform var(--transition-base),box-shadow var(--transition-base),border-color var(--transition-base); }
+.stat-card.clickable:hover { transform:translateY(-3px);box-shadow:var(--shadow-lg); }
+.stat-card.clickable:active { transform:translateY(-1px); }
+.stat-card[data-tier] { border-left:3px solid var(--tier-color,var(--primary)); }
+.session-meta { display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-top:6px;color:var(--text-muted);font-size:13px; }
+.session-meta .sep { color:var(--border);font-size:10px; }
+.card-header-controls { display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px; }
+.card-header-controls h2 { margin:0; }
+.card-header-controls .controls-right { display:flex;gap:8px;align-items:center; }
+.page-size-select { padding:5px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;background:var(--card);color:var(--text);outline:none;cursor:pointer; }
+.page-size-select:focus { border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-glow); }
+.record-count { font-size:12px;color:var(--text-muted);white-space:nowrap; }
+.session-status-wrap { display:flex;align-items:center;gap:10px; }
+.btn-sm { padding:4px 12px;font-size:12px;font-weight:600;border-radius:var(--radius-sm);border:1px solid transparent;cursor:pointer;white-space:nowrap; }
+.btn-end { background:#f59e0b;color:#fff;border-color:#f59e0b; }
+.btn-del { background:var(--danger);color:#fff;border-color:var(--danger); }
+.modal-bg { display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:99999;align-items:center;justify-content:center; }
+.modal-bg.on { display:flex; }
+.modal-bx { background:#fff;border-radius:8px;padding:24px;max-width:420px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.3); }
+.modal-bx h3 { margin-top:0; }
+.modal-bx .btns { display:flex;gap:8px;justify-content:flex-end;margin-top:16px; }
 </style>
 
-<div id="loading" class="loading">
-    <div class="spinner"></div>
-    <span class="msg">加载中...</span>
-</div>
+<div id="loading" class="loading"><div class="spinner"></div><span class="msg">加载中...</span></div>
 
 <div id="session-content" style="display:none;">
-    <!-- Header -->
     <div class="card">
         <div class="flex-between" style="align-items:flex-start;flex-wrap:wrap;gap:10px;">
             <div style="min-width:0;flex:1;">
                 <h2 style="margin:0;font-size:18px;" id="session-title"></h2>
                 <div class="session-meta" id="session-meta"></div>
             </div>
-            <span id="session-status-badge" class="badge"></span>
+            <div class="session-status-wrap">
+                <span id="session-status-badge" class="badge"></span>
+                <button class="btn-sm btn-end" id="btn-end" style="display:none;" title="手动结束">结束</button>
+                <button class="btn-sm btn-del" id="btn-del" title="删除场次">删除</button>
+            </div>
         </div>
     </div>
 
-    <!-- Tier Stats -->
     <div class="card">
         <h2>达标用户总览</h2>
         <div class="stats-row" id="tier-stats">
-            <div class="stat-card clickable" data-tier="0" style="--tier-color:var(--text-soft);" onclick="filterTier(0)" id="tier-card-0">
-                <div class="num" id="tier-total">0</div>
-                <div class="label">全部贡献者</div>
-            </div>
-            <div class="stat-card clickable" data-tier="1000" style="--tier-color:#0369a1;" onclick="filterTier(1000)" id="tier-card-1000">
-                <div class="num" id="tier-1000">0</div>
-                <div class="label">1k+ 用户</div>
-            </div>
-            <div class="stat-card clickable" data-tier="3000" style="--tier-color:#15803d;" onclick="filterTier(3000)" id="tier-card-3000">
-                <div class="num" id="tier-3000">0</div>
-                <div class="label">3k+ 用户</div>
-            </div>
-            <div class="stat-card clickable" data-tier="10000" style="--tier-color:#b45309;" onclick="filterTier(10000)" id="tier-card-10000">
-                <div class="num" id="tier-10000">0</div>
-                <div class="label">1w+ 用户</div>
-            </div>
-            <div class="stat-card clickable" data-tier="100000" style="--tier-color:#be123c;" onclick="filterTier(100000)" id="tier-card-100000">
-                <div class="num" id="tier-100000">0</div>
-                <div class="label">10w+ 用户</div>
-            </div>
-            <div class="stat-card" style="border-left-color:var(--primary);">
-                <div class="num" id="stat-diamonds">0</div>
-                <div class="label">总音浪</div>
-            </div>
+            <div class="stat-card clickable" data-tier="0" style="--tier-color:var(--text-soft);" onclick="filterTier(0)" id="tc0"><div class="num" id="tier-total">0</div><div class="label">全部贡献者</div></div>
+            <div class="stat-card clickable" data-tier="1000" style="--tier-color:#0369a1;" onclick="filterTier(1000)" id="tc1000"><div class="num" id="tier-1000">0</div><div class="label">1k+ 用户</div></div>
+            <div class="stat-card clickable" data-tier="3000" style="--tier-color:#15803d;" onclick="filterTier(3000)" id="tc3000"><div class="num" id="tier-3000">0</div><div class="label">3k+ 用户</div></div>
+            <div class="stat-card clickable" data-tier="10000" style="--tier-color:#b45309;" onclick="filterTier(10000)" id="tc10000"><div class="num" id="tier-10000">0</div><div class="label">1w+ 用户</div></div>
+            <div class="stat-card clickable" data-tier="100000" style="--tier-color:#be123c;" onclick="filterTier(100000)" id="tc100000"><div class="num" id="tier-100000">0</div><div class="label">10w+ 用户</div></div>
+            <div class="stat-card" style="border-left-color:var(--primary);"><div class="num" id="stat-diamonds">0</div><div class="label">总音浪</div></div>
         </div>
     </div>
 
-    <!-- Contributors -->
     <div class="card">
         <div class="card-header-controls">
             <h2>贡献榜</h2>
             <div class="controls-right">
                 <span class="record-count" id="top-count"></span>
-                <button onclick="exportContributorsCSV()" style="background:var(--success);color:#fff;border:1px solid var(--success);border-radius:var(--radius-sm);padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;">&#x2B06; CSV</button>
-                <select id="top-size-select" class="page-size-select" onchange="changePageSize()">
-                    <option value="25">25条/页</option>
-                    <option value="50" selected>50条/页</option>
-                    <option value="100">100条/页</option>
-                </select>
+                <button onclick="exportTopCsv()" style="background:var(--success);color:#fff;border:1px solid var(--success);border-radius:var(--radius-sm);padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;">&#x2B06; CSV</button>
+                <select id="top-size" class="page-size-select" onchange="changePageSize()"><option value="25">25条</option><option value="50" selected>50条</option><option value="100">100条</option></select>
             </div>
         </div>
-        <div class="table-wrap">
-            <table>
-                <thead><tr>
-                    <th style="text-align:center;width:50px;">排名</th>
-                    <th>昵称</th>
-                    <th>用户ID</th>
-                    <th>财富等级</th>
-                    <th>粉丝团</th>
-                    <th>达标</th>
-                    <th style="text-align:right;">音浪</th>
-                </tr></thead>
-                <tbody id="top-table-body"></tbody>
-            </table>
-        </div>
-        <div id="top-empty" class="empty-state" style="display:none;">
-            <div class="icon">&#128237;</div>
-            <div>暂无贡献用户</div>
-            <div class="hint">当前筛选条件下没有符合条件的贡献者</div>
-        </div>
-        <div class="pagination" id="top-pagination" style="display:none;margin-top:12px;"></div>
+        <div class="table-wrap"><table><thead><tr><th style="text-align:center;width:50px;">排名</th><th style="width:40px;"></th><th>昵称</th><th>用户ID</th><th>等级</th><th>粉丝团</th><th>达标</th><th style="text-align:right;">音浪</th></tr></thead><tbody id="top-tbody"></tbody></table></div>
+        <div id="top-empty" class="empty-state" style="display:none;"><div class="icon">&#128237;</div><div>暂无贡献用户</div></div>
+        <div class="pagination" id="top-pag" style="display:none;margin-top:12px;"></div>
     </div>
 
-    <!-- Top Gifts (collapsible) -->
     <div class="card">
         <div class="flex-between" style="cursor:pointer;" onclick="toggleGifts()">
             <h2 style="margin:0;">礼物排行</h2>
             <div style="display:flex;align-items:center;gap:8px;">
-                <button onclick="exportGiftsCSV()" style="background:var(--success);color:#fff;border:1px solid var(--success);border-radius:var(--radius-sm);padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;">&#x2B06; CSV</button>
+                <button onclick="exportGiftCsv()" style="background:var(--success);color:#fff;border:1px solid var(--success);border-radius:var(--radius-sm);padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;">&#x2B06; CSV</button>
                 <span id="gift-arrow" class="gift-arrow">&#9654;</span>
             </div>
         </div>
         <div id="gift-section" style="display:none;margin-top:16px;">
-            <div class="table-wrap">
-                <table>
-                    <thead><tr>
-                        <th>礼物</th>
-                        <th>次数</th>
-                        <th>总数量</th>
-                        <th style="text-align:right;">总钻石</th>
-                    </tr></thead>
-                    <tbody id="gift-table-body"></tbody>
-                </table>
-            </div>
-            <div id="gift-empty" class="empty-state" style="display:none;">
-                <div class="icon">&#127873;</div>
-                <div>暂无礼物</div>
-            </div>
+            <div class="table-wrap"><table><thead><tr><th>礼物</th><th>次数</th><th>总数量</th><th style="text-align:right;">总钻石</th></tr></thead><tbody id="gift-tbody"></tbody></table></div>
+            <div id="gift-empty" class="empty-state" style="display:none;"><div class="icon">&#127873;</div><div>暂无礼物</div></div>
+        </div>
+    </div>
+</div>
+
+<div class="modal-bg" id="mdl">
+    <div class="modal-bx">
+        <h3>确认删除场次 #{{ session_id }}</h3>
+        <p style="color:var(--danger);font-size:13px;">将同时删除该场次的全部礼物、弹幕和贡献数据，不可恢复。</p>
+        <div class="btns">
+            <button class="btn-sm" style="background:var(--bg);color:var(--text);border:1px solid var(--border);" onclick="closeMdl()">取消</button>
+            <button class="btn-sm btn-del" onclick="doDelete()">确认删除</button>
         </div>
     </div>
 </div>
 
 <script>
-var sessionId = {{ session_id }};
-var topCurrentPage = 1;
-var topPageSize = 50;
-var currentTierFilter = 0;
+var sid = {{ session_id }};
+var topPage = 1, topSize = 50, tier = 0;
 
 function loadSession() {
-    var loading = document.getElementById('loading');
-    var content = document.getElementById('session-content');
-    loading.style.display = 'flex';
-
+    document.getElementById('loading').style.display = 'flex';
     Promise.all([
-        fetch('/api/sessions/' + sessionId).then(function(r) { return r.json(); }),
-        fetchTopContributors(1, topPageSize)
-    ]).then(function(results) {
-        loading.style.display = 'none';
-        content.style.display = 'block';
-        var d = results[0];
-        var topData = results[1];
-        renderHeader(d);
-        renderTiers(d);
-        renderTopContributors(topData);
-        renderTopGifts(d);
-    }).catch(function(err) {
-        loading.innerHTML = '<span style="color:var(--danger);">加载失败: ' + err.message + '</span>';
+        fetch('/api/sessions/'+sid).then(function(r){return r.json()}),
+        fetchTop(1, topSize)
+    ]).then(function(r){
+        document.getElementById('loading').style.display = 'none';
+        document.getElementById('session-content').style.display = 'block';
+        var d = r[0]; renderHeader(d); renderTiers(d); renderTop(r[1]); renderGifts(d);
+    }).catch(function(e){
+        document.getElementById('loading').innerHTML = '<span style="color:var(--danger);">加载失败: '+e.message+'</span>';
     });
 }
 
 function renderHeader(d) {
-    document.getElementById('session-title').textContent = (d.anchor_name || '未知主播') + ' 的场次 #' + d.id;
-    document.getElementById('session-meta').innerHTML =
-        '房间 ' + d.room_id +
-        ' <span class="sep">&#183;</span> ' +
-        (d.start_time || '').substring(0, 16) +
-        (d.end_time ? ' <span class="sep">&#8594;</span> ' + d.end_time.substring(0, 16) : ' <span class="sep">&#183;</span> 直播中');
-
-    var badge = document.getElementById('session-status-badge');
-    if (d.status === 'live') {
-        badge.textContent = '直播中';
-        badge.className = 'badge badge-green';
-    } else {
-        badge.textContent = '已结束';
-        badge.className = 'badge badge-blue';
-    }
+    document.getElementById('session-title').textContent = (d.anchor_name||'未知')+' 的场次 #'+d.id;
+    document.getElementById('session-meta').innerHTML = '房间 '+d.room_id+' <span class="sep">&#183;</span> '+(d.start_time||'').substring(0,16)+(d.end_time?' <span class="sep">&#8594;</span> '+d.end_time.substring(0,16):' <span class="sep">&#183;</span> 直播中');
+    var b = document.getElementById('session-status-badge');
+    var eb = document.getElementById('btn-end');
+    if (d.status === 'live') { b.textContent='直播中'; b.className='badge badge-green'; eb.style.display='inline-block'; }
+    else { b.textContent='已结束'; b.className='badge badge-blue'; eb.style.display='none'; }
 }
 
 function renderTiers(d) {
@@ -265,7 +132,7 @@ function renderTiers(d) {
     document.getElementById('tier-3000').textContent = t.tier_3000 || 0;
     document.getElementById('tier-10000').textContent = t.tier_10000 || 0;
     document.getElementById('tier-100000').textContent = t.tier_100000 || 0;
-    document.getElementById('stat-diamonds').textContent = d.gift_stats ? (d.gift_stats.total_diamonds || 0).toLocaleString() : '0';
+    document.getElementById('stat-diamonds').textContent = d.gift_stats ? (d.gift_stats.total_diamonds||0).toLocaleString() : '0';
 }
 
 function renderTierBadges(u) {
@@ -277,123 +144,87 @@ function renderTierBadges(u) {
     return b;
 }
 
-function fetchTopContributors(page, size) {
-    var tier = currentTierFilter || 0;
-    return fetch('/api/leaderboard?session_id=' + sessionId + '&page=' + page + '&size=' + size + '&threshold=' + tier)
-        .then(function(r) { return r.json(); });
+function fetchTop(page, size) {
+    return fetch('/api/leaderboard?session_id='+sid+'&page='+page+'&size='+size+'&threshold='+(tier||0)).then(function(r){return r.json()});
 }
 
-function filterTier(tier) {
-    currentTierFilter = tier;
-    topCurrentPage = 1;
-    document.querySelectorAll('#tier-stats .stat-card').forEach(function(c) {
-        c.style.background = '';
-        c.style.boxShadow = '';
-    });
-    var card = document.getElementById('tier-card-' + tier);
-    if (card) {
-        card.style.background = 'var(--primary-light)';
-        card.style.boxShadow = '0 0 0 2px var(--primary)';
-    }
-    fetchTopContributors(1, topPageSize).then(function(data) {
-        renderTopContributors(data);
-    });
+function filterTier(t) {
+    tier = t; topPage = 1;
+    document.querySelectorAll('#tier-stats .stat-card').forEach(function(c){c.style.background='';c.style.boxShadow='';});
+    var card = document.getElementById('tc'+t); if (card) { card.style.background='var(--primary-light)'; card.style.boxShadow='0 0 0 2px var(--primary)'; }
+    fetchTop(1, topSize).then(function(d){renderTop(d);});
 }
 
-function renderTopContributors(d) {
-    var tbody = document.getElementById('top-table-body');
-    var empty = document.getElementById('top-empty');
-    var pag = document.getElementById('top-pagination');
-    var count = document.getElementById('top-count');
-
-    tbody.innerHTML = '';
-    if (!d.users || d.users.length === 0) {
-        empty.style.display = 'block';
-        pag.style.display = 'none';
-        count.textContent = '';
-        return;
-    }
-    empty.style.display = 'none';
-    count.textContent = '共 ' + d.total + ' 位贡献者';
-
-    d.users.forEach(function(u, i) {
+function renderTop(d) {
+    var tb = document.getElementById('top-tbody'); tb.innerHTML = '';
+    var emp = document.getElementById('top-empty');
+    var pag = document.getElementById('top-pag');
+    var cnt = document.getElementById('top-count');
+    if (!d.users || !d.users.length) { emp.style.display='block'; pag.style.display='none'; cnt.textContent=''; return; }
+    emp.style.display='none'; cnt.textContent = '共 '+d.total+' 位贡献者';
+    d.users.forEach(function(u,i){
+        var rk = (topPage-1)*topSize+i+1;
+        var rc = rk===1?'rank-1':(rk===2?'rank-2':(rk===3?'rank-3':''));
+        var av = u.avatar_url ? '<img src="'+u.avatar_url+'" style="width:28px;height:28px;border-radius:50%;object-fit:cover;" onerror="this.style.display=\'none\'">' : '<div style="width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#06b6d4);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff;">'+(u.user_name||'?').charAt(0).toUpperCase()+'</div>';
         var tr = document.createElement('tr');
-        var rank = (topCurrentPage - 1) * topPageSize + i + 1;
-        var rankClass = rank === 1 ? 'rank-1' : (rank === 2 ? 'rank-2' : (rank === 3 ? 'rank-3' : ''));
-
-        tr.innerHTML =
-            '<td class="' + rankClass + '" style="font-weight:600;text-align:center;">#' + rank + '</td>' +
-            '<td><a href="/user?uid=' + u.user_id + '" style="color:var(--primary-dark);font-weight:500;">' + u.user_name + '</a></td>' +
-            '<td style="color:var(--text-soft);font-size:12px;">' + u.user_id + '</td>' +
-            '<td style="font-size:12px;">' + (u.grade || '-') + '</td>' +
-            '<td style="font-size:12px;">' + (u.fans_club || '-') + '</td>' +
-            '<td>' + renderTierBadges(u) + '</td>' +
-            '<td style="font-weight:600;text-align:right;">' + (u.consume || 0).toLocaleString() + '</td>';
-        tbody.appendChild(tr);
+        tr.innerHTML = '<td class="'+rc+'" style="font-weight:600;text-align:center;">#'+rk+'</td><td style="padding:3px;">'+av+'</td><td><a href="/user?uid='+u.user_id+'" style="color:var(--primary-dark);font-weight:500;">'+u.user_name+'</a></td><td style="color:var(--text-soft);font-size:12px;">'+u.user_id+'</td><td style="font-size:12px;">'+(u.grade||'-')+'</td><td style="font-size:12px;">'+(u.fans_club||'-')+'</td><td>'+renderTierBadges(u)+'</td><td style="font-weight:600;text-align:right;">'+(u.consume||0).toLocaleString()+'</td>';
+        tb.appendChild(tr);
     });
-
-    var total = d.total || 0;
-    var totalPages = Math.ceil(total / topPageSize);
-    if (totalPages > 1) {
-        var html = '';
-        if (topCurrentPage > 1) html += '<a href="#" onclick="gotoTopPage(' + (topCurrentPage - 1) + ');return false;">&#8249;</a>';
-        html += '<span>第 ' + topCurrentPage + ' / ' + totalPages + ' 页</span>';
-        if (topCurrentPage < totalPages) html += '<a href="#" onclick="gotoTopPage(' + (topCurrentPage + 1) + ');return false;">&#8250;</a>';
-        pag.innerHTML = html;
-        pag.style.display = 'flex';
-    } else {
-        pag.style.display = 'none';
-    }
+    var pages = Math.ceil(d.total/topSize);
+    if (pages>1) {
+        var h = '';
+        if (topPage>1) h += '<a href="#" onclick="goPage('+(topPage-1)+');return false;">&#8249;</a>';
+        h += '<span>第 '+topPage+' / '+pages+' 页</span>';
+        if (topPage<pages) h += '<a href="#" onclick="goPage('+(topPage+1)+');return false;">&#8250;</a>';
+        pag.innerHTML = h; pag.style.display = 'flex';
+    } else { pag.style.display = 'none'; }
 }
 
-function gotoTopPage(p) {
-    topCurrentPage = p;
-    fetchTopContributors(p, topPageSize).then(function(data) { renderTopContributors(data); });
-}
+function goPage(p) { topPage = p; fetchTop(p, topSize).then(function(d){renderTop(d);}); }
+function changePageSize() { topSize = parseInt(document.getElementById('top-size').value); topPage = 1; fetchTop(1, topSize).then(function(d){renderTop(d);}); }
 
-function changePageSize() {
-    topPageSize = parseInt(document.getElementById('top-size-select').value);
-    topCurrentPage = 1;
-    fetchTopContributors(1, topPageSize).then(function(data) { renderTopContributors(data); });
-}
+var giftsVis = false;
+function toggleGifts() { giftsVis = !giftsVis; document.getElementById('gift-section').style.display = giftsVis?'block':'none'; document.getElementById('gift-arrow').textContent = giftsVis?'▼':'▶'; }
 
-var giftsVisible = false;
-function toggleGifts() {
-    giftsVisible = !giftsVisible;
-    document.getElementById('gift-section').style.display = giftsVisible ? 'block' : 'none';
-    document.getElementById('gift-arrow').textContent = giftsVisible ? '&#9660;' : '&#9654;';
-}
-
-function renderTopGifts(d) {
-    var tbody = document.getElementById('gift-table-body');
-    var empty = document.getElementById('gift-empty');
-    tbody.innerHTML = '';
-    if (!d.top_gifts || d.top_gifts.length === 0) {
-        empty.style.display = 'block';
-        return;
-    }
-    empty.style.display = 'none';
-    d.top_gifts.forEach(function(g) {
+function renderGifts(d) {
+    var tb = document.getElementById('gift-tbody'); tb.innerHTML = '';
+    var emp = document.getElementById('gift-empty');
+    if (!d.top_gifts || !d.top_gifts.length) { emp.style.display='block'; return; }
+    emp.style.display='none';
+    d.top_gifts.forEach(function(g){
         var tr = document.createElement('tr');
-        tr.innerHTML = '<td>' + g.gift_name + '</td>' +
-            '<td>' + (g.times || 0) + '次</td>' +
-            '<td>' + (g.total_count || 0) + '</td>' +
-            '<td style="font-weight:600;text-align:right;">' + (g.total_diamonds || 0).toLocaleString() + '</td>';
-        tbody.appendChild(tr);
+        tr.innerHTML = '<td>'+g.gift_name+'</td><td>'+g.times+'次</td><td>'+g.total_count+'</td><td style="font-weight:600;text-align:right;">'+(g.total_diamonds||0).toLocaleString()+'</td>';
+        tb.appendChild(tr);
     });
 }
 
-function exportContributorsCSV() {
-    var url = '/api/sessions/' + sessionId + '/csv';
-    if (currentTierFilter > 0) {
-        url += '?threshold=' + currentTierFilter;
-    }
+function exportTopCsv() {
+    var url = '/api/sessions/'+sid+'/csv';
+    if (tier>0) url += '?threshold='+tier;
     window.location.href = url;
 }
+function exportGiftCsv() { window.location.href = '/api/sessions/'+sid+'/gifts/csv'; }
 
-function exportGiftsCSV() {
-    window.location.href = '/api/sessions/' + sessionId + '/gifts/csv';
+/* ── actions ── */
+function endOne() {
+    if (!confirm('确定要手动结束场次 #'+sid+' 吗？')) return;
+    fetch('/api/sessions/'+sid+'/end', {method:'POST'}).then(function(r){return r.json()}).then(function(d){
+        if (d.success) loadSession(); else alert(d.message);
+    }).catch(function(e){ alert('请求失败: '+e.message); });
 }
+
+function delOne() { document.getElementById('mdl').classList.add('on'); }
+function closeMdl() { document.getElementById('mdl').classList.remove('on'); }
+
+function doDelete() {
+    fetch('/api/sessions/'+sid, {method:'DELETE'}).then(function(r){return r.json()}).then(function(d){
+        closeMdl();
+        if (d.success) window.location.href = '/sessions'; else alert(d.message);
+    }).catch(function(e){ closeMdl(); alert('请求失败: '+e.message); });
+}
+
+document.getElementById('btn-end').addEventListener('click', endOne);
+document.getElementById('btn-del').addEventListener('click', delOne);
 
 loadSession();
 </script>

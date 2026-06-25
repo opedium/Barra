@@ -392,12 +392,13 @@ def enter_room_api(ttwid, ua, ua_version, live_id, http_timeout=15, session=None
     user = resp_data.get('data', {}).get('user', {})
     anchor_name = user.get('nickname', '')
     sec_uid = user.get('sec_uid', '')
-    
+    anchor_user_id = str(user.get('id_str', '') or user.get('id', '') or user.get('uid', ''))
+
     avatar_list = user.get('avatar_thumb', {}).get('url_list', [])
     anchor_avatar = avatar_list[0] if avatar_list else ''
-    
+
     room_title = room.get('title', '')
-    
+
     cover_list = room.get('cover', {}).get('url_list', [])
     room_cover = cover_list[0] if cover_list else ''
 
@@ -409,7 +410,336 @@ def enter_room_api(ttwid, ua, ua_version, live_id, http_timeout=15, session=None
         'status': status,
         'anchor_name': anchor_name,
         'anchor_avatar': anchor_avatar,
+        'anchor_user_id': anchor_user_id,
         'room_title': room_title,
         'room_cover': room_cover,
         'sec_uid': sec_uid,
     }
+
+
+# ── 用户信息 API ──────────────────────────────────
+
+def fetch_user_info_by_sec_uid(sec_uid, ua=None, timeout=15, session=None):
+    """通过 sec_uid 调用抖音公开 API 获取用户信息（含头像、昵称等）。
+
+    端点: GET https://www.douyin.com/web/api/v2/user/info/?sec_uid={sec_uid}
+    该端点公开可用，无需登录态，但需要合理的浏览器 User-Agent。
+
+    Args:
+        sec_uid: 抖音用户永久标识符（~50位字符串）。
+        ua: User-Agent 字符串，未传入时使用内置默认值。
+        timeout: HTTP 请求超时秒数。
+        session: 可选的 requests.Session，传入时复用连接池。
+
+    Returns:
+        dict 包含以下字段:
+        - sec_uid: 用户 sec_uid（回显）
+        - nickname: 昵称
+        - avatar_medium: 中等尺寸头像 URL（推荐）
+        - avatar_thumb: 小尺寸头像 URL
+        - avatar_large: 大尺寸头像 URL
+        - avatar_url: 最佳可用头像 URL（medium > thumb > large）
+        - unique_id: 抖音号（如 "douyin_xxx"）
+        - signature: 个人签名
+        - follower_count: 粉丝数
+        - following_count: 关注数
+        - aweme_count: 作品数
+        - total_favorited: 获赞总数
+        - ip_location: IP 属地
+
+        请求失败时返回 None。
+
+    Raises:
+        ValueError: sec_uid 为空时抛出。
+    """
+    if not sec_uid:
+        raise ValueError('sec_uid 不能为空')
+
+    if ua is None:
+        from base.utils import USER_AGENTS
+        ua = USER_AGENTS[0]
+
+    url = f'https://www.douyin.com/web/api/v2/user/info/?sec_uid={sec_uid}'
+
+    owns_session = session is None
+    if owns_session:
+        session = requests.Session()
+
+    try:
+        resp = http_get_with_retry(
+            session, url,
+            headers={
+                'User-Agent': ua,
+                'Accept': 'application/json',
+                'Accept-Language': 'zh-CN,zh;q=0.9',
+                'Referer': 'https://www.douyin.com/',
+            },
+            timeout=timeout,
+        )
+
+        data = resp.json()
+        if data.get('status_code') != 0:
+            logger.warning(f'[用户API] sec_uid={sec_uid[:20]}... 返回非0状态码: {data.get("status_code")}')
+            return None
+
+        user_info = data.get('user_info', {})
+        if not user_info:
+            logger.warning(f'[用户API] sec_uid={sec_uid[:20]}... 返回空 user_info')
+            return None
+
+        # 提取各级头像 URL
+        def _get_url(image_dict):
+            urls = image_dict.get('url_list', [])
+            return urls[0] if urls else ''
+
+        avatar_thumb = _get_url(user_info.get('avatar_thumb', {}))
+        avatar_medium = _get_url(user_info.get('avatar_medium', {}))
+        avatar_large = _get_url(user_info.get('avatar_large', {}))
+
+        # 最佳可用头像 URL（优先中等尺寸）
+        best_avatar = avatar_medium or avatar_thumb or avatar_large
+
+        result = {
+            'sec_uid': user_info.get('sec_uid', sec_uid),
+            'nickname': user_info.get('nickname', ''),
+            'avatar_medium': avatar_medium,
+            'avatar_thumb': avatar_thumb,
+            'avatar_large': avatar_large,
+            'avatar_url': best_avatar,
+            'unique_id': user_info.get('unique_id', ''),
+            'signature': user_info.get('signature', ''),
+            'follower_count': user_info.get('follower_count', 0),
+            'following_count': user_info.get('following_count', 0),
+            'aweme_count': user_info.get('aweme_count', 0),
+            'total_favorited': user_info.get('total_favorited', 0),
+            'ip_location': user_info.get('ip_location', ''),
+        }
+
+        logger.debug(f'[用户API] sec_uid={sec_uid[:20]}... 获取成功: nickname={result["nickname"]}')
+        return result
+
+    except Exception as e:
+        logger.warning(f'[用户API] sec_uid={sec_uid[:20]}... 请求失败: {e}')
+        return None
+
+    finally:
+        if owns_session:
+            session.close()
+
+
+def fetch_user_avatar(sec_uid, ua=None, timeout=15, session=None):
+    """通过 sec_uid 仅获取用户头像 URL（轻量接口）。
+
+    这是 fetch_user_info_by_sec_uid 的便捷封装，只返回最佳可用头像 URL。
+
+    Args:
+        sec_uid: 抖音用户永久标识符。
+        ua: User-Agent 字符串，未传入时使用内置默认值。
+        timeout: HTTP 请求超时秒数。
+        session: 可选的 requests.Session。
+
+    Returns:
+        头像 URL 字符串，失败时返回空字符串。
+    """
+    info = fetch_user_info_by_sec_uid(sec_uid, ua=ua, timeout=timeout, session=session)
+    if info and info.get('avatar_url'):
+        return info['avatar_url']
+    return ''
+
+
+def fetch_user_info_by_user_id(user_id, ua=None, timeout=15, session=None):
+    """通过数字 user_id 调用抖音直播用户 API 获取用户信息。
+
+    端点: GET https://live.douyin.com/webcast/user/
+    参数: aid=6383, live_id=1, device_platform=web, target_uid={user_id}
+
+    这是 Douyin 直播 Web 端的内部 API，公开可用，可直接通过数字 UID 查询
+    用户昵称、头像、display_id（抖音号）等信息。
+
+    Args:
+        user_id: 抖音用户数字 ID（如 "1234567890123456789"）。
+        ua: User-Agent 字符串，未传入时使用内置默认值。
+        timeout: HTTP 请求超时秒数。
+        session: 可选的 requests.Session，传入时复用连接池。
+
+    Returns:
+        dict 包含以下字段:
+        - user_id: 用户数字 ID（回显）
+        - nickname: 昵称
+        - display_id: 抖音号（如 "douyin_xxx"）
+        - avatar_url: 中等尺寸头像 URL
+        - avatar_thumb: 缩略图 URL
+        - city: 城市
+        - follower_count: 粉丝数
+        - following_count: 关注数
+        - badge_text: 等级/认证标签文本
+
+        请求失败时返回 None。
+    """
+    if not user_id:
+        raise ValueError('user_id 不能为空')
+
+    if ua is None:
+        from base.utils import USER_AGENTS
+        ua = USER_AGENTS[0]
+
+    url = (
+        f'https://live.douyin.com/webcast/user/'
+        f'?aid=6383&live_id=1&device_platform=web'
+        f'&language=zh-CN&target_uid={user_id}'
+    )
+
+    owns_session = session is None
+    if owns_session:
+        session = requests.Session()
+
+    try:
+        resp = http_get_with_retry(
+            session, url,
+            headers={
+                'User-Agent': ua,
+                'Accept': 'application/json',
+                'Accept-Language': 'zh-CN,zh;q=0.9',
+                'Referer': 'https://live.douyin.com/',
+            },
+            timeout=timeout,
+        )
+
+        data = resp.json()
+        user_data = data.get('data', {})
+        if not user_data:
+            logger.warning(f'[UID API] user_id={user_id} 返回空 data')
+            return None
+
+        # 提取头像
+        avatar_medium = user_data.get('avatar_medium', {})
+        avatar_thumb = user_data.get('avatar_thumb', {})
+        avatar_url = ''
+        if isinstance(avatar_medium, dict):
+            urls = avatar_medium.get('url_list', [])
+            avatar_url = urls[0] if urls else ''
+        if not avatar_url and isinstance(avatar_thumb, dict):
+            urls = avatar_thumb.get('url_list', [])
+            avatar_url = urls[0] if urls else ''
+
+        # 粉丝/关注数
+        follow_info = user_data.get('follow_info', {}) or {}
+
+        # 等级标签
+        badge_text = ''
+        badges = user_data.get('badge_image_list', []) or []
+        for badge in badges:
+            alt = badge.get('content', {}).get('alternative_text', '')
+            if alt:
+                badge_text = alt
+                break
+
+        result = {
+            'user_id': str(user_data.get('uid', user_id)),
+            'nickname': user_data.get('nickname', ''),
+            'display_id': user_data.get('display_id', ''),
+            'sec_uid': user_data.get('sec_uid', ''),
+            'avatar_url': avatar_url,
+            'avatar_thumb': user_data.get('avatar_thumb', {}).get('url_list', [''])[0]
+                if isinstance(user_data.get('avatar_thumb'), dict) else '',
+            'city': user_data.get('city', ''),
+            'follower_count': follow_info.get('follower_count', 0),
+            'following_count': follow_info.get('following_count', 0),
+            'badge_text': badge_text,
+        }
+
+        logger.debug(f'[UID API] user_id={user_id} 获取成功: nickname={result["nickname"]}')
+        return result
+
+    except Exception as e:
+        logger.warning(f'[UID API] user_id={user_id} 请求失败: {e}')
+        return None
+
+    finally:
+        if owns_session:
+            session.close()
+
+
+def fetch_user_info_by_unique_id(unique_id, ua=None, timeout=15, session=None):
+    """通过抖音号（unique_id / display_id）获取用户信息（含 sec_uid）。
+
+    端点: GET https://www.iesdouyin.com/web/api/v2/user/info/?unique_id={unique_id}
+
+    与 sec_uid 版本的 user/info API 类似，但接受抖音短号（如 "douyin_xxx"），
+    返回完整用户信息包括 sec_uid。
+
+    Args:
+        unique_id: 抖音号/display_id（如 "douyin_xxx"）。
+        ua: User-Agent 字符串。
+        timeout: HTTP 请求超时秒数。
+        session: 可选的 requests.Session。
+
+    Returns:
+        dict 包含 sec_uid, nickname, avatar_url 等字段，失败时返回 None。
+    """
+    if not unique_id:
+        raise ValueError('unique_id 不能为空')
+
+    if ua is None:
+        from base.utils import USER_AGENTS
+        ua = USER_AGENTS[0]
+
+    url = f'https://www.iesdouyin.com/web/api/v2/user/info/?unique_id={unique_id}'
+
+    owns_session = session is None
+    if owns_session:
+        session = requests.Session()
+
+    try:
+        resp = http_get_with_retry(
+            session, url,
+            headers={
+                'User-Agent': ua,
+                'Accept': 'application/json',
+                'Accept-Language': 'zh-CN,zh;q=0.9',
+                'Referer': 'https://www.douyin.com/',
+            },
+            timeout=timeout,
+        )
+
+        data = resp.json()
+        if data.get('status_code') != 0:
+            logger.warning(f'[unique_id API] unique_id={unique_id} 返回非0状态码: {data.get("status_code")}')
+            return None
+
+        user_info = data.get('user_info', {})
+        if not user_info:
+            logger.warning(f'[unique_id API] unique_id={unique_id} 返回空 user_info')
+            return None
+
+        def _get_url(image_dict):
+            urls = image_dict.get('url_list', [])
+            return urls[0] if urls else ''
+
+        avatar_medium = _get_url(user_info.get('avatar_medium', {}))
+        avatar_thumb = _get_url(user_info.get('avatar_thumb', {}))
+        best_avatar = avatar_medium or avatar_thumb
+
+        result = {
+            'sec_uid': user_info.get('sec_uid', ''),
+            'user_id': str(user_info.get('uid', '')),
+            'nickname': user_info.get('nickname', ''),
+            'unique_id': user_info.get('unique_id', unique_id),
+            'avatar_url': best_avatar,
+            'avatar_medium': avatar_medium,
+            'avatar_thumb': avatar_thumb,
+            'signature': user_info.get('signature', ''),
+            'follower_count': user_info.get('follower_count', 0),
+            'following_count': user_info.get('following_count', 0),
+        }
+
+        logger.debug(f'[unique_id API] unique_id={unique_id} 获取成功: nickname={result["nickname"]}')
+        return result
+
+    except Exception as e:
+        logger.warning(f'[unique_id API] unique_id={unique_id} 请求失败: {e}')
+        return None
+
+    finally:
+        if owns_session:
+            session.close()

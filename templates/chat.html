@@ -48,7 +48,7 @@ function loadData(p) {
     if (uid) url += '&user_id=' + encodeURIComponent(uid);
     if (kw) url += '&keyword=' + encodeURIComponent(kw);
 
-    fetch(url)
+    fetchWithTimeout(url)
         .then(function(r) { return r.json(); })
         .then(function(data) {
             el.style.display = 'none';
@@ -103,7 +103,8 @@ function exportCSV() {
     if (uid) params.push('user_id=' + encodeURIComponent(uid));
     if (kw) params.push('keyword=' + encodeURIComponent(kw));
     if (params.length) url += '?' + params.join('&');
-    window.location.href = url;
+    showCsvColumnSelector(url,
+        ['time', 'user_id', 'user_name', 'anchor_name', 'content', 'grade', 'fans_club', '链接']);
 }
 
 document.querySelectorAll('#user-input, #keyword-input').forEach(function(el) {

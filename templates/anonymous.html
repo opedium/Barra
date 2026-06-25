@@ -149,7 +149,7 @@ function loadData() {
     var tbl = document.getElementById('data-table');
     var tbody = document.getElementById('table-body');
     el.style.display = 'flex'; tbl.style.display = 'none';
-    fetch('/api/anonymous?search=' + encodeURIComponent(q) + '&size=100')
+    fetchWithTimeout('/api/anonymous?search=' + encodeURIComponent(q) + '&size=100')
         .then(function(r) { return r.json(); })
         .then(function(d) {
             el.style.display = 'none';
@@ -186,7 +186,9 @@ function exportCSV() {
     var q = document.getElementById('anon-search-input').value.trim();
     var url = '/api/anonymous/csv';
     if (q) url += '?search=' + encodeURIComponent(q);
-    window.location.href = url;
+    showCsvColumnSelector(url,
+        ['real_user_id', 'user_name', 'anonymous_label', 'grade', 'fans_club',
+         'consume', 'sessions_count', 'last_seen', '链接']);
 }
 
 document.getElementById('anon-search-input').addEventListener('keydown', function(e) { if (e.key === 'Enter') loadData(); });

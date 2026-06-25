@@ -1,0 +1,15 @@
+services:
+  douyin-barrage:
+    build: .
+    container_name: douyin-barrage
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data        # SQLite DB + collected data persists
+      - ./logs:/app/logs        # Log files persist
+      - ./config.yaml:/app/config.yaml:ro  # Config read-only
+      - ./rooms.txt:/app/rooms.txt:ro      # Room list read-only
+      - ./cookie.txt:/app/cookie.txt       # Cookie file (mutable)
+    environment:
+      - TZ=Asia/Singapore

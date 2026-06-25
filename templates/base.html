@@ -3,6 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <script>
+        (function() {
+            var t = localStorage.getItem('theme');
+            if (t === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+        })();
+    </script>
     <title>{% block title %}弹幕后台{% endblock %} · StreamDash</title>
     <style>
         /* ================================================================
@@ -188,6 +194,47 @@
         }
         .nav-search button:hover { background: var(--primary-dark); }
         .nav-search button:active { transform: scale(0.96); }
+
+        /* ── Search Autocomplete ── */
+        .search-autocomplete {
+            position: absolute; top: 100%; right: 0; width: 340px;
+            max-height: 360px; overflow-y: auto;
+            background: var(--card); border: 1px solid var(--border);
+            border-radius: var(--radius); box-shadow: var(--shadow-lg);
+            z-index: 200; display: none; margin-top: 4px;
+        }
+        .search-autocomplete.open { display: block; }
+        .search-autocomplete .ac-item {
+            display: flex; align-items: center; gap: 10px;
+            padding: 10px 14px; cursor: pointer;
+            transition: background var(--transition-fast);
+            border-bottom: 1px solid var(--border-light);
+        }
+        .search-autocomplete .ac-item:last-child { border-bottom: none; }
+        .search-autocomplete .ac-item:hover,
+        .search-autocomplete .ac-item.active { background: var(--primary-light); }
+        .search-autocomplete .ac-avatar {
+            width: 36px; height: 36px; border-radius: 50%;
+            background: linear-gradient(135deg, var(--primary), #06b6d4);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 14px; font-weight: 700; color: #fff;
+            flex-shrink: 0; overflow: hidden;
+        }
+        .search-autocomplete .ac-avatar img {
+            width: 100%; height: 100%; object-fit: cover; border-radius: 50%;
+        }
+        .search-autocomplete .ac-info { min-width: 0; flex: 1; }
+        .search-autocomplete .ac-name {
+            font-weight: 600; font-size: 13px; color: var(--text);
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .search-autocomplete .ac-id {
+            font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);
+        }
+        .search-autocomplete .ac-empty {
+            padding: 16px; text-align: center; color: var(--text-soft); font-size: 13px;
+        }
+
         .nav-toggle {
             display: none;
             background: none;
@@ -209,11 +256,11 @@
             max-width: 1320px;
             margin: 0 auto;
             padding: 24px 20px;
-            animation: containerIn var(--transition-slow) ease both;
+            animation: containerIn var(--transition-slow) ease forwards;
         }
         @keyframes containerIn {
             from { opacity: 0; transform: translateY(6px); }
-            to { opacity: 1; transform: translateY(0); }
+            to { opacity: 1; transform: none; }
         }
 
         /* ================================================================
@@ -576,6 +623,136 @@
         .toast.toast-info::before { background: var(--primary); }
 
         /* ================================================================
+           MODAL OVERLAY
+           ================================================================ */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(15,23,42,0.55);
+            z-index: 9998;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity var(--transition-base);
+        }
+        .modal-overlay.open {
+            opacity: 1;
+            pointer-events: auto;
+        }
+        .modal-dialog {
+            background: var(--card);
+            border-radius: var(--radius-lg);
+            box-shadow: var(--shadow-lg);
+            width: 420px;
+            max-width: 94vw;
+            max-height: 80vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            transform: translateY(12px);
+            transition: transform var(--transition-base);
+        }
+        .modal-overlay.open .modal-dialog {
+            transform: none;
+        }
+        .modal-header {
+            padding: 18px 22px 12px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .modal-header h3 {
+            font-size: 15px;
+            font-weight: 700;
+            margin: 0;
+        }
+        .modal-close {
+            background: none;
+            border: none;
+            font-size: 20px;
+            cursor: pointer;
+            color: var(--text-muted);
+            padding: 2px 6px;
+            border-radius: 4px;
+            transition: color var(--transition-fast);
+            line-height: 1;
+        }
+        .modal-close:hover { color: var(--danger); }
+        .modal-body {
+            padding: 16px 22px;
+            overflow-y: auto;
+            flex: 1;
+        }
+        .modal-body .col-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+        }
+        .modal-body .col-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 8px;
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            font-size: 13px;
+            transition: background var(--transition-fast);
+            user-select: none;
+        }
+        .modal-body .col-item:hover { background: var(--primary-light); }
+        .modal-body .col-item input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            accent-color: var(--primary);
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+        .modal-body .col-item label {
+            cursor: pointer;
+            flex: 1;
+        }
+        .modal-footer {
+            padding: 12px 22px 18px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            gap: 8px;
+            justify-content: space-between;
+        }
+        .modal-footer .btn-group-sm {
+            display: flex;
+            gap: 6px;
+        }
+        .modal-footer button {
+            padding: 7px 16px;
+            border-radius: var(--radius-sm);
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            border: 1px solid var(--border);
+            background: var(--card);
+            color: var(--text);
+            transition: all var(--transition-fast);
+        }
+        .modal-footer button:hover { background: var(--bg); }
+        .modal-footer button.btn-primary {
+            background: var(--primary);
+            color: #fff;
+            border-color: var(--primary);
+        }
+        .modal-footer button.btn-primary:hover { background: var(--primary-dark); }
+        .modal-footer button.btn-ghost {
+            border: none;
+            background: none;
+            color: var(--text-muted);
+            font-size: 12px;
+            padding: 7px 10px;
+        }
+        .modal-footer button.btn-ghost:hover { color: var(--text); }
+
+        /* ================================================================
            TIER BADGES
            ================================================================ */
         .tier-badge {
@@ -699,6 +876,75 @@
             }
         }
     </style>
+    <style id="theme-dark">
+        [data-theme="dark"] {
+            --bg: #0f172a;
+            --bg-soft: #1e293b;
+            --card: #1e293b;
+            --nav-bg: #020617;
+            --nav-hover: rgba(255,255,255,0.06);
+            --primary: #818cf8;
+            --primary-dark: #6366f1;
+            --primary-light: #1e1b4b;
+            --primary-glow: rgba(129,140,248,0.12);
+            --text: #e2e8f0;
+            --text-muted: #94a3b8;
+            --text-soft: #64748b;
+            --border: #334155;
+            --border-light: #1e293b;
+            --success: #34d399;
+            --success-bg: #064e3b;
+            --warning: #fbbf24;
+            --warning-bg: #78350f;
+            --danger: #f87171;
+            --danger-bg: #7f1d1d;
+            --font: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            --font-mono: 'SF Mono', 'Cascadia Code', 'JetBrains Mono', Menlo, Consolas, monospace;
+            --shadow: 0 1px 3px rgba(0,0,0,0.3), 0 1px 2px rgba(0,0,0,0.2);
+            --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.4), 0 2px 4px -1px rgba(0,0,0,0.2);
+            --shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.5), 0 4px 6px -2px rgba(0,0,0,0.25);
+        }
+        [data-theme="dark"] .nav-search input { background: #0f172a; }
+        [data-theme="dark"] .nav-links a.active { background: rgba(129,140,248,0.15); }
+        [data-theme="dark"] tbody tr:nth-child(even) td { background: #1a2332; }
+        [data-theme="dark"] tbody tr:hover td { background: #1e1b4b; }
+        [data-theme="dark"] .card-live { background: linear-gradient(135deg, #064e3b, var(--card) 50%); }
+        [data-theme="dark"] .toast { background: #334155; }
+        [data-theme="dark"] .badge-gray { background: #334155; color: #94a3b8; }
+        [data-theme="dark"] .user-header-card { background: linear-gradient(135deg, #1e1b4b 0%, var(--card) 60%); }
+        [data-theme="dark"] .filter-bar select,
+        [data-theme="dark"] .filter-bar input,
+        [data-theme="dark"] .filter-bar button { background: var(--card); color: var(--text); }
+        [data-theme="dark"] .filter-bar .btn-group button { background: var(--card); }
+        [data-theme="dark"] .filter-bar .btn-group button.active { background: var(--primary); }
+        [data-theme="dark"] #data-table tbody tr:has(> td.rank-1) td { background: #422006 !important; }
+        [data-theme="dark"] #data-table tbody tr:has(> td.rank-2) td { background: #1e293b !important; }
+        [data-theme="dark"] #data-table tbody tr:has(> td.rank-3) td { background: #431407 !important; }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script>
+        /* ── Fetch with Timeout (must load before child template scripts) ── */
+        function fetchWithTimeout(url, options, timeoutMs) {
+            timeoutMs = timeoutMs || 15000;
+            var controller = new AbortController();
+            var signal = controller.signal;
+            var fetchOptions = options || {};
+            fetchOptions.signal = signal;
+            var timeoutId = setTimeout(function() {
+                controller.abort();
+            }, timeoutMs);
+            return fetch(url, fetchOptions).then(function(response) {
+                clearTimeout(timeoutId);
+                return response;
+            }).catch(function(err) {
+                clearTimeout(timeoutId);
+                if (err.name === 'AbortError') {
+                    throw new Error('请求超时，请检查网络连接');
+                }
+                throw err;
+            });
+        }
+    </script>
 </head>
 <body>
     <nav class="nav">
@@ -713,20 +959,66 @@
             <a href="/chat" class="{% if request.path == '/chat' %}active{% endif %}">弹幕</a>
             <a href="/anonymous" class="{% if request.path == '/anonymous' %}active{% endif %}">神秘人</a>
             <a href="/sessions" class="{% if request.path == '/sessions' %}active{% endif %}">场次</a>
+            <a href="/compare" class="{% if request.path == '/compare' %}active{% endif %}">对比</a>
+            <a href="/settings" class="{% if request.path == '/settings' %}active{% endif %}">设置</a>
+            {% if auth_enabled %}<a href="/logout" style="color:#f87171;">&#10149; 登出</a>{% endif %}
         </div>
-        <form class="nav-search" onsubmit="return doSearch(this.uid.value.trim())">
-            <div class="search-wrap">
+        <div class="nav-search">
+            <div class="search-wrap" style="position:relative;">
                 <span class="search-icon">&#128269;</span>
-                <input name="uid" id="search-input" placeholder="搜索用户ID或昵称..." autocomplete="off">
+                <input name="uid" id="search-input" placeholder="搜索用户ID或昵称..." autocomplete="off"
+                       oninput="handleSearchInput(this.value)"
+                       onkeydown="handleSearchKeydown(event)"
+                       onfocus="handleSearchFocus()">
+                <div class="search-autocomplete" id="search-dropdown"></div>
             </div>
-            <button type="submit">搜索</button>
-        </form>
+            <button type="button" onclick="return doSearch(document.getElementById('search-input').value.trim())">搜索</button>
+        </div>
+        <button id="theme-toggle" onclick="toggleTheme()" style="background:none;border:none;color:var(--text-muted);font-size:16px;cursor:pointer;padding:4px 8px;border-radius:4px;transition:color var(--transition-fast);margin-left:6px;" title="切换主题" aria-label="切换暗色/亮色模式">&#9728;&#65039;</button>
     </nav>
     <div class="container">
         {% block content %}{% endblock %}
     </div>
+    <!-- CSV Column Selector Modal -->
+    <div class="modal-overlay" id="csv-modal">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <h3>&#128196; 选择导出列</h3>
+                <button class="modal-close" onclick="closeCsvModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="col-grid" id="csv-modal-cols"></div>
+            </div>
+            <div class="modal-footer">
+                <div class="btn-group-sm">
+                    <button class="btn-ghost" onclick="csvModalSelectAll()">全选</button>
+                    <button class="btn-ghost" onclick="csvModalDeselectAll()">取消全选</button>
+                </div>
+                <button class="btn-primary" id="csv-modal-export" onclick="csvModalExport()">&#x2B06; 导出</button>
+            </div>
+        </div>
+    </div>
+
     <div class="toast-container" id="toast-container"></div>
     <script>
+        /* ── Dark Mode ── */
+        function toggleTheme() {
+            var current = document.documentElement.getAttribute('data-theme');
+            var next = current === 'dark' ? '' : 'dark';
+            document.documentElement.setAttribute('data-theme', next);
+            localStorage.setItem('theme', next || 'light');
+            var btn = document.getElementById('theme-toggle');
+            if (btn) {
+                btn.innerHTML = next === 'dark' ? '&#127769;' : '&#9728;&#65039;';
+            }
+        }
+        (function() {
+            var btn = document.getElementById('theme-toggle');
+            if (btn && document.documentElement.getAttribute('data-theme') === 'dark') {
+                btn.innerHTML = '&#127769;';
+            }
+        })();
+
         /* ── Toast System ── */
         function showToast(msg, type) {
             var container = document.getElementById('toast-container');
@@ -743,14 +1035,15 @@
             }, 3000);
         }
 
-        /* ── Nav Search: resolve nickname → user_id ── */
+        /* ── Nav Search ── */
         function doSearch(q) {
             if (!q) return false;
+            hideDropdown();
             if (/^\d{6,}$/.test(q)) {
                 window.location.href = '/user?uid=' + encodeURIComponent(q);
                 return false;
             }
-            fetch('/api/search?q=' + encodeURIComponent(q) + '&size=5')
+            fetchWithTimeout('/api/search?q=' + encodeURIComponent(q) + '&size=5')
                 .then(function(r) { return r.json(); })
                 .then(function(d) {
                     if (d.users && d.users.length >= 1) {
@@ -765,12 +1058,180 @@
             return false;
         }
 
+        /* ── Search Autocomplete ── */
+        var _searchTimer = null;
+        var _searchActiveIndex = -1;
+        var _searchResults = [];
+        var _searchVisible = false;
+
+        function handleSearchInput(val) {
+            clearTimeout(_searchTimer);
+            _searchActiveIndex = -1;
+            if (!val || val.trim().length < 1) { hideDropdown(); return; }
+            _searchTimer = setTimeout(function() {
+                fetchWithTimeout('/api/search?q=' + encodeURIComponent(val.trim()) + '&size=5', {}, 5000)
+                    .then(function(r) { return r.json(); })
+                    .then(function(d) {
+                        _searchResults = d.users || [];
+                        renderDropdown(_searchResults, val.trim());
+                    })
+                    .catch(function() { hideDropdown(); });
+            }, 300);
+        }
+
+        function renderDropdown(users, query) {
+            var dd = document.getElementById('search-dropdown');
+            if (!users || users.length === 0) {
+                dd.innerHTML = '<div class="ac-empty">未找到匹配用户</div>';
+                dd.classList.add('open');
+                _searchVisible = true;
+                return;
+            }
+            var html = '';
+            users.forEach(function(u, i) {
+                var avatarContent = u.avatar_url
+                    ? '<img src="' + u.avatar_url + '" onerror="this.parentElement.textContent=\'' + (u.user_name || '?').charAt(0).toUpperCase() + '\'">'
+                    : (u.user_name || '?').charAt(0).toUpperCase();
+                html += '<div class="ac-item" data-index="' + i + '" onmousedown="selectSearchResult(' + i + ')" onmouseenter="highlightSearchItem(' + i + ')">' +
+                    '<div class="ac-avatar">' + avatarContent + '</div>' +
+                    '<div class="ac-info">' +
+                        '<div class="ac-name">' + highlightMatch(u.user_name, query) + '</div>' +
+                        '<div class="ac-id">' + u.user_id + '</div>' +
+                    '</div>' +
+                    '<div style="font-size:11px;color:var(--text-muted);">' + ((u.consume || u.total_consume || 0)).toLocaleString() + ' 音浪</div>' +
+                '</div>';
+            });
+            dd.innerHTML = html;
+            dd.classList.add('open');
+            _searchVisible = true;
+        }
+
+        function highlightMatch(text, query) {
+            if (!text || !query) return text || '';
+            var idx = text.toLowerCase().indexOf(query.toLowerCase());
+            if (idx < 0) return text;
+            return text.substring(0, idx) +
+                '<b style="color:var(--primary);">' +
+                text.substring(idx, idx + query.length) + '</b>' +
+                text.substring(idx + query.length);
+        }
+
+        function handleSearchKeydown(e) {
+            if (!_searchVisible) return;
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                _searchActiveIndex = Math.min(_searchActiveIndex + 1, _searchResults.length - 1);
+                highlightSearchItem(_searchActiveIndex);
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                _searchActiveIndex = Math.max(_searchActiveIndex - 1, 0);
+                highlightSearchItem(_searchActiveIndex);
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                if (_searchActiveIndex >= 0 && _searchResults[_searchActiveIndex]) {
+                    selectSearchResult(_searchActiveIndex);
+                } else {
+                    doSearch(document.getElementById('search-input').value.trim());
+                }
+            } else if (e.key === 'Escape') {
+                hideDropdown();
+            }
+        }
+
+        function highlightSearchItem(index) {
+            _searchActiveIndex = index;
+            document.querySelectorAll('#search-dropdown .ac-item').forEach(function(el) {
+                el.classList.toggle('active', parseInt(el.dataset.index) === index);
+            });
+        }
+
+        function selectSearchResult(index) {
+            var u = _searchResults[index];
+            if (u) { window.location.href = '/user?uid=' + u.user_id; }
+        }
+
+        function handleSearchFocus() {
+            var val = document.getElementById('search-input').value.trim();
+            if (val && _searchResults.length > 0) {
+                document.getElementById('search-dropdown').classList.add('open');
+                _searchVisible = true;
+            }
+        }
+
+        function hideDropdown() {
+            document.getElementById('search-dropdown').classList.remove('open');
+            _searchVisible = false;
+            _searchActiveIndex = -1;
+        }
+
+        document.addEventListener('click', function(e) {
+            var dd = document.getElementById('search-dropdown');
+            var input = document.getElementById('search-input');
+            if (dd && input && !input.contains(e.target) && !dd.contains(e.target)) {
+                hideDropdown();
+            }
+        });
+
         /* ── Close mobile nav on link click ── */
         document.querySelectorAll('.nav-links a').forEach(function(a) {
             a.addEventListener('click', function() {
                 var navLinks = document.querySelector('.nav-links');
                 if (navLinks) navLinks.classList.remove('open');
             });
+        });
+
+        /* ── CSV Column Selector Modal ── */
+        var _csvExportUrl = '';
+        function showCsvColumnSelector(url, columns) {
+            _csvExportUrl = url;
+            var grid = document.getElementById('csv-modal-cols');
+            grid.innerHTML = '';
+            columns.forEach(function(col) {
+                var item = document.createElement('div');
+                item.className = 'col-item';
+                var id = 'csv-col-' + col.replace(/[^a-zA-Z0-9一-鿿]/g, '_');
+                item.innerHTML =
+                    '<input type="checkbox" id="' + id + '" value="' + col + '" checked>' +
+                    '<label for="' + id + '">' + col + '</label>';
+                item.addEventListener('click', function(e) {
+                    if (e.target.tagName !== 'INPUT') {
+                        var cb = item.querySelector('input[type="checkbox"]');
+                        cb.checked = !cb.checked;
+                    }
+                });
+                grid.appendChild(item);
+            });
+            document.getElementById('csv-modal').classList.add('open');
+        }
+        function closeCsvModal() {
+            document.getElementById('csv-modal').classList.remove('open');
+        }
+        function csvModalSelectAll() {
+            document.querySelectorAll('#csv-modal-cols input[type="checkbox"]').forEach(function(cb) { cb.checked = true; });
+        }
+        function csvModalDeselectAll() {
+            document.querySelectorAll('#csv-modal-cols input[type="checkbox"]').forEach(function(cb) { cb.checked = false; });
+        }
+        function csvModalExport() {
+            var checked = [];
+            document.querySelectorAll('#csv-modal-cols input[type="checkbox"]:checked').forEach(function(cb) {
+                checked.push(cb.value);
+            });
+            if (checked.length === 0) {
+                showToast('请至少选择一列', 'warning');
+                return;
+            }
+            var sep = _csvExportUrl.indexOf('?') === -1 ? '?' : '&';
+            window.location.href = _csvExportUrl + sep + 'cols=' + encodeURIComponent(checked.join(','));
+            closeCsvModal();
+        }
+        /* Close modal on overlay click */
+        document.getElementById('csv-modal').addEventListener('click', function(e) {
+            if (e.target === this) closeCsvModal();
+        });
+        /* Close modal on Escape key */
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') closeCsvModal();
         });
     </script>
 </body>
