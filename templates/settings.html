@@ -190,6 +190,26 @@
 .cookie-panel { display: none; }
 .cookie-panel.active { display: block; }
 
+    text-align: center;
+    padding: 12px 0;
+}
+    display: inline-block;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    max-width: 260px;
+    height: auto;
+    background: #fff;
+    padding: 8px;
+}
+    margin-top: 8px;
+    font-size: 13px;
+    color: var(--text-muted);
+}
+    display: flex;
+    gap: 8px;
+    justify-content: center;
+    margin-top: 10px;
+}
 
 .cookie-textarea {
     width: 100%;
@@ -248,7 +268,86 @@
     .sr-id { display: none; }
     .add-streamer-form { flex-direction: column; align-items: stretch; }
     .add-streamer-form input { width: 100% !important; }
-            return msg;
+}
+</style>
+
+<!-- Page Header -->
+<div class="dash-header">
+    <h1>设置</h1>
+    <span class="sub">直播监控管理</span>
+</div>
+
+<!-- Streamer Monitor -->
+<div class="card" id="streamer-monitor-card">
+    <div class="table-header">
+        <h2>&#128250; 直播监控</h2>
+        <span class="count" id="sr-count">--</span>
+    </div>
+    <div class="streamer-grid" id="streamer-grid">
+        <div style="text-align:center;color:var(--text-muted);padding:16px;font-size:13px;">
+            <span class="spinner" style="display:inline-block;width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:spin 0.6s linear infinite;vertical-align:middle;margin-right:6px;"></span>
+            加载中 &hellip;
+        </div>
+    </div>
+    <div id="add-streamer-area">
+        <button class="btn-show-form" onclick="showAddForm()" style="margin-top:8px;">+ 添加主播</button>
+        <div class="add-streamer-form" id="add-form" style="display:none;">
+            <input class="live-id" id="new-live-id" placeholder="房间ID (数字)" maxlength="18">
+            <input class="anchor-name" id="new-anchor-name" placeholder="主播名 (可选)" maxlength="40">
+            <button onclick="addStreamer()">添加</button>
+            <button onclick="hideAddForm()" style="background:transparent;color:var(--text-muted);border-color:var(--border);">取消</button>
+        </div>
+    </div>
+</div>
+
+<!-- Cookie Management -->
+<div class="card" id="cookie-manager-card">
+    <div class="table-header">
+        <h2>&#128273; Cookie 管理</h2>
+    </div>
+    <div id="cookie-status-area">
+        <div class="cookie-status-row">
+            <span class="cookie-status-dot gray" id="cookie-dot"></span>
+            <span id="cookie-status-text" style="font-size:13px;">加载中 &hellip;</span>
+        </div>
+        <div class="cookie-meta" id="cookie-meta-text"></div>
+    </div>
+
+    <!-- Mode tabs -->
+    <div class="cookie-mode-tabs">
+        <span class="cookie-mode-tab" data-mode="manual" onclick="switchCookieMode('manual')">手动输入</span>
+    </div>
+
+    <!-- QR Code Panel -->
+    <!-- Manual Input Panel -->
+    <div class="cookie-panel" id="cookie-panel-manual">
+        <textarea class="cookie-textarea" id="cookie-input"
+            placeholder="从浏览器导出 Cookie 粘贴到此处&#10;支持格式：name1=value1; name2=value2 或 Netscape cookie jar"></textarea>
+        <div class="cookie-hint">
+            打开浏览器 → F12 开发者工具 → Application → Cookies → douyin.com → 复制所有 cookie 的 name=value 对，用分号分隔
+        </div>
+        <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
+            <button class="btn-cookie" id="btn-manual-save" onclick="manualSaveCookie()">验证并保存</button>
+            <span id="manual-result" style="font-size:12px;"></span>
+        </div>
+    </div>
+</div>
+
+<script>
+/* ── Streamer Monitor ── */
+var STREAMER_POLL_MS = 5000;
+var _streamerTimer = null;
+
+function statusLabel(s) {
+    if (s.status === 'collecting') {
+        var msg = '<span class="dot dot-green"></span> 监控中';
+        if (s.message_count > 0) msg += ' · ' + s.message_count.toLocaleString() + '条';
+        if (s.uptime_seconds > 0) {
+            var m = Math.floor(s.uptime_seconds / 60);
+            var sec = s.uptime_seconds % 60;
+            msg += ' · ' + m + '分' + sec + '秒';
+        }
+        return msg;
     }
     if (s.status === 'connecting') return '<span class="dot dot-amber"></span> 连接中…';
     if (s.status === 'waiting')    return '<span class="dot dot-amber"></span> 等待开播';
@@ -386,16 +485,6 @@ function escHtml(s) {
 }
 
 /* ── Cookie Management ── */
-
-function switchCookieMode(mode) {
-    document.querySelectorAll('.cookie-mode-tab').forEach(function(t) {
-        t.classList.toggle('active', t.dataset.mode === mode);
-    });
-    document.querySelectorAll('.cookie-panel').forEach(function(p) {
-        p.classList.toggle('active', p.id === 'cookie-panel-' + mode);
-    });
-    
-}
 
 function manualSaveCookie() {
     var input = document.getElementById('cookie-input');
