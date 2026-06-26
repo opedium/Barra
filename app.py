@@ -664,6 +664,12 @@ def index():
         auth_enabled=bool(_web_config['password']))
 
 
+@app.route('/leaderboard')
+@require_auth
+def leaderboard():
+    return render_template('leaderboard.html', auth_enabled=bool(_web_config['password']))
+
+
 @app.route('/audit')
 @require_auth
 def audit():
