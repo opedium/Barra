@@ -294,12 +294,12 @@
 
     <!-- Mode tabs -->
     <div class="cookie-mode-tabs">
-        <span class="cookie-mode-tab" data-mode="manual" onclick="switchCookieMode('manual')">手动输入</span>
+        <span class="cookie-mode-tab active" data-mode="manual" onclick="switchCookieMode('manual')">手动输入</span>
     </div>
 
     <!-- QR Code Panel -->
     <!-- Manual Input Panel -->
-    <div class="cookie-panel" id="cookie-panel-manual">
+    <div class="cookie-panel active" id="cookie-panel-manual">
         <textarea class="cookie-textarea" id="cookie-input"
             placeholder="从浏览器导出 Cookie 粘贴到此处&#10;支持格式：name1=value1; name2=value2 或 Netscape cookie jar"></textarea>
         <div class="cookie-hint">
@@ -508,6 +508,15 @@ function refreshCookieStatus() {
 }
 
 /* ── Cookie Management ── */
+
+function switchCookieMode(mode) {
+    document.querySelectorAll('.cookie-mode-tab').forEach(function(t) {
+        t.classList.toggle('active', t.dataset.mode === mode);
+    });
+    document.querySelectorAll('.cookie-panel').forEach(function(p) {
+        p.classList.toggle('active', p.id === 'cookie-panel-' + mode);
+    });
+}
 
 function manualSaveCookie() {
     var input = document.getElementById('cookie-input');
