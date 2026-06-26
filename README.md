@@ -339,22 +339,156 @@ data/{live_id}/
 ## 项目结构
 
 ```
-├── main.py             启动入口（参数解析、交互选择、多房间管理）
-├── config.yaml         运行配置
-├── sign.js             签名脚本（Node.js）
-├── cookie.txt          登录 Cookie（需自行创建）
-├── cookie.example.txt  Cookie 样本文件
-├── rooms.txt           房间列表
-├── requirements.txt    Python 依赖
-├── base/               基础层
-│   ├── messages.py     Protobuf 消息定义（PushFrame / Response / 13 种业务消息）
-│   ├── parser.py       消息解析与分发表（HANDLERS 字典）
-│   ├── output.py       异步日志 + 数据记录器 + 吞吐统计
-│   └── utils.py        配置加载、Cookie 解析、常量、工具函数
-└── service/            服务层
-    ├── fetcher.py      采集器主类（连接管理、消息分发、心跳、看门狗）
-    ├── network.py      HTTP 请求 + WebSocket URL 构建 + 房间 API
-    └── signer.py       X-Bogus 签名生成（subprocess 调用 Node.js）
+├── main.py                        启动入口（参数解析、交互选择、多房间管理）
+├── app.py                         Flask Web 管理面板 + QR 扫码登录 + Cookie 管理
+├── config.yaml                    运行配置
+├── sign.js                        签名脚本（Node.js）
+├── cookie.txt                     登录 Cookie（需自行创建）
+├── cookie.example.txt             Cookie 样本文件
+├── rooms.txt                      房间列表
+├── requirements.txt               Python 依赖
+│
+├── douyin_login_server.py         独立 FastAPI QR 扫码登录服务器 §5
+├── douyin_integration_client.py   外部集成客户端 SDK（Python）§6
+├── session_manager.py             会话持久化管理器 §7.2
+│
+├── base/                          基础层
+│   ├── messages.py                Protobuf 消息定义（PushFrame / Response / 13 种业务消息）
+│   ├── parser.py                  消息解析与分发表（HANDLERS 字典）
+│   ├── output.py                  异步日志 + 数据记录器 + 吞吐统计
+│   └── utils.py                   配置加载、Cookie 解析、常量、工具函数
+└── service/                       服务层
+    ├── fetcher.py                 采集器主类（连接管理、消息分发、心跳、看门狗）
+    ├── network.py                 HTTP 请求 + WebSocket URL 构建 + 房间 API
+    └── signer.py                  X-Bogus 签名生成（subprocess 调用 Node.js）
+```
+
+---
+
+## 扫码登录集成
+
+本项目提供一套完整的抖音 QR 扫码登录方案，基于 [MediaCrawler Server Integration Guide](https://github.com/NanmiCoder/MediaCrawler) 实现。
+
+### Web 面板扫码登录
+
+在 Web 管理面板的"设置"页面（`/settings`）中，点击**扫码登录**即可：
+
+1. 点击"开始扫码登录"→ 自动启动 headless 浏览器打开抖音
+2. 页面展示二维码 → 使用抖音 APP 扫码
+3. 扫码后 Cookie 自动保存到 `cookie.txt`（含边框优化二维码，提高扫码成功率）
+
+### 独立登录服务器
+
+`douyin_login_server.py` — 独立的 FastAPI 登录服务，可部署在远程服务器：
+
+```bash
+# 安装依赖
+pip install fastapi uvicorn playwright httpx pillow
+playwright install chromium
+
+# 启动服务器
+python douyin_login_server.py
+
+# 服务端输出:
+# ╔══════════════════════════════════════════════════╗
+# ║        抖音 QR 登录服务器                        ║
+# ║  http://0.0.0.0:8000                            ║
+# ║  API: /api/douyin/login/start                   ║
+# ║       /api/douyin/login/status                  ║
+# ║       /api/douyin/check-auth                    ║
+# ║       /api/douyin/login/refresh                 ║
+# ╚══════════════════════════════════════════════════╝
+```
+
+**API 端点：**
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/douyin/login/start` | 创建登录会话，返回二维码 base64 |
+| POST | `/api/douyin/login/status?session_id=xxx` | 轮询扫码结果，成功时返回 Cookie |
+| POST | `/api/douyin/check-auth?session_id=xxx` | 检查会话认证状态 |
+| POST | `/api/douyin/login/refresh?session_id=xxx` | 刷新二维码 |
+| GET  | `/qr/{session_id}` | 浏览器中展示二维码的 HTML 页面 |
+
+**登录流程：**
+```
+客户端                          服务器
+  │                                │
+  │── POST /login/start ──────────>│  启动 Playwright 浏览器
+  │<── { session_id, qrcode } ─────│  返回二维码
+  │                                │
+  │  展示二维码 ← 用户用抖音 APP 扫描
+  │                                │
+  │── POST /login/status ──────────>│  后台轮询（6 次/分）
+  │<── { state: "success",         │  localStorage 或 Cookie 检测
+  │       cookies: {...} } ────────│
+  │                                │
+  │  使用 Cookie 调用抖音 API      │
+```
+
+### 集成客户端
+
+`douyin_integration_client.py` — 供外部项目调用的 Python SDK：
+
+```python
+from douyin_integration_client import DouyinIntegrationClient
+
+async def main():
+    async with DouyinIntegrationClient(server_url="http://localhost:8000") as client:
+        # 交互式扫码登录
+        auth = await client.login_interactive()
+        
+        # 获取 Cookie 字符串，直接用作 HTTP 头
+        headers = {"Cookie": auth.cookie_str}
+        
+        # 检查登录态是否有效
+        if await client.check_auth_valid():
+            print("Session still valid")
+
+# 或使用回调自定义二维码展示方式
+async def show_qr(base64_qr):
+    with open("qr.png", "wb") as f:
+        f.write(base64.b64decode(base64_qr.split(",")[-1]))
+    print("QR saved — scan with Douyin app")
+
+auth = await client.login_interactive(qrcode_callback=show_qr)
+```
+
+### 会话持久化管理
+
+`session_manager.py` — 将登录会话持久化到磁盘，支持跨重启恢复：
+
+```python
+from session_manager import SessionManager
+
+sm = SessionManager("./sessions")
+
+# 保存登录会话
+sm.save_session("session_abc", cookies={"sessionid": "..."}, nickname="用户名")
+
+# 列出所有会话
+for s in sm.list_sessions():
+    print(f"{s['label']}: {s['nickname']} ({s['cookie_count']} cookies)")
+
+# 加载 Cookie
+cookies = sm.load_cookies("session_abc")
+
+# 清理 72 小时未更新的过期会话
+cleaned = sm.cleanup_expired(max_age_hours=72)
+```
+
+### 依赖
+
+| 包名 | 用途 | 必需 |
+|------|------|------|
+| `playwright` | 浏览器自动化 QR 登录 | Web 面板、独立服务器 |
+| `pillow` | 二维码图像处理（边框/轮廓） | Web 面板、独立服务器 |
+| `httpx` | 异步 HTTP 客户端 | 集成客户端 |
+| `fastapi` / `uvicorn` | 独立登录服务器 | 独立服务器可选 |
+
+```bash
+pip install -r requirements.txt
+playwright install chromium
 ```
 
 ## 常见问题
