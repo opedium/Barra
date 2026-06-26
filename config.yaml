@@ -30,14 +30,14 @@ output:
   roomstats: true               # 直播统计
   contribution: true            # 贡献用户排行（1000贡献用户列表 Top 3）
   control: true                  # 直播状态
-  file_format: sqlite           # 输出格式: sqlite / csv / json (JSONL) / both / none
-  file_dir: data                 # 数据输出目录
+  file_dir: data                 # 数据输出目录（房间 meta、头像、raw frame 等）
 
 # ==================== 网络配置 ====================
 network:
   http_timeout: 15               # HTTP 超时（秒），超时后自动 ×1.5，封顶 60s，最多重试 3 次
   ws_connect_timeout: 30         # WebSocket 底层 socket 超时（秒）
   silence_timeout: 60            # 看门狗静默阈值（秒），超过则判定断连并重连
+  user_msg_timeout: 120          # 用户互动消息静默阈值（秒），无弹幕/礼物/点赞时重连
   heartbeat_interval: 10         # 心跳间隔（秒）
   rcvbuf_kb: 1024                # 接收缓冲区（KB），高流量直播间建议 1024
   proxy: null                    # 代理地址，如 {"http": "http://127.0.0.1:8080", "https": "socks5://127.0.0.1:1080"}
@@ -53,7 +53,7 @@ stats_interval: 60              # 吞吐统计打印间隔（秒）
 # ==================== Web 面板配置 ====================
 web:
   host: "0.0.0.0"               # Flask 绑定地址
-  port: 8080                     # Flask 端口
+  port: 8000                     # Flask 端口
   password: "xky0304"             # 面板密码（空=无需认证）
   auto_refresh: 30               # 仪表盘自动刷新间隔（秒，0=禁用）
   rate_limit:

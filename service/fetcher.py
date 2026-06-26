@@ -41,14 +41,15 @@ from base.messages import PushFrame, Response, parse_proto
 from base.parser import HANDLERS
 from base.utils import (
     load_config, load_cookies,
-    USER_AGENTS, LOW_VALUE_TYPES, INTERACTIVE_TYPES, METHOD_TO_CONFIG,
+    USER_AGENTS, LOW_VALUE_TYPES, INTERACTIVE_TYPES, USER_MSG_TYPES, METHOD_TO_CONFIG,
     generate_user_unique_id, extract_ua_version,
-    rotate_ua,
+    rotate_ua, set_current_anchor, set_anchor_name,
 )
-from base.output import setup_logger, DataRecorder, ThroughputCounter, BARRAGE, RoomLogFilter, display_width, is_ci_environment
-from base.parser import get_dedup_stats, set_dedup_csv_dir, flush_dedup_stats, init_db, create_session, end_session, flush_to_sqlite, record_chat, record_gift, upsert_user, _get_conn
+from base.output import setup_logger, ThroughputCounter, BARRAGE, RoomLogFilter, display_width, is_ci_environment
+from base.parser import get_dedup_stats, init_db, create_session, end_session, flush_to_sqlite, record_chat, record_gift, upsert_user, _get_conn
 from service.network import (
     fetch_ttwid, enter_room_api, download_image,
+    fetch_user_info,
     build_http_headers,
     build_websocket_url, build_ws_cookie,
 )
@@ -73,10 +74,11 @@ class DouyinBarrage:
             'fansclub': True, 'emoji': True, 'room': True, 'roomstats': True,
             'pk_event': True, 'dump_pk_raw': False,
             'contribution': True,
-            'control': True, 'file_format': 'none', 'file_dir': 'data',
+            'control': True, 'file_dir': 'data',
         },
         'network': {
             'http_timeout': 15, 'ws_connect_timeout': 30, 'silence_timeout': 60,
+            'user_msg_timeout': 120,
             'heartbeat_interval': 10, 'rcvbuf_kb': 2048, 'proxy': None,
         },
         'max_reconnects': 0,
@@ -125,6 +127,7 @@ class DouyinBarrage:
         self._http_timeout = net_cfg.get('http_timeout', 15)
         self._ws_connect_timeout = net_cfg.get('ws_connect_timeout', 30)
         self._silence_timeout = net_cfg.get('silence_timeout', 60)
+        self._user_msg_timeout = net_cfg.get('user_msg_timeout', 120)
         self._heartbeat_interval = net_cfg.get('heartbeat_interval', 10)
         self._proxy = net_cfg.get('proxy', None)
         self._rcvbuf = net_cfg.get('rcvbuf_kb', 256) * 1024
@@ -177,6 +180,8 @@ class DouyinBarrage:
         # ── 业务消息健康检测 ──
         self._last_business_msg_time = 0.0
         self._last_business_msg_time_lock = threading.Lock()
+        self._last_user_msg_time = 0.0
+        self._last_user_msg_time_lock = threading.Lock()
         self._ws_connected_at = 0.0
 
         # ── 吞吐量 ──
@@ -192,9 +197,10 @@ class DouyinBarrage:
         self._session_id = None
         self._db_inited = False
 
-        # ── 数据记录器（首次连接后初始化）──
-        self._recorder = None
-        self._dedup_csv_inited = False
+        # ── 输出目录（首次连接后初始化，用于 raw frame 等）──
+        self._output_dir = None
+        # ── 匿名用户解析跟踪（避免重复 API 调用）──
+        self._resolving_anon = set()
 
         # ── 统计定时打印 ──
         self._stats_interval = self.config.get('stats_interval', 60)
@@ -519,6 +525,7 @@ class DouyinBarrage:
             self.live_id, self._http_timeout, session=self.session,
         )
         self._room_id = self._room_info['room_id']
+        set_anchor_name(self.live_id, self.anchor_name)
         status = self._room_info['status']
         status_text = {2: '直播中', 4: '未开播'}.get(status, f'未知({status})')
         logger.info(f'[房间] room_id={self._room_id}, 状态={status_text}, 主播={self.anchor_name}')
@@ -606,15 +613,12 @@ class DouyinBarrage:
                 pass
 
         logger.info(f"[统计] 最终: {self._counter.report()}")
-        flush_dedup_stats()
         if self._raw_file:
             try:
                 self._raw_file.close()
             except Exception:
                 pass
             self._raw_file = None
-        if self._recorder:
-            self._recorder.close()
 
     async def _close_ws(self):
         try:
@@ -674,26 +678,22 @@ class DouyinBarrage:
         self._last_seq_id = 0
         self._frame_gaps = 0
         self._frame_total = 0
-        self._reset_recorder()
+        self._reset_output_dir()
         self._start_monitor_loop()
 
     def _is_waiting_live(self):
         with self._live_lock:
             return self._waiting_live
 
-    def _reset_recorder(self):
+    def _reset_output_dir(self):
         if self._raw_file:
             try:
                 self._raw_file.close()
             except Exception:
                 pass
             self._raw_file = None
-        if self._recorder:
-            try:
-                self._recorder.close()
-            except Exception as e:
-                logger.debug(f"[数据] 关闭旧 recorder 异常: {e}")
-        self._recorder = DataRecorder(self.live_id, self.config)
+        self._output_dir = None
+        self._resolving_anon.clear()
 
     def _start_monitor_loop(self):
         if self._monitor_stop is not None:
@@ -722,6 +722,7 @@ class DouyinBarrage:
                         if info['status'] == 2:
                             self._room_id = info['room_id']
                             self._room_info = info
+                            set_anchor_name(self.live_id, info.get('anchor_name', ''))
                             self._on_live_started(source='api')
                             return
                     except Exception as e:
@@ -787,7 +788,7 @@ class DouyinBarrage:
                 return
             self._waiting_live = False
         self._stop_monitor_loop()
-        self._reset_recorder()
+        self._reset_output_dir()
         self._counter = ThroughputCounter()
         self._unknown_seen.clear()
         self._last_seq_id = 0
@@ -835,6 +836,7 @@ class DouyinBarrage:
                     )
                     self._room_id = info['room_id']
                     self._room_info = info
+                    set_anchor_name(self.live_id, info.get('anchor_name', ''))
 
                     anchor = info.get('anchor_name', '')
                     if anchor:
@@ -998,18 +1000,16 @@ class DouyinBarrage:
                     self._eo_cached['live_stop'] = self.config.get('live_stop', False)
                     self._dump_pk_raw = self._enable_outputs.get('dump_pk_raw', False)
 
-                    # 初始化 recorder
-                    if self._recorder is None:
-                        self._recorder = DataRecorder(self.live_id, self.config)
-                        self._dedup_csv_inited = False
-                    self._recorder.open(self.room_id)
-                    if not self._dedup_csv_inited:
-                        set_dedup_csv_dir(self._recorder._dir)
-                        self._dedup_csv_inited = True
+                    # 创建输出目录（用于 raw frame 等文件）
+                    if self._output_dir is None:
+                        file_dir = self.config.get('output', {}).get('file_dir', 'data')
+                        ts = time.strftime('%Y%m%d_%H%M')
+                        self._output_dir = os.path.join(file_dir, self.live_id, f"{ts}_{self.room_id}")
+                    os.makedirs(self._output_dir, exist_ok=True)
                     self._save_room_info()
 
                     if self._dump_raw:
-                        raw_path = os.path.join(self._recorder._dir, 'raw_frames.bin.gz')
+                        raw_path = os.path.join(self._output_dir, 'raw_frames.bin.gz')
                         import gzip as _gz
                         self._raw_file = _gz.open(raw_path, 'ab', compresslevel=6)
                         logger.info(f"[落盘] {raw_path}")
@@ -1189,6 +1189,9 @@ class DouyinBarrage:
         """处理单条消息组（一个 Response 包中的所有内部消息）。"""
         messages_list, eo_cached, dump_pk_raw = item
 
+        # 设置线程本地主播名，供 fmt_fans_club 解析多粉丝团时使用
+        set_current_anchor(self.anchor_name)
+
         for msg in messages_list:
             if self._stop_event.is_set():
                 break
@@ -1209,6 +1212,11 @@ class DouyinBarrage:
                             if prev == 0:
                                 delay = time.time() - getattr(self, '_ws_connected_at', 0)
                                 logger.info(f"[连接] 开始采集 首条业务消息到达: {msg.method} (连接后 {delay:.1f}s)")
+
+                    # 单独追踪用户互动消息（排除 roomstats 等系统定时推送）
+                    if msg.method in USER_MSG_TYPES:
+                        with self._last_user_msg_time_lock:
+                            self._last_user_msg_time = time.time()
 
                     now = time.monotonic()
                     if now - self._panel_last >= 3.0:
@@ -1247,8 +1255,6 @@ class DouyinBarrage:
 
                         rec_type = r.get('type', '')
                         rec_data = r.get('data')
-                        if rec_type and rec_type != '_log_only' and rec_data and self._recorder:
-                            self._recorder.record(rec_type, rec_data)
 
                         # 同步写入 SQLite
                         if self._session_id and rec_data:
@@ -1262,6 +1268,25 @@ class DouyinBarrage:
                                 # 只要有用户信息就更新 users 表（记录财富等级、粉丝团、sec_uid、头像）
                                 if uid:
                                     upsert_user(uid, uname, ugrade, uclub, usec_uid, uavatar)
+                                    # 匿名用户（神秘人/dou前缀）自动解析真实昵称
+                                    if uname and (uname.startswith('神秘人') or re.match(r'dou\d+$', uname, re.IGNORECASE)) and uid not in self._resolving_anon:
+                                        self._resolving_anon.add(uid)
+                                        try:
+                                            info = fetch_user_info(uid)
+                                            if info and info.get('nickname') and not info['nickname'].startswith('神秘人') and not re.match(r'dou\d+$', info['nickname'], re.IGNORECASE):
+                                                resolved = info['nickname']
+                                                conn = _get_conn()
+                                                conn.execute(
+                                                    'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END WHERE user_id = ?',
+                                                    (resolved,
+                                                     info.get('sec_uid', ''), info.get('sec_uid', ''),
+                                                     info.get('avatar_url', ''), info.get('avatar_url', ''),
+                                                     uid)
+                                                )
+                                                conn.commit()
+                                                logger.info(f"[匿名] 已解析 {uid}: {uname} → {resolved}")
+                                        except Exception:
+                                            logger.debug(f"[匿名] 解析 {uid} 失败，保留原名称")
                                 if rec_type == 'chat' and rec_data.get('content'):
                                     record_chat(self._session_id,
                                         uid, uname,
@@ -1325,7 +1350,7 @@ class DouyinBarrage:
                             raw_bytes = r.get('_dump_raw')
                             if raw_bytes:
                                 import os as _os
-                                dump_dir = _os.path.join(self._recorder._dir, r.get('_dump_dir', 'pk_dumps'))
+                                dump_dir = _os.path.join(self._output_dir, r.get('_dump_dir', 'pk_dumps'))
                                 _os.makedirs(dump_dir, exist_ok=True)
                                 dump_path = _os.path.join(dump_dir, r['_dump_name'])
                                 with open(dump_path, 'wb') as _f:
@@ -1486,6 +1511,17 @@ class DouyinBarrage:
                     except Exception:
                         pass
                     break
+
+            # 用户互动消息静默检测（roomstats 不停但用户无操作时重连）
+            with self._last_user_msg_time_lock:
+                user_silence = time.time() - self._last_user_msg_time if self._last_user_msg_time > 0 else time.time() - self._ws_connected_at
+            if user_silence > self._user_msg_timeout:
+                logger.info(f"[看门狗] {user_silence:.0f}s 无用户互动消息 (阈值={self._user_msg_timeout}s)，触发重连")
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+                break
 
     async def _stats_task(self):
         """异步统计：每 N 秒打印吞吐量报告。"""

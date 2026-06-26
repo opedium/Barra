@@ -743,3 +743,54 @@ def fetch_user_info_by_unique_id(unique_id, ua=None, timeout=15, session=None):
     finally:
         if owns_session:
             session.close()
+
+
+def fetch_user_info(user_id, ua=None, timeout=15, session=None):
+    """两步式安全获取用户信息：先用 user_id 获取 sec_uid，再用 sec_uid 获取完整信息。
+
+    流程: user_id → sec_uid → 完整用户信息（昵称、头像等）
+    比直接调用单个 API 更安全，因为 sec_uid 端点的数据更完整可靠。
+
+    Args:
+        user_id: 抖音用户数字 ID（如 "1234567890123456789"）。
+        ua: User-Agent 字符串，未传入时使用内置默认值。
+        timeout: HTTP 请求超时秒数。
+        session: 可选的 requests.Session，传入时复用连接池。
+
+    Returns:
+        dict 包含 nickname, avatar_url, sec_uid 等完整字段，失败时返回 None。
+    """
+    if not user_id:
+        raise ValueError('user_id 不能为空')
+
+    if ua is None:
+        from base.utils import USER_AGENTS
+        ua = USER_AGENTS[0]
+
+    # Step 1: 用 user_id 获取 sec_uid（及基础信息）
+    owns_session = session is None
+    if owns_session:
+        session = requests.Session()
+
+    try:
+        basic = fetch_user_info_by_user_id(user_id, ua=ua, timeout=timeout, session=session)
+        if not basic:
+            return None
+
+        sec_uid = basic.get('sec_uid', '') or ''
+        if not sec_uid:
+            logger.debug(f'[用户信息] user_id={user_id} 无 sec_uid，返回基础信息')
+            return basic
+
+        # Step 2: 用 sec_uid 获取完整信息（昵称、头像等多字段）
+        full = fetch_user_info_by_sec_uid(sec_uid, ua=ua, timeout=timeout, session=session)
+        if full:
+            return full
+
+        # sec_uid API 失败，回退到基础信息
+        logger.debug(f'[用户信息] user_id={user_id} sec_uid API 回退，使用基础信息')
+        return basic
+
+    finally:
+        if owns_session:
+            session.close()

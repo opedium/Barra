@@ -960,6 +960,7 @@
             <a href="/anonymous" class="{% if request.path == '/anonymous' %}active{% endif %}">神秘人</a>
             <a href="/sessions" class="{% if request.path == '/sessions' %}active{% endif %}">场次</a>
             <a href="/compare" class="{% if request.path == '/compare' %}active{% endif %}">对比</a>
+            <a href="/audit" class="{% if request.path == '/audit' or request.path.startswith('/audit/') %}active{% endif %}">审计</a>
             <a href="/settings" class="{% if request.path == '/settings' %}active{% endif %}">设置</a>
             {% if auth_enabled %}<a href="/logout" style="color:#f87171;">&#10149; 登出</a>{% endif %}
         </div>

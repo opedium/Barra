@@ -35,7 +35,7 @@ from base.parser import (
     set_sse_callback,
 )
 from service.fetcher import DouyinBarrage
-from service.network import fetch_user_info_by_sec_uid, fetch_user_info_by_user_id
+from service.network import fetch_user_info_by_sec_uid, fetch_user_info_by_user_id, fetch_user_info
 
 app = Flask(__name__)
 
@@ -900,14 +900,10 @@ def index():
     ''').fetchall()
     top_users = []
     if live:
+        anchor_name = live['anchor_name']
         top = conn.execute('''
             SELECT c.user_id, c.user_name, c.consume,
-                   COALESCE(
-                       NULLIF(u.fans_club, ''),
-                       NULLIF(c.fans_club, ''),
-                       (SELECT fans_club FROM chat_logs WHERE user_id=c.user_id AND fans_club!='' ORDER BY id DESC LIMIT 1),
-                       ''
-                   ) as fans_club,
+                   CASE WHEN ? != '' THEN '[粉丝团:' || ? || ']' ELSE '' END AS fans_club,
                    COALESCE(u.grade, (SELECT grade FROM chat_logs WHERE user_id=c.user_id AND grade!='' ORDER BY id DESC LIMIT 1), '') as grade,
                    u.sec_uid, u.avatar_url,
                    (SELECT COUNT(*) FROM gift_logs WHERE session_id=c.session_id AND user_id=c.user_id) as gift_count,
@@ -915,7 +911,7 @@ def index():
             FROM contributions c
             LEFT JOIN users u ON u.user_id = c.user_id
             WHERE c.session_id=? ORDER BY c.consume DESC LIMIT 10
-        ''', (live['id'],)).fetchall()
+        ''', (anchor_name, anchor_name, live['id'],)).fetchall()
         top_users = [dict(r) for r in top]
 
     # 查找主播头像（从 users 表中匹配主播昵称 + sec_uid）
@@ -941,10 +937,22 @@ def index():
         auth_enabled=bool(_web_config['password']))
 
 
-@app.route('/leaderboard')
+@app.route('/audit')
 @require_auth
-def leaderboard():
-    return render_template('leaderboard.html', auth_enabled=bool(_web_config['password']))
+def audit():
+    """数据完整性审计页。"""
+    from base.parser import query_audit as _qa
+    return render_template('audit.html',
+        data=_qa(),
+        auth_enabled=bool(_web_config['password']))
+
+
+@app.route('/api/audit')
+@require_auth
+def api_audit():
+    """审计诊断数据 API。"""
+    from base.parser import query_audit as _qa
+    return jsonify(_qa())
 
 
 @app.route('/session/<int:session_id>')
@@ -1078,6 +1086,8 @@ def api_leaderboard():
     sort_by = request.args.get('sort_by', 'consume')
     year_month = request.args.get('year_month', '')
     min_consume = request.args.get('min_consume', 0, type=int)
+    streamer = request.args.get('streamer', '').strip()
+    room_id = request.args.get('room_id', '').strip()
 
     # If session_id passed explicitly, use it; otherwise resolve from live session
     session_id = request.args.get('session_id', None, type=int)
@@ -1090,12 +1100,25 @@ def api_leaderboard():
             # No live session and no explicit session_id — return empty
             return jsonify({'users': [], 'total': 0, 'page': 1})
 
-    data = query_leaderboard(threshold, period, page, size, session_id, year_month, min_consume)
+    data = query_leaderboard(threshold, period, page, size, session_id, year_month, min_consume, anchor_name=streamer, room_id=room_id)
     if sort_by == 'sessions' and data.get('users'):
         data['users'].sort(key=lambda u: (-u.get('sessions_count', 0), -u.get('consume', 0)))
         for i, u in enumerate(data['users']):
             u['rank'] = i + 1
     return jsonify(data)
+
+
+@app.route('/api/leaderboard/streamers')
+def api_leaderboard_streamers():
+    """返回所有有贡献记录的主播名+room_id（用于榜单筛选下拉框）。"""
+    conn = _get_conn()
+    rows = conn.execute('''
+        SELECT DISTINCT TRIM(s.anchor_name) AS anchor_name, s.room_id
+        FROM sessions s
+        WHERE s.anchor_name != '' AND s.anchor_name IS NOT NULL
+        ORDER BY s.anchor_name
+    ''').fetchall()
+    return jsonify([{'name': r['anchor_name'], 'id': r['room_id']} for r in rows])
 
 
 @app.route('/api/user')
@@ -1110,17 +1133,21 @@ def api_user():
     if not data:
         return jsonify({'error': 'user not found'}), 404
 
-    # 头像/ sec_uid 缺失时尝试从抖音 API 补全（受速率限制保护）
+    # 头像/sec_uid 缺失时尝试从抖音 API 补全（受速率限制保护）
+    # 安全流程：先通过 ID 获取 sec_uid，再用 sec_uid 获取完整用户信息
     need_avatar = not data.get('avatar_url')
     need_sec_uid = not data.get('sec_uid')
     if need_avatar or need_sec_uid:
-        sec_uid = data.get('sec_uid', '')
+        existing_sec_uid = data.get('sec_uid', '') or ''
         fetched = None
         if _rate_limiter.acquire():
-            if sec_uid:
-                fetched = fetch_user_info_by_sec_uid(sec_uid)
+            if existing_sec_uid:
+                # 已有 sec_uid → 直接获取完整信息（1 次 API 调用，最高效）
+                fetched = fetch_user_info_by_sec_uid(existing_sec_uid)
             if not fetched:
-                fetched = fetch_user_info_by_user_id(uid)
+                # 无 sec_uid 或 sec_uid API 失败
+                # → 两步式安全流程：ID → sec_uid → 完整信息
+                fetched = fetch_user_info(uid)
         if fetched:
             updates = []
             params = []
@@ -1132,6 +1159,10 @@ def api_user():
                 data['sec_uid'] = fetched['sec_uid']
                 updates.append('sec_uid = ?')
                 params.append(fetched['sec_uid'])
+            if fetched.get('nickname'):
+                data['user_name'] = fetched['nickname']
+                updates.append('user_name = ?')
+                params.append(fetched['nickname'])
             if updates:
                 params.append(uid)
                 conn = _get_conn()
@@ -1246,23 +1277,32 @@ def api_user_avatar_lookup():
             'source': 'local',
         })
 
-    # 有 sec_uid 但无 avatar_url → 调用抖音 API 补全
+    # 有 sec_uid 但无 avatar_url → 调用抖音 API 补全（也会返回最新昵称）
     if user['sec_uid']:
         if not _rate_limiter.acquire():
             return jsonify({'error': 'rate_limited', 'message': '请求频率过高，请稍后重试'}), 429
         info = fetch_user_info_by_sec_uid(user['sec_uid'])
-        if info and info.get('avatar_url'):
-            # 回写 avatar_url 到本地 DB
-            conn.execute(
-                'UPDATE users SET avatar_url = ? WHERE user_id = ?',
-                (info['avatar_url'], user_id)
-            )
-            conn.commit()
+        if info:
+            updates = []
+            params = []
+            if info.get('avatar_url'):
+                updates.append('avatar_url = ?')
+                params.append(info['avatar_url'])
+            if info.get('nickname') and info['nickname'] != user['user_name']:
+                updates.append('user_name = ?')
+                params.append(info['nickname'])
+            if updates:
+                params.append(user_id)
+                conn.execute(
+                    f'UPDATE users SET {", ".join(updates)} WHERE user_id = ?',
+                    params
+                )
+                conn.commit()
             return jsonify({
                 'user_id': user['user_id'],
-                'nickname': user['user_name'],
+                'nickname': info.get('nickname', user['user_name']),
                 'sec_uid': user['sec_uid'],
-                'avatar_url': info['avatar_url'],
+                'avatar_url': info.get('avatar_url', user['avatar_url'] or ''),
                 'grade': user['grade'] or '',
                 'fans_club': user['fans_club'] or '',
                 'source': 'api',
@@ -1278,26 +1318,39 @@ def api_user_avatar_lookup():
             'source': 'local',
         })
 
-    # 无 sec_uid：尝试通过数字 user_id 直接调用抖音 API
+    # 无 sec_uid：两步式安全获取 — 先用 ID 获取 sec_uid，再用 sec_uid 获取完整信息
     if not _rate_limiter.acquire():
         return jsonify({'error': 'rate_limited', 'message': '请求频率过高，请稍后重试'}), 429
-    info = fetch_user_info_by_user_id(user_id)
-    if info and info.get('avatar_url'):
-        # 回写 avatar_url 到本地 DB
-        conn.execute(
-            'UPDATE users SET avatar_url = ? WHERE user_id = ?',
-            (info['avatar_url'], user_id)
-        )
-        conn.commit()
+    info = fetch_user_info(user_id)
+    if info:
+        # 回写获取到的数据到本地 DB
+        updates = []
+        params = []
+        if info.get('avatar_url'):
+            updates.append('avatar_url = ?')
+            params.append(info['avatar_url'])
+        if info.get('sec_uid'):
+            updates.append('sec_uid = ?')
+            params.append(info['sec_uid'])
+        if info.get('nickname'):
+            updates.append('user_name = ?')
+            params.append(info['nickname'])
+        if updates:
+            params.append(user_id)
+            conn.execute(
+                f'UPDATE users SET {", ".join(updates)} WHERE user_id = ?',
+                params
+            )
+            conn.commit()
         return jsonify({
             'user_id': user_id,
             'nickname': info.get('nickname', user['user_name']),
-            'sec_uid': '',
+            'sec_uid': info.get('sec_uid', ''),
             'display_id': info.get('display_id', ''),
-            'avatar_url': info['avatar_url'],
+            'avatar_url': info.get('avatar_url', ''),
             'grade': user['grade'] or '',
             'fans_club': user['fans_club'] or '',
-            'source': 'api_uid',
+            'source': 'api',
         })
 
     # 所有方式都失败：返回本地已有数据
@@ -1601,6 +1654,8 @@ def api_leaderboard_csv():
     sort_by = request.args.get('sort_by', 'consume')
     year_month = request.args.get('year_month', '')
     min_consume = request.args.get('min_consume', 0, type=int)
+    streamer = request.args.get('streamer', '').strip()
+    room_id = request.args.get('room_id', '').strip()
     session_id = request.args.get('session_id', None, type=int)
 
     if period == 'session' and session_id is None:
@@ -1612,7 +1667,7 @@ def api_leaderboard_csv():
             return _make_csv_response([], ['user_id', 'user_name', 'consume'], 'leaderboard.csv')
 
     # Fetch ALL pages (size=999999)
-    data = query_leaderboard(threshold, period, 1, 999999, session_id, year_month, min_consume)
+    data = query_leaderboard(threshold, period, 1, 999999, session_id, year_month, min_consume, anchor_name=streamer, room_id=room_id)
     users = data.get('users', [])
 
     if sort_by == 'sessions' and users:

@@ -157,8 +157,7 @@ output:
   room: false                # 直播间公告
   roomstats: false           # 直播统计
   control: true              # 直播状态
-  file_format: csv           # 输出格式: csv / json / both / none
-  file_dir: data             # 输出目录
+  file_dir: data             # 数据输出目录（房间 meta、头像、raw frame 等）
 
 # ==================== 网络配置 ====================
 network:

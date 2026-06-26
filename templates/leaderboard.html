@@ -32,6 +32,11 @@
         </div>
         <input type="month" id="month-picker" class="month-picker" onchange="monthChanged()">
 
+        <span class="threshold-label">主播</span>
+        <select id="streamer-select" onchange="onStreamerChange(this.value)" style="max-width:150px;">
+            <option value="">全部主播</option>
+        </select>
+
         <span class="filter-divider"></span>
 
         <span class="threshold-label">门槛</span>
@@ -80,8 +85,7 @@
             <thead>
                 <tr>
                     <th>排名</th>
-                    <th>头像</th>
-                    <th>昵称</th>
+                    <th>用户</th>
                     <th>ID</th>
                     <th>粉丝团</th>
                     <th>财富等级</th>
@@ -272,7 +276,7 @@
 </style>
 
 <script>
-var currentPage = 1, currentThreshold = 0, currentPeriod = 'session', currentSort = 'consume', currentMinConsume = 0, currentTopN = 50;
+var currentPage = 1, currentThreshold = 0, currentPeriod = 'session', currentSort = 'consume', currentMinConsume = 0, currentTopN = 50, currentStreamer = '', currentRoomId = '';
 var lockedSessionId = null;
 var lbBarChart = null;
 
@@ -332,6 +336,34 @@ function loadSessionSelector() {
             document.getElementById('session-selector').style.display = 'flex';
         });
 }
+function loadStreamers() {
+    fetchWithTimeout('/api/leaderboard/streamers')
+        .then(function(r) { return r.json(); })
+        .then(function(list) {
+            if (!list || list.length === 0) return;
+            var sel = document.getElementById('streamer-select');
+            sel.innerHTML = '<option value="">全部主播</option>';
+            list.forEach(function(item) {
+                var opt = document.createElement('option');
+                opt.value = item.id;
+                opt.dataset.name = item.name;
+                opt.textContent = item.name;
+                if (currentRoomId === item.id) opt.selected = true;
+                sel.appendChild(opt);
+            });
+            sel.style.display = '';
+        });
+}
+
+function onStreamerChange(roomId) {
+    currentRoomId = roomId;
+    var sel = document.getElementById('streamer-select');
+    var opt = sel.options[sel.selectedIndex];
+    currentStreamer = opt ? opt.dataset.name || '' : '';
+    currentPage = 1;
+    loadData();
+}
+
 function onSessionChange(sid) {
     lockedSessionId = parseInt(sid);
     currentPage = 1;
@@ -506,6 +538,7 @@ function loadData() {
     }
 
     var url = '/api/leaderboard?threshold=' + currentThreshold + '&period=' + currentPeriod + '&page=' + currentPage + '&size=' + currentTopN + '&sort_by=' + currentSort + '&min_consume=' + currentMinConsume;
+    if (currentRoomId) url += '&room_id=' + encodeURIComponent(currentRoomId);
     if (lockedSessionId) url += '&session_id=' + lockedSessionId;
     if (currentPeriod === 'month' || currentPeriod === '30d' || currentPeriod === 'all' || isMillion) {
         var ym = document.getElementById('month-picker').value || '';
@@ -520,19 +553,18 @@ function loadData() {
             tc.style.display = '';
             tbody.innerHTML = '';
             if (!data.users || data.users.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--text-soft);padding:30px;">暂无数据</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-soft);padding:30px;">暂无数据</td></tr>';
                 tbl.style.display = 'table';
                 return;
             }
             data.users.forEach(function(u) {
                 var tr = document.createElement('tr');
                 var rankClass = u.rank === 1 ? 'rank-1' : (u.rank === 2 ? 'rank-2' : (u.rank === 3 ? 'rank-3' : ''));
-                var avatarHtml = u.avatar_url
-                    ? '<img src="' + u.avatar_url + '" style="width:32px;height:32px;border-radius:50%;object-fit:cover;" onerror="this.style.display=\'none\'">'
-                    : '<div style="width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#06b6d4);display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:#fff;">' + (u.user_name || '?').charAt(0).toUpperCase() + '</div>';
-                tr.innerHTML = '<td class="' + rankClass + '" style="font-weight:600;">#' + u.rank + '</td>' +
-                    '<td style="padding:4px;">' + avatarHtml + '</td>' +
-                    '<td><a href="/user?uid=' + u.user_id + '" style="font-weight:500;">' + u.user_name + '</a></td>' +
+                var avHtml = u.avatar_url
+                    ? '<img src="' + u.avatar_url + '" style="width:28px;height:28px;border-radius:50%;object-fit:cover;" onerror="this.style.display=\'none\'">'
+                    : '<div style="width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#06b6d4);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff;">' + (u.user_name || '?').charAt(0).toUpperCase() + '</div>';
+                tr.innerHTML = '<td class="' + rankClass + '" style="font-weight:600;text-align:center;">#' + u.rank + '</td>' +
+                    '<td style="padding:3px;"><div style="display:flex;align-items:center;gap:8px;">' + avHtml + '<a href="/user?uid=' + u.user_id + '" style="color:var(--primary-dark);font-weight:500;">' + u.user_name + '</a></div></td>' +
                     '<td style="font-family:var(--font-mono);font-size:12px;color:var(--text-soft);">' + u.user_id + '</td>' +
                     '<td style="font-size:12px;">' + (u.fans_club || '-') + '</td>' +
                     '<td style="font-size:12px;">' + (u.grade || '-') + '</td>' +
@@ -557,7 +589,7 @@ function loadData() {
         })
         .catch(function(err) {
             el.style.display = 'none';
-            document.getElementById('table-body').innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--danger);">加载失败: ' + err.message + '</td></tr>';
+            document.getElementById('table-body').innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--danger);">加载失败: ' + err.message + '</td></tr>';
             document.getElementById('data-table').style.display = 'table';
         });
 }
@@ -603,6 +635,7 @@ function exportCSV() {
     var url = isMillion ? '/api/million/csv' : '/api/leaderboard/csv';
     url += '?period=' + currentPeriod + '&threshold=' + currentThreshold + '&sort_by=' + currentSort;
     if (currentMinConsume > 0) url += '&min_consume=' + currentMinConsume;
+    if (currentRoomId) url += '&room_id=' + encodeURIComponent(currentRoomId);
     if (lockedSessionId) url += '&session_id=' + lockedSessionId;
     if (currentPeriod === 'month' || currentPeriod === '30d' || currentPeriod === 'all' || isMillion) {
         var ym = document.getElementById('month-picker').value || '';
@@ -617,5 +650,6 @@ function exportCSV() {
 }
 
 loadData();
+loadStreamers();
 </script>
 {% endblock %}

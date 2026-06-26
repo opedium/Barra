@@ -1,0 +1,214 @@
+{% extends "base.html" %}
+{% block title %}数据审计{% endblock %}
+{% block content %}
+<div class="card">
+    <div class="flex-between" style="margin-bottom:16px;">
+        <h2 style="margin-bottom:0;">📊 数据完整性审计</h2>
+        <button onclick="location.reload()" class="btn-refresh" style="padding:6px 14px;border:1px solid var(--border);background:var(--card);border-radius:6px;cursor:pointer;">&#x27F3; 刷新</button>
+    </div>
+
+    <!-- 1. Overview -->
+    <div class="audit-section">
+        <h3>📈 总体概览</h3>
+        <div class="stats-row" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));">
+            <div class="stat-card"><div class="num">{{ data.overview.total_gifts }}</div><div class="label">礼物总数</div></div>
+            <div class="stat-card" style="border-color:#10b981;"><div class="num" style="color:#10b981;">{{ data.overview.total_diamond }}</div><div class="label">总钻石</div></div>
+            <div class="stat-card" style="border-color:#06b6d4;"><div class="num" style="color:#06b6d4;">{{ data.overview.total_chats }}</div><div class="label">弹幕总数</div></div>
+            <div class="stat-card"><div class="num">{{ data.overview.total_sessions }}</div><div class="label">总场次</div></div>
+            <div class="stat-card"><div class="num">{{ data.overview.gift_users }}</div><div class="label">送礼用户</div></div>
+        </div>
+    </div>
+
+    <!-- 2. Dedup Health -->
+    <div class="audit-section">
+        <h3>🔄 去重健康状态</h3>
+        {% set rr = data.dedup.reject_rate %}
+        {% if rr > 10 %}
+            {% set badge_cls = 'badge-red' %}
+        {% elif rr > 3 %}
+            {% set badge_cls = 'badge-amber' %}
+        {% else %}
+            {% set badge_cls = 'badge-green' %}
+        {% endif %}
+        <div style="margin-bottom:10px;">
+            拒绝率: <span class="badge {{ badge_cls }}" style="font-size:14px;">{{ rr }}%</span>
+            {% if rr > 10 %}
+            <span style="color:#ef4444;margin-left:8px;">⚠️ 拒绝率过高，可能存在过度去重</span>
+            {% elif rr > 3 %}
+            <span style="color:#f59e0b;margin-left:8px;">⚠️ 拒绝率偏高，建议检查时间窗口</span>
+            {% else %}
+            <span style="color:#10b981;margin-left:8px;">✅ 健康</span>
+            {% endif %}
+        </div>
+        <div class="stats-row" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));">
+            <div class="stat-card"><div class="num">{{ data.dedup.raw }}</div><div class="label">原始消息</div></div>
+            <div class="stat-card"><div class="num">{{ data.dedup.passed }}</div><div class="label">已通过</div></div>
+            <div class="stat-card" style="{% if data.dedup.rejected > 0 %}border-color:#ef4444;{% endif %}"><div class="num" style="{% if data.dedup.rejected > 0 %}color:#ef4444;{% endif %}">{{ data.dedup.rejected }}</div><div class="label">已拒绝</div></div>
+            <div class="stat-card" style="{% if data.dedup.delta_zero > 100 %}border-color:#f59e0b;{% endif %}"><div class="num">{{ data.dedup.delta_zero }}</div><div class="label">增量零</div></div>
+            <div class="stat-card" style="{% if data.dedup.out_of_order > 10 %}border-color:#ef4444;{% endif %}"><div class="num" style="{% if data.dedup.out_of_order > 10 %}color:#ef4444;{% endif %}">{{ data.dedup.out_of_order }}</div><div class="label">乱序</div></div>
+            <div class="stat-card" style="{% if data.dedup.combo_block > 10 %}border-color:#f59e0b;{% endif %}"><div class="num">{{ data.dedup.combo_block }}</div><div class="label">Combo封锁</div></div>
+            <div class="stat-card"><div class="num">{{ data.dedup.rc1_dup }}</div><div class="label">单次去重</div></div>
+        </div>
+    </div>
+
+    <!-- 3. Time Gaps -->
+    <div class="audit-section">
+        <h3>⏱️ 时间间隙检测 <span class="badge badge-blue">最近10场</span></h3>
+        {% set gap_warn = 'badge-red' if data.gaps.total_gaps > 50 else ('badge-amber' if data.gaps.total_gaps > 10 else 'badge-green') %}
+        <div style="margin-bottom:10px;">
+            间隙数: <span class="badge {{ gap_warn }}">{{ data.gaps.total_gaps }}</span>
+            &nbsp;最大间隙: <strong>{{ data.gaps.max_gap_sec }}s</strong>
+            &nbsp;总损失: <strong>{{ data.gaps.total_lost_sec }}s</strong>
+        </div>
+        {% if data.gaps.details %}
+        <table class="mini-table">
+            <thead><tr><th>#</th><th>起始</th><th>结束</th><th>间隔</th></tr></thead>
+            <tbody>
+            {% for g in data.gaps.details %}
+            <tr>
+                <td>{{ loop.index }}</td>
+                <td>{{ g.from }}</td>
+                <td>{{ g.to }}</td>
+                <td style="font-weight:600;{% if g.gap > 30 %}color:#ef4444;{% endif %}">{{ g.gap }}s</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="text-muted" style="padding:12px 0;">✅ 未检测到 >5s 的消息间隙</div>
+        {% endif %}
+    </div>
+
+    <!-- 4. Sessions Detail -->
+    <div class="audit-section">
+        <h3>📋 场次详情 <span class="badge badge-blue">最近50场</span></h3>
+        <div class="table-wrap">
+            <table class="mini-table">
+                <thead>
+                    <tr><th>#</th><th>主播</th><th>礼物</th><th>弹幕</th><th>用户</th><th>钻石</th><th>礼/时</th><th>状态</th></tr>
+                </thead>
+                <tbody>
+                {% for s in data.sessions %}
+                <tr>
+                    <td>{{ s.id }}</td>
+                    <td>{{ s.anchor_name or '?' }}</td>
+                    <td>{{ s.gift_cnt }}</td>
+                    <td>{{ s.chat_cnt }}</td>
+                    <td>{{ s.user_cnt }}</td>
+                    <td style="font-weight:600;">{{ s.diamond_sum }}</td>
+                    <td>{{ s.gifts_per_hour }}/h</td>
+                    <td>{% if s.status == 'live' %}<span class="badge badge-green">live</span>{% else %}<span class="badge badge-gray">{{ s.status }}</span>{% endif %}</td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- 5. Anonymous Resolution Rate -->
+    <div class="audit-section">
+        <h3>🎭 匿名用户解析率</h3>
+        {% set ar = data.anonymous %}
+        {% if ar.total > 0 %}
+        {% set anon_badge = 'badge-green' if ar.resolve_rate > 80 else ('badge-amber' if ar.resolve_rate > 50 else 'badge-red') %}
+        <div class="stats-row" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));">
+            <div class="stat-card"><div class="num">{{ ar.total }}</div><div class="label">匿名用户总数</div></div>
+            <div class="stat-card" style="border-color:#10b981;"><div class="num" style="color:#10b981;">{{ ar.resolved }}</div><div class="label">已解析</div></div>
+            <div class="stat-card" style="{% if ar.unresolved > 0 %}border-color:#ef4444;{% endif %}"><div class="num" style="{% if ar.unresolved > 0 %}color:#ef4444;{% endif %}">{{ ar.unresolved }}</div><div class="label">未解析</div></div>
+            <div class="stat-card" style="border-color:#6366f1;"><div class="num" style="color:#6366f1;">{{ ar.resolve_rate }}%</div><div class="label">解析率</div></div>
+        </div>
+        <div style="margin-top:8px;">
+            <span class="badge badge-blue">神秘人: {{ ar.mystic }}</span>
+            <span class="badge badge-amber">dou前缀: {{ ar.dou_prefix }}</span>
+            {% if ar.resolve_rate == 0 %}
+            <span style="color:#ef4444;margin-left:8px;">⚠️ 自动解析可能未生效，请检查 API 调用</span>
+            {% endif %}
+        </div>
+        {% else %}
+        <div class="text-muted" style="padding:12px 0;">✅ 无匿名用户数据</div>
+        {% endif %}
+    </div>
+
+    <!-- 6. Per-Session Dedup Breakdown -->
+    <div class="audit-section">
+        <h3>🔍 每场去重分析 <span class="badge badge-blue">最近20场</span></h3>
+        <div class="table-wrap">
+            <table class="mini-table">
+                <thead>
+                    <tr><th>#</th><th>主播</th><th>原始行</th><th>唯一事件</th><th>重复率</th><th>钻石</th><th>用户</th></tr>
+                </thead>
+                <tbody>
+                {% for sd in data.dedup_sessions %}
+                {% set dr = sd.dup_rate %}
+                <tr>
+                    <td>{{ sd.session_id }}</td>
+                    <td>{{ sd.anchor_name or '?' }}</td>
+                    <td>{{ sd.raw_rows }}</td>
+                    <td>{{ sd.unique_events }}</td>
+                    <td>
+                        <span class="badge {% if dr > 10 %}badge-red{% elif dr > 5 %}badge-amber{% else %}badge-green{% endif %}">
+                            {{ dr }}%
+                        </span>
+                    </td>
+                    <td style="font-weight:600;">{{ sd.diamond_sum }}</td>
+                    <td>{{ sd.user_cnt }}</td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- 7. Corrupted Usernames -->
+    <div class="audit-section">
+        <h3>⚠️ 异常用户名检测</h3>
+        {% if data.bad_usernames %}
+        <div style="margin-bottom:10px;color:#ef4444;">检测到 {{ data.bad_usernames|length }} 个可能损坏的用户名</div>
+        <table class="mini-table">
+            <thead><tr><th>用户ID</th><th>用户名</th></tr></thead>
+            <tbody>
+            {% for u in data.bad_usernames %}
+            <tr>
+                <td>{{ u.user_id }}</td>
+                <td style="color:#ef4444;font-family:var(--font-mono);">{{ u.user_name }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="text-muted" style="padding:12px 0;">✅ 未发现异常用户名</div>
+        {% endif %}
+    </div>
+</div>
+
+<style>
+.audit-section {
+    margin-bottom: 24px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+}
+.audit-section:last-child { border-bottom: none; }
+.audit-section h3 {
+    font-size: 15px;
+    font-weight: 600;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.stat-card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 12px;
+    text-align: center;
+}
+.stat-card .num { font-size: 20px; font-weight: 700; color: var(--primary); }
+.stat-card .label { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+.mini-table { width:100%; border-collapse:collapse; font-size:13px; }
+.mini-table th,.mini-table td { padding:6px 10px; text-align:left; border-bottom:1px solid var(--border); }
+.mini-table th { font-size:11px; color:var(--text-muted); font-weight:500; }
+.mini-table tbody tr:hover td { background:var(--nav-hover); }
+.btn-refresh:hover { opacity:0.8; }
+</style>
+{% endblock %}

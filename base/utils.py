@@ -86,6 +86,12 @@ INTERACTIVE_TYPES = frozenset({
     'WebcastEmojiChatMessage',
 })
 
+# 用户真实互动消息类型（用于看门狗检测业务静默）
+# 仅追踪弹幕和礼物 — 有任意一条即视为"直播间有用户活跃"
+USER_MSG_TYPES = frozenset({
+    'WebcastChatMessage', 'WebcastGiftMessage', 'WebcastLightGiftMessage',
+})
+
 # WebSocket method → output config key 映射
 # strip('Webcast','Message').lower() 后与 config key 不一致的特殊映射
 METHOD_TO_CONFIG = {
@@ -351,21 +357,80 @@ def extract_ua_version(ua: str) -> str:
     return f"Chrome/{m.group(1)}" if m else "Chrome/132.0.0.0"
 
 
+# ── 主播名称映射（供 fmt_fans_club 使用）──
+# 解析线程（msg-processor）可能同时处理多个房间的消息，线程名无法区分。
+# 改用 thread-local 变量，由 fetcher 的 _process_item 在处理每条消息前设置。
+_thread_fans = threading.local()
+
+def set_current_anchor(name):
+    """设置当前处理消息的主播名（由 fetcher 在处理每条消息前调用）。"""
+    _thread_fans.anchor = name
+
+def get_current_anchor():
+    """获取当前处理消息的主播名。"""
+    return getattr(_thread_fans, 'anchor', '')
+
+
+# 仍然保留 live_id → name 映射，供 set_current_anchor 查询
+_anchor_names = {}
+
+def set_anchor_name(live_id, name):
+    """注册直播间对应的主播名。由 fetcher 在获取房间信息后调用。"""
+    if name and live_id:
+        _anchor_names[live_id] = name
+
+
+def _get_anchor_name():
+    """获取当前主播名。优先使用 thread-local，回退到线程名推断。"""
+    name = get_current_anchor()
+    if name:
+        return name
+    import threading
+    tname = threading.current_thread().name
+    if tname.startswith('room-'):
+        return _anchor_names.get(tname[5:], '')
+    return ''
+
+
 def fmt_fans_club(user):
-    """格式化用户的粉丝团信息为显示字符串。
+    """格式化用户的粉丝团信息为显示字符串，支持多粉丝团。
 
     Args:
         user: protobuf User 对象。
 
     Returns:
-        '[粉丝团:名称 Lv等级]' 或 '[粉丝团 Lv等级]'，无粉丝团时返回空字符串。
+        粉丝团标签字符串，多个以空格分隔。格式为：
+        '[粉丝团:名称 Lv等级]' 或 '[粉丝团:本主播 Lv等级]'，
+        无粉丝团时返回空字符串。
     """
     try:
-        club = user.fans_club.data
-        if club and club.club_name:
-            return f"[粉丝团:{club.club_name} Lv{club.level}]"
-        elif club and club.level > 0:
-            return f"[粉丝团 Lv{club.level}]"
+        clubs = []
+        host = _get_anchor_name()
+        # 主粉丝团 (data)
+        data = user.fans_club.data
+        if data and data.level > 0:
+            if data.club_name:
+                clubs.append(f"[粉丝团:{data.club_name} Lv{data.level}]")
+            elif host:
+                clubs.append(f"[粉丝团:{host} Lv{data.level}]")
+            else:
+                clubs.append(f"[粉丝团 Lv{data.level}]")
+        # 附加粉丝团 (prefer_data map) — proto-plus MapField 不支持 .items()
+        pd = getattr(user.fans_club, 'prefer_data', None)
+        if pd:
+            try:
+                # proto-plus MapField: iterate keys, get values by key
+                keys = list(pd.keys()) if hasattr(pd, 'keys') else []
+                for key in keys:
+                    club = pd.get(key) if hasattr(pd, 'get') else pd[key]
+                    if club and club.level > 0 and club.club_name:
+                        # 避免重复（同一 club_name 只保留最高等级）
+                        existing = [c for c in clubs if club.club_name in c]
+                        if not existing:
+                            clubs.append(f"[粉丝团:{club.club_name} Lv{club.level}]")
+            except (AttributeError, TypeError):
+                pass
+        return ' '.join(clubs)
     except (AttributeError, TypeError):
         pass
     return ''
@@ -462,6 +527,67 @@ def get_user_sec_uid(user):
         return su if su else ''
     except (AttributeError, TypeError):
         return ''
+
+
+def sanitize_username(raw_name, display_id=''):
+    """清理并验证用户昵称。
+
+    部分 protobuf 消息中的 nick_name 可能含控制字符（如 \\x02 标记字节
+    泄漏到字符串中），导致多个用户显示为相同的损坏名称（如 "2@\\x02"）。
+    此函数会：
+    1. 去除 ASCII 控制字符（0x00-0x1f，保留 0x20+ 的可见字符）
+    2. 如果清理后为空或明显损坏，回退到 display_id
+    3. 去首尾空白
+
+    Args:
+        raw_name: protobuf User.nick_name 的原始值。
+        display_id: User.display_id 备用字段。
+
+    Returns:
+        清理后的用户显示名。
+    """
+    if not raw_name:
+        if display_id:
+            return str(display_id)
+        return '用户'
+    # 过滤控制字符
+    cleaned = ''.join(c for c in str(raw_name) if ord(c) >= 0x20 or c in '\n\r\t')
+    cleaned = cleaned.strip()
+    if not cleaned or len(cleaned) <= 1:
+        if display_id:
+            return str(display_id)
+        return '用户'
+    return cleaned
+
+
+def get_user_name(user):
+    """安全获取用户显示名，自动清理 + fallback 链。
+
+    Fallback 链（逐级回退）:
+    1. user.nick_name → sanitize_username() 清理控制字符
+    2. user.display_id 备用
+    3. user.sec_uid 末段（如 '...aBcDeFgH'），至少可区分用户
+    4. '用户' 兜底
+
+    Args:
+        user: protobuf User 对象。
+
+    Returns:
+        清理后的用户显示名。
+    """
+    try:
+        raw = user.nick_name
+        disp = getattr(user, 'display_id', '') or ''
+        name = sanitize_username(raw, disp)
+        if name != '用户':
+            return name
+        # nick_name 和 display_id 均不可用 → 尝试 sec_uid 末段作为标识
+        su = get_user_sec_uid(user)
+        if su:
+            return f'…{su[-12:]}' if len(su) > 12 else su
+        return '用户'
+    except (AttributeError, TypeError):
+        return '用户'
 
 
 def get_user_avatar_url(user):
