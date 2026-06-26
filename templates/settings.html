@@ -190,27 +190,6 @@
 .cookie-panel { display: none; }
 .cookie-panel.active { display: block; }
 
-    text-align: center;
-    padding: 12px 0;
-}
-    display: inline-block;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    max-width: 260px;
-    height: auto;
-    background: #fff;
-    padding: 8px;
-}
-    margin-top: 8px;
-    font-size: 13px;
-    color: var(--text-muted);
-}
-    display: flex;
-    gap: 8px;
-    justify-content: center;
-    margin-top: 10px;
-}
-
 .cookie-textarea {
     width: 100%;
     min-height: 90px;
@@ -482,6 +461,50 @@ function escHtml(s) {
     var d = document.createElement('div');
     d.textContent = s;
     return d.innerHTML;
+}
+
+/* ── Cookie Status ── */
+
+function cookieDotClass(status) {
+    if (status === 'active') return 'green';
+    if (status === 'expiring_soon') return 'amber';
+    if (status === 'expired') return 'red';
+    return 'gray';
+}
+
+function cookieStatusText(status, info) {
+    if (status === 'active') return '状态正常 · 有效期至 ' + (info.expire_date || '--');
+    if (status === 'expiring_soon') return '即将过期 · 有效期至 ' + (info.expire_date || '--') + ' · 请尽快更新';
+    if (status === 'expired') return 'Cookie 已过期，请重新登录';
+    return '未加载 Cookie · 以游客模式运行';
+}
+
+function refreshCookieStatus() {
+    fetch('/api/cookie-status')
+        .then(function(r) { return r.json(); })
+        .then(function(info) {
+            var dot = document.getElementById('cookie-dot');
+            var text = document.getElementById('cookie-status-text');
+            var meta = document.getElementById('cookie-meta-text');
+            dot.className = 'cookie-status-dot ' + cookieDotClass(info.status);
+            var statusMsg = cookieStatusText(info.status, info);
+            if (info.nickname) {
+                statusMsg = statusMsg + ' · 已登录「' + info.nickname + '」';
+            }
+            text.textContent = statusMsg;
+            if (info.has_cookie) {
+                meta.textContent = '已加载 ' + info.cookie_count + ' 项 cookie' +
+                    (info.days_remaining >= 0 ? ' · 剩余 ' + info.days_remaining + ' 天' : '');
+            } else {
+                meta.textContent = '';
+            }
+        })
+        .catch(function() {
+            var dot = document.getElementById('cookie-dot');
+            var text = document.getElementById('cookie-status-text');
+            if (dot) dot.className = 'cookie-status-dot gray';
+            if (text) text.textContent = 'Cookie 状态查询失败';
+        });
 }
 
 /* ── Cookie Management ── */
