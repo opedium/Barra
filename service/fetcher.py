@@ -1356,6 +1356,9 @@ class DouyinBarrage:
                                         _old_lv_saved = 0
                                         _old_fc_saved = 0
                                     upsert_user(uid, uname, ugrade, uclub, usec_uid, uavatar)
+                                    # è¡¥å……ç­‰å¾…ä¸­çš„è®¢é˜… user_idï¼ˆç”¨æˆ·ç¡®è®¤èº«ä»½åŽå¡«å……ï¼‰
+                                    if uid:
+                                        self._fill_subscription_uid(uname, uid)
                                     # åŒ¿åç”¨æˆ·ï¼ˆç¥žç§˜äºº/douå‰ç¼€ï¼‰è‡ªåŠ¨è§£æžçœŸå®žæ˜µç§°
                                     _is_anon = uname and (uname.startswith('ç¥žç§˜äºº') or re.match(r'dou\d+$', uname, re.IGNORECASE))
                                     if _is_anon:
@@ -1489,7 +1492,11 @@ class DouyinBarrage:
                                                 record_gift(self._session_id, final_uid, final_name, sub_name or 'è®¢é˜…',
                                                     1, rec_data.get('diamond', 0), sub_grade, sub_club)
                                             else:
-                                                logger.warning(f"[è®¢é˜…] æ— æ³•ç¡®å®šç”¨æˆ·IDï¼Œè·³è¿‡ gift è®°å½• (douyin_id={sub_douyin_id}, proto_uid={proto_uid}, name={sub_uname})")
+                                                # ç­å¾…ç”¨æˆ·èº«ä»½ï¼šå…ˆç”¨ç©º user_id è®°å½•ï¼ŒåŽç»­ top up å¡«å…… real_uid
+                                                if sub_uname:
+                                                    record_gift(self._session_id, '', sub_uname, sub_name or 'è®¢é˜…',
+                                                                1, rec_data.get('diamond', 0), sub_grade, sub_club)
+                                                    logger.info(f"[subscribe] pending user: {sub_uname} (waiting for real_uid)")
                             except Exception as e:
                                 logger.error(f"[DB] SQLite write failed in _process_item: {e} | type={rec_type} user={uid}")
 
@@ -1828,6 +1835,20 @@ class DouyinBarrage:
 
         t = threading.Thread(target=_resolve, daemon=True, name='anon-resolve')
         t.start()
+
+    def _fill_subscription_uid(self, user_name, real_uid):
+        """当用户身份确认后，补填等待中的订阅记录 user_id。"""
+        if not user_name or not real_uid:
+            return
+        try:
+            cur = _get_conn().execute(
+                'UPDATE gift_logs SET user_id = ?, user_name = ? WHERE user_id = \'\' AND user_name = ? AND (gift_name LIKE \'%会员%\' OR gift_name LIKE \'%星守护%\')',
+                (real_uid, user_name, user_name)
+            )
+            if cur.rowcount > 0:
+                logger.info(f"[è®¢é˜…] å¡«è¡¥ user_id: {user_name} â†’ {real_uid} (å…± {cur.rowcount} æ¡)")
+        except Exception:
+            pass
 
 
 # â”€â”€ å†…éƒ¨ä¿¡å·å¼‚å¸¸ï¼ˆä¸åœ¨æ¨¡å—çº§æš´éœ²ï¼‰â”€â”€
