@@ -884,10 +884,8 @@ def _extract_proto_strings(payload):
 
 
 def _extract_douyin_id(payload):
-    """从 protobuf 中提取 douyin_id（10-12位数字，非 room_id）。"""
-    # 遍历所有 varint，找 10-12 位的数字，排除已知的 room_id
+    """从 protobuf varint 中提取数字 user_id（排除时间戳和 room_id）。"""
     ids = []
-    i = 0
     stack = [(payload, 0)]
     while stack:
         data, depth = stack.pop()
@@ -907,7 +905,13 @@ def _extract_douyin_id(payload):
                     b = data[j]; j += 1
                     val |= (b & 0x7f) << shift; shift += 7
                     if not (b & 0x80): break
-                if 10**9 < val < 10**13:
+                # user_id 通常是 9-19 位数字
+                # 排除 Unix 时间戳 (1.5e9-2e9) 和毫秒时间戳 (1.5e12-2e12)
+                if val > 10**8:
+                    if 1500000000 < val < 2000000000:
+                        continue  # Unix 时间戳
+                    if 1500000000000 < val < 2000000000000:
+                        continue  # 毫秒时间戳
                     ids.append(val)
             elif wt == 2:
                 length = 0; shift = 0
@@ -921,78 +925,11 @@ def _extract_douyin_id(payload):
                 j += 4
             else:
                 break
-    # 排除已知 room_id，取最常见的
+    if not ids:
+        return ''
+    # 取出现次数最多的 ID（最常见的通常是 user_id 或 room_id）
     from collections import Counter
-    id_counts = Counter(ids)
-    for val, _ in id_counts.most_common(3):
-        if val not in (7647162160514190118, 7646418124761353003, 7646787956389776170):
-            return str(val)
-    return ''
-
-
-def _extract_user_id(payload):
-    """从 protobuf 原始字节中提取数字 user_id（17-19位）。
-
-    订阅类型 payload 中，user_id 与 douyin_id、username 位于同一个
-    User 子消息内。此函数扫描所有 varint，收集 17-19 位的数值
-    （包含 user_id 和可能出现的 room_id），通过 field number 和
-    嵌套深度区分：User 消息中 fn=1 的 varint 即为 user_id。
-
-    Returns:
-        str: 提取到的 user_id，或 ''。
-    """
-    if not payload:
-        return ''
-
-    candidates = []  # (fn, depth, value)
-    stack = [(payload, 0)]
-    while stack:
-        data, depth = stack.pop()
-        if depth > 6:
-            continue
-        j = 0
-        while j < len(data):
-            tag = 0; shift = 0
-            while j < len(data):
-                b = data[j]; j += 1
-                tag |= (b & 0x7f) << shift; shift += 7
-                if not (b & 0x80): break
-            fn = tag >> 3; wt = tag & 0x7
-            if wt == 0:
-                val = 0; shift = 0
-                while j < len(data):
-                    b = data[j]; j += 1
-                    val |= (b & 0x7f) << shift; shift += 7
-                    if not (b & 0x80): break
-                # 17-19 位的大数值，可能是 user_id 或 room_id
-                if val > 10**15:
-                    candidates.append((fn, depth, val))
-            elif wt == 2:
-                length = 0; pos = j; shift = 0
-                while j < len(data):
-                    b = data[j]; j += 1
-                    length |= (b & 0x7f) << shift; shift += 7
-                    if not (b & 0x80): break
-                raw = data[j:j+length] if j + length <= len(data) else b''
-                if raw:
-                    stack.append((raw, depth + 1))
-                j += length
-            elif wt == 5:
-                j += 4
-            else:
-                break
-
-    if not candidates:
-        return ''
-
-    # 优先选择 fn=1 的候选值（User.id 的 field number 为 1）
-    for fn, depth, val in candidates:
-        if fn == 1:
-            return str(val)
-
-    # 回退：选择最小的候选值（user_id 通常比 room_id 数值小）
-    vals = sorted(v for _, _, v in candidates)
-    return str(vals[0])
+    return str(Counter(ids).most_common(1)[0][0])
 
 
 def _extract_subscribe(payload):
@@ -1014,7 +951,7 @@ def _extract_subscribe(payload):
     # 提取 douyin_id (display_id, 10-12位数字)
     douyin_id = _extract_douyin_id(payload)
     # 提取数字 user_id (17-19位, 与 douyin_id 不同)
-    user_id = _extract_user_id(payload)
+    user_id = _extract_douyin_id(payload)
 
     # ── 辅助：从字符串列表中找用户名 ──
     def _find_username(candidates):
