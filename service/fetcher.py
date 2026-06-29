@@ -1505,6 +1505,14 @@ class DouyinBarrage:
                         payload_preview = msg.payload[:80].hex() if isinstance(msg.payload, bytes) else str(msg.payload)[:80]
                         logger.info(f"[æ•°æ®] æœªæ³¨å†Œæ¶ˆæ¯ç±»åž‹: {msg.method} | payload_len={len(msg.payload)} | preview={payload_preview}")
 
+        # æ¯ 100 æ¡æ¶ˆæ¯è§¦å‘ä¸€æ¬¡ç»Ÿè®¡å†™å…¥ï¼ˆåœ¨å¤„ç†çº¿ç¨‹æ‰§è¡Œï¼Œå…äº‰æ‰§ï¼‰
+        self._proc_count = getattr(self, '_proc_count', 0) + 1
+        if self._proc_count % 100 == 0 and self._session_id:
+            try:
+                flush_to_sqlite(self._session_id)
+            except Exception:
+                pass
+
     # â”€â”€ æ¶ˆæ¯å¤„ç† â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _handle_message(self, message):
@@ -1709,11 +1717,7 @@ class DouyinBarrage:
                     flush_combo_buffer()
                 except Exception:
                     pass
-                if self._session_id:
-                    try:
-                        flush_to_sqlite(self._session_id)
-                    except Exception as e:
-                        logger.debug(f"[DB] flush å¼‚å¸¸: {e}")
+                # (flush_to_sqlite å·²ç§»è‡³ _process_item çº¿ç¨‹ï¼Œæ­¤å¤„ä¸å†è°ƒç”¨ä»¥å…äº‰æ‰§)
                 # â”€â”€ æ¯ 5 åˆ†é’Ÿå…³é—­é—²ç½® HTTP è¿žæŽ¥ï¼Œé˜²æ­¢ fd æ³„æ¼ â”€â”€
                 if int(time.time()) % 300 < self._stats_interval:
                     try:

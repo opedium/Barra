@@ -2062,21 +2062,32 @@ def upsert_user(user_id, user_name, grade='', fans_club='', sec_uid='', avatar_u
     conn.commit()
 
 
+def _write_lock_conn():
+    """获取带写锁的连接（所有 DB 写线程通过此锁串行化，避免 database is locked）。"""
+    _db_write_lock.acquire()
+    conn = _get_conn()
+    return conn
+
+
+    """释放写锁。"""
+    _db_write_lock.release()
+
+
 def flush_to_sqlite(session_id):
     """从 gift_logs 聚合贡献数据写入 contributions / daily_stats / monthly_stats。"""
-    conn = _get_conn()
-    today = datetime.now().strftime('%Y-%m-%d')  # uses local system time (set to UTC+8 for Singapore)
-    month = datetime.now().strftime('%Y-%m')
+    with _db_write_lock:
+        conn = _get_conn()
+        today = datetime.now().strftime('%Y-%m-%d')
+        month = datetime.now().strftime('%Y-%m')
 
-    # 从 gift_logs 聚合每个用户的消费
-    rows = conn.execute('''
-        SELECT user_id, user_name, SUM(diamond_total) as consume
-        FROM gift_logs WHERE session_id = ?
-        GROUP BY user_id
-    ''', (session_id,)).fetchall()
+        rows = conn.execute('''
+            SELECT user_id, user_name, SUM(diamond_total) as consume
+            FROM gift_logs WHERE session_id = ?
+            GROUP BY user_id
+        ''', (session_id,)).fetchall()
 
-    if not rows:
-        return
+        if not rows:
+            return
 
     for r in rows:
         uid = r['user_id']
@@ -2162,6 +2173,7 @@ def flush_to_sqlite(session_id):
 
 _write_count = 0
 _WRITE_BATCH_SIZE = 10  # 每 10 次写入批量 commit 一次（降低锁持有时间）
+_db_write_lock = threading.Lock()  # 全局写锁，所有线程通过此锁串行化 SQLite 写入
 
 
 def _maybe_commit(conn):
