@@ -56,6 +56,7 @@ def set_sse_callback(cb):
 
 _gift_dedup = {}        # (group_id, gift_id, user_id) -> (last_repeat_count, last_update_time, combo_ended)
 _rc1_dedup = {}         # (gift_id, user_id) -> last_accept_time (rc=1 500ms 短窗口去重)
+_gift_total_tracker = {}  # (user_id, gift_id) -> total_count（绝对累计值，跨 combo 去重）
 _dedup_lock = threading.Lock()
 
 # ── trace_id 影子去重 (shadow mode) ────────────────

@@ -965,6 +965,7 @@ class DouyinBarrage:
                             if r2 and r2['gc'] < 5 and r2['cc'] < 10:
                                 logger.info(f"[æŽ§åˆ¶] ä¸Šä¸€åœºæ¬¡ #{self._session_id} ä¸ºè™šæµ®åœºæ¬¡ (ç¤¼ç‰©={r2['gc']} å¼¹å¹•={r2['cc']})ï¼Œè¿›å…¥ç­‰å¾…æ¨¡å¼")
                                 self._enter_wait_mode()
+                                continue  # é‡æ–°æ£€æŸ¥ API çŠ¶æ€
                             else:
                                 self._session_id = create_session(self.live_id, self.anchor_name)
                     except Exception:
