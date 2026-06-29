@@ -2061,12 +2061,6 @@ def upsert_user(user_id, user_name, grade='', fans_club='', sec_uid='', avatar_u
           is_anon, anon_label, anon_label))
         conn.commit()
 
-
-
-    """释放写锁。"""
-    _db_write_lock.release()
-
-
 def flush_to_sqlite(session_id):
     """从 gift_logs 聚合贡献数据写入 contributions / daily_stats / monthly_stats。"""
     with _db_write_lock:
