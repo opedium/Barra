@@ -1667,10 +1667,27 @@ class DouyinBarrage:
                 if self._frame_total > 0:
                     gap_pct = self._frame_gaps / (self._frame_total + self._frame_gaps) * 100
                     logger.info(f"[å¸§åº] frames={self._frame_total} gaps={self._frame_gaps} loss={gap_pct:.2f}%")
-                # â”€â”€ æ¯ 5 åˆ†é’Ÿè§¦å‘ä¸€æ¬¡åŒ¿åè§£æžï¼ˆæ–°å¢žåŒ¿åç”¨æˆ·ä¼šè¢«è¡¥è§£æžï¼‰â”€â”€
+                # â”€â”€ fd çŠ¶æ€ç›‘æŽ§ï¼ˆé¿å… fd æ³„æ¼å¯¼è‡´ crashï¼‰â”€â”€
+                import os as _os
+                try:
+                    _fd_count = len(_os.listdir(f'/proc/{_os.getpid()}/fd'))
+                    if _fd_count > 200:
+                        logger.warning(f"[FD] å½“å‰ fd æ•°: {_fd_count} (è­¦æˆ’ > 200)")
+                    elif self._stats_count % 5 == 0:
+                        logger.info(f"[FD] fd: {_fd_count}")
+                except Exception:
+                    pass
+                # â”€â”€ æ¯ 5 åˆ†é’Ÿè§¦å‘ä¸€æ¬¡åŒ¿åè§£æž + ç¼©æ”¾ HTTP è¿žæŽ¥æ± â”€â”€
                 self._stats_count = getattr(self, '_stats_count', 0) + 1
                 if self._stats_count % 10 == 0:
                     self._batch_resolve_anonymous()
+                    try:
+                        # æ¸…ç† HTTP è¿žæŽ¥æ± ï¼Œé‡Šæ”¾é—²ç½®é•¿è¿žæŽ¥
+                        for proto in ('https://', 'http://'):
+                            adp = self.session.get_adapter(proto)
+                            adp.pool_manager.clear()
+                    except Exception:
+                        pass
                 # â”€â”€ å¼ºåˆ¶åˆ·æ–° combo ç¼“å†² + è´¡çŒ®å†™å…¥ SQLite + æ‰¹é‡ commit â”€â”€
                 flush_writes()
                 try:

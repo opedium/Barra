@@ -1675,6 +1675,23 @@ HANDLERS = {
 DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
 DB_PATH = os.path.join(DB_DIR, 'douyin_barrage.db')
 _local = threading.local()
+_conn_registry = set()  # 跟踪所有 SQLite 连接，退出时关闭
+_conn_lock = threading.Lock()
+
+
+def _close_all_connections():
+    """进程退出时关闭所有 SQLite 连接，防止 fd 泄漏。"""
+    with _conn_lock:
+        for c in list(_conn_registry):
+            try:
+                c.close()
+            except Exception:
+                pass
+        _conn_registry.clear()
+
+
+import atexit
+atexit.register(_close_all_connections)
 
 # ── 启动时自动迁移旧表结构 ──
 try:
@@ -1738,7 +1755,9 @@ def _get_conn():
     global _db_schema_inited
     if not hasattr(_local, 'conn') or _local.conn is None:
         os.makedirs(DB_DIR, exist_ok=True)
-        _local.conn = sqlite3.connect(DB_PATH)
+        _local.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        with _conn_lock:
+            _conn_registry.add(_local.conn)
         _local.conn.execute('PRAGMA journal_mode=WAL')
         _local.conn.execute('PRAGMA synchronous=NORMAL')
         _local.conn.execute('PRAGMA busy_timeout=10000')
