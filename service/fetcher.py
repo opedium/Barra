@@ -960,26 +960,12 @@ class DouyinBarrage:
                     except Exception:
                         pass
 
-                # æ³¨å†Œ combo æœ€ç»ˆåŒ–å›žè°ƒï¼ˆæŒ‰ä¸»æ’­åéš”ç¦»ï¼Œæ”¯æŒå¤šæˆ¿é—´å…±å­˜ï¼‰
+                # combo æœ€ç»ˆåŒ–å›žè°ƒï¼šåªæŽ¨å…¥é˜Ÿåˆ—ï¼Œä¸ç›´æŽ¥å†™DB (ç”± _process_thread çº¿ç¨‹ç»Ÿä¸€å†™å…¥ï¼Œé¿å…çº¿ç¨‹ç´¢)
+                if not hasattr(self, '_combo_pending'):
+                    self._combo_pending = []
                 def _on_gift_finalize(data):
-                    sid = self._session_id
-                    if not sid or not data: return
-                    try:
-                        # å…ˆæ›´æ–°ç”¨æˆ·ä¿¡æ¯ï¼ˆè´¢å¯Œç­‰çº§ã€ç²‰ä¸å›¢ã€å¤´åƒç­‰ï¼‰
-                        uid = data.get('user_id', '')
-                        uname = data.get('user_name', '')
-                        if uid:
-                            upsert_user(uid, uname,
-                                grade=data.get('grade', ''),
-                                fans_club=data.get('fans_club', ''),
-                                sec_uid=data.get('sec_uid', ''),
-                                avatar_url=data.get('avatar_url', ''))
-                        # å†è®°å½•ç¤¼ç‰©
-                        record_gift(sid, uid, uname,
-                            data.get('gift_name',''), data.get('gift_count',0),
-                            data.get('diamond_total',0), data.get('grade',''), data.get('fans_club',''))
-                    except Exception as e:
-                        logger.error(f"[DB] combo finalize record_gift failed: {e}")
+                    if data:
+                        self._combo_pending.append(dict(data))
                 set_gift_finalize_callback(self.anchor_name or self.live_id, _on_gift_finalize)
                 self._gift_callback_anchor = self.anchor_name or self.live_id
 
@@ -1260,6 +1246,24 @@ class DouyinBarrage:
 
         # è®¾ç½®çº¿ç¨‹æœ¬åœ°ä¸»æ’­åï¼Œä¾› fmt_fans_club è§£æžå¤šç²‰ä¸å›¢æ—¶ä½¿ç”¨
         set_current_anchor(self.anchor_name or str(self.live_id))
+
+        # æ¶ˆè€— combo ç¼“å†²ï¼ˆç»Ÿä¸€åœ¨ _process_item çº¿ç¨‹å†™ DBï¼Œé¿å…å®šæ—¶å™¨çº¿ç¨‹ä¸Žæ­¤çº¿ç¨‹äº‰æ‰§ï¼‰
+        if hasattr(self, '_combo_pending') and self._combo_pending:
+            pending = self._combo_pending[:]
+            self._combo_pending.clear()
+            for data in pending:
+                try:
+                    uid = data.get('user_id', '')
+                    uname = data.get('user_name', '')
+                    if uid:
+                        upsert_user(uid, uname,
+                            grade=data.get('grade',''), fans_club=data.get('fans_club',''),
+                            sec_uid=data.get('sec_uid',''), avatar_url=data.get('avatar_url',''))
+                    record_gift(self._session_id, uid, uname,
+                        data.get('gift_name',''), data.get('gift_count',0),
+                        data.get('diamond_total',0), data.get('grade',''), data.get('fans_club',''))
+                except Exception as e:
+                    logger.error(f"[DB] combo finalize write failed: {e}")
 
         for msg in messages_list:
             if self._stop_event.is_set():

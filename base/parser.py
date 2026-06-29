@@ -1760,7 +1760,7 @@ def _get_conn():
             _conn_registry.add(_local.conn)
         _local.conn.execute('PRAGMA journal_mode=WAL')
         _local.conn.execute('PRAGMA synchronous=NORMAL')
-        _local.conn.execute('PRAGMA busy_timeout=10000')
+        _local.conn.execute('PRAGMA busy_timeout=30000')
         _local.conn.execute('PRAGMA cache_size=-16000')
         _local.conn.execute('PRAGMA mmap_size=268435456')
         _local.conn.execute('PRAGMA temp_store=MEMORY')
@@ -2161,7 +2161,7 @@ def flush_to_sqlite(session_id):
 
 
 _write_count = 0
-_WRITE_BATCH_SIZE = 50  # 每 50 次写入批量 commit 一次
+_WRITE_BATCH_SIZE = 10  # 每 10 次写入批量 commit 一次（降低锁持有时间）
 
 
 def _maybe_commit(conn):
