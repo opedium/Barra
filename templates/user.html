@@ -443,10 +443,20 @@ function loadUser() {
                 metaEl.appendChild(gradeBadge);
             }
             if (data.fans_club) {
-                var clubBadge = document.createElement('span');
-                clubBadge.className = 'badge badge-amber';
-                clubBadge.textContent = data.fans_club;
-                metaEl.appendChild(clubBadge);
+                var clubs = data.fans_club.match(/\[粉丝团:[^\]]+?\sLv\d+\]/g);
+                if (clubs && clubs.length > 0) {
+                    clubs.forEach(function(c) {
+                        var cb = document.createElement('span');
+                        cb.className = 'badge badge-amber';
+                        cb.textContent = c;
+                        metaEl.appendChild(cb);
+                    });
+                } else {
+                    var cb = document.createElement('span');
+                    cb.className = 'badge badge-amber';
+                    cb.textContent = data.fans_club;
+                    metaEl.appendChild(cb);
+                }
             } else {
                 var noClub = document.createElement('span');
                 noClub.className = 'badge badge-gray';
