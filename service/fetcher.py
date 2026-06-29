@@ -1661,12 +1661,17 @@ class DouyinBarrage:
 
             if not first_check_done:
                 if business_silence > first_check_timeout:
-                    logger.info(f"[çœ‹é—¨ç‹—] é¦–æ¬¡æ£€æµ‹ {business_silence:.0f}s æ— ä¸šåŠ¡æ¶ˆæ¯ï¼Œå¿«é€Ÿé‡è¿ž")
+                    logger.info(f"[çœ‹é—¨ç‹—] é¦–æ¬¡æ£€æµ‹ {business_silence:.0f}s æ— ä¸šåŠ¡æ¶ˆæ¯ï¼Œå é™¤ç©ºåœºæ¬¡")
                     first_check_done = True
+                    # å é™¤æ­¤æ¬¡å»ºç«‹çš„ç©ºåœºæ¬¡ï¼ˆé¿å…èšæµ®åœºæ¬¡ç§¯ç´¯ï¼‰
                     try:
-                        await self._ws.close()
+                        from base.parser import delete_session as _ds
+                        if self._session_id:
+                            _ds(self._session_id)
+                            self._session_id = None
                     except Exception:
                         pass
+                    self._enter_wait_mode()
                     break
                 elif self._last_business_msg_time > 0:
                     first_check_done = True
