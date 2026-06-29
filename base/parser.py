@@ -2021,45 +2021,13 @@ def _merge_fans_club_strings(existing, new_val):
 
 
 def upsert_user(user_id, user_name, grade='', fans_club='', sec_uid='', avatar_url=''):
-    """更新或插入用户信息（财富等级、粉丝团、sec_uid、头像URL等）。线程安全。
-
-    Args:
-        user_id: 抖音用户数字 ID。
-        user_name: 昵称。
-        grade: 消费等级标签。
-        fans_club: 粉丝团标签（同名称保留最高等级）。
-        sec_uid: 抖音永久用户标识（~50位字符串），仅在非空时更新。
-        avatar_url: 用户头像 URL，仅在非空时更新。
-    """
+    """更新或插入用户信息（财富等级、粉丝团、sec_uid、头像URL等）。通过写者队列串行化。"""
     if not user_id:
         return
-    is_anon, anon_label = _detect_anonymous(user_name)
-    with _db_write_lock:
-        conn = _get_conn()
-        if fans_club:
-            existing = conn.execute('SELECT fans_club FROM users WHERE user_id = ?', (user_id,)).fetchone()
-            if existing and existing['fans_club']:
-                fans_club = _merge_fans_club_strings(existing['fans_club'], fans_club)
-        conn.execute('''
-            INSERT INTO users (user_id, user_name, grade, fans_club, sec_uid, avatar_url, is_anonymous, anonymous_label, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime("now", "+8 hours"))
-            ON CONFLICT(user_id) DO UPDATE SET
-                user_name = CASE WHEN ? != '' THEN ? ELSE user_name END,
-                grade = CASE WHEN ? != '' THEN ? ELSE grade END,
-                fans_club = CASE WHEN ? != '' THEN ? ELSE fans_club END,
-                sec_uid = CASE WHEN ? != '' THEN ? ELSE sec_uid END,
-                avatar_url = CASE WHEN ? != '' THEN ? ELSE avatar_url END,
-                is_anonymous = CASE WHEN ? = 1 THEN 1 ELSE is_anonymous END,
-                anonymous_label = CASE WHEN ? != '' THEN ? ELSE anonymous_label END,
-                last_seen = datetime("now", "+8 hours")
-        ''', (user_id, user_name, grade, fans_club, sec_uid, avatar_url, is_anon, anon_label,
-              user_name, user_name,
-              grade, grade,
-          fans_club, fans_club,
-          sec_uid, sec_uid,
-          avatar_url, avatar_url,
-          is_anon, anon_label, anon_label))
-        conn.commit()
+    try:
+        _write_queue.put_nowait(('upsert', user_id, user_name, grade, fans_club, sec_uid, avatar_url))
+    except queue.Full:
+        logger.warning(f"[DB] upsert queue full: uid={user_id}")
 
 def flush_to_sqlite(session_id):
     """从 gift_logs 聚合贡献数据写入 contributions / daily_stats / monthly_stats。"""
@@ -2076,7 +2044,7 @@ def flush_to_sqlite(session_id):
     if not rows:
         return
 
-    with _db_write_lock:
+    with _flush_lock:
         for r in rows:
             uid = r['user_id']
             nick = r['user_name']
@@ -2159,38 +2127,103 @@ def flush_to_sqlite(session_id):
         conn.commit()
 
 
-_write_count = 0
-_WRITE_BATCH_SIZE = 10  # 每 10 次写入批量 commit 一次（降低锁持有时间）
-_db_write_lock = threading.RLock()  # 全局写锁（RLock 支持同一线程重入，避免嵌套加锁死锁）
+# ── 单写者线程队列（所有线程推送写入操作，写者单线程处理，消除多线程锁争抢）──
+_write_queue = queue.Queue(maxsize=20000)
+_WRITER_BATCH_SIZE = 50
+_WRITER_FLUSH_INTERVAL = 0.5
+_flush_lock = threading.Lock()  # 用于 flush_to_sqlite 等直接写操作
 
 
-def _maybe_commit(conn):
-    """批量提交：每 _WRITE_BATCH_SIZE 次写入才 commit，减少事务开销。
-    注意：必须在 _db_write_lock 保护下调用（由 record_chat/record_gift 确保）。
-    """
-    global _write_count
-    _write_count += 1
-    if _write_count >= _WRITE_BATCH_SIZE:
-        _write_count = 0
-        conn.commit()
+def _writer_loop():
+    """后台写者线程：从队列消费写入操作，批量提交。"""
+    conn = _get_conn()
+    buf = []
+    last_flush = time.time()
+    while True:
+        try:
+            item = _write_queue.get(timeout=0.2)
+            if item is None:
+                _flush_write_batch(conn, buf) if buf else None
+                conn.commit()
+                break
+            buf.append(item)
+            now = time.time()
+            if len(buf) >= _WRITER_BATCH_SIZE or now - last_flush > _WRITER_FLUSH_INTERVAL:
+                _flush_write_batch(conn, buf)
+                for _ in buf:
+                    _write_queue.task_done()
+                buf = []
+                last_flush = now
+        except queue.Empty:
+            if buf and time.time() - last_flush > _WRITER_FLUSH_INTERVAL:
+                _flush_write_batch(conn, buf)
+                for _ in buf:
+                    _write_queue.task_done()
+                buf = []
+                last_flush = time.time()
+        except Exception:
+            pass
+
+
+def _flush_write_batch(conn, batch):
+    """执行一批写入操作。"""
+    for item in batch:
+        op = item[0]
+        try:
+            if op == 'chat':
+                _, sid, uid, uname, content, grade, club = item
+                conn.execute('INSERT OR IGNORE INTO chat_logs (session_id, user_id, user_name, content, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?)',
+                             (sid, uid, uname, content, grade, club))
+            elif op == 'gift':
+                _, sid, uid, uname, gname, cnt, dia, grade, club = item
+                conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                             (sid, uid, uname, gname, cnt, dia, grade, club))
+            elif op == 'upsert':
+                _, uid, uname, grade, club, sec, av = item
+                is_anon, anon_label = _detect_anonymous(uname)
+                # 合并粉丝团（保留最高等级）
+                if club:
+                    existing = conn.execute('SELECT fans_club FROM users WHERE user_id = ?', (uid,)).fetchone()
+                    if existing and existing['fans_club']:
+                        club = _merge_fans_club_strings(existing['fans_club'], club)
+                conn.execute('''
+                    INSERT INTO users (user_id, user_name, grade, fans_club, sec_uid, avatar_url, is_anonymous, anonymous_label, last_seen)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime("now", "+8 hours"))
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        user_name = CASE WHEN ? != '' THEN ? ELSE user_name END,
+                        grade = CASE WHEN ? != '' THEN ? ELSE grade END,
+                        fans_club = CASE WHEN ? != '' THEN ? ELSE fans_club END,
+                        sec_uid = CASE WHEN ? != '' THEN ? ELSE sec_uid END,
+                        avatar_url = CASE WHEN ? != '' THEN ? ELSE avatar_url END,
+                        is_anonymous = CASE WHEN ? = 1 THEN 1 ELSE is_anonymous END,
+                        anonymous_label = CASE WHEN ? != '' THEN ? ELSE anonymous_label END,
+                        last_seen = datetime("now", "+8 hours")
+                ''', (uid, uname, grade, club, sec, av, is_anon, anon_label,
+                      uname, uname, grade, grade, club, club, sec, sec, av, av,
+                      is_anon, anon_label, anon_label))
+        except Exception as e:
+            logger.debug(f"[DB] writer batch op failed: {op} {e}")
+    conn.commit()
+
+
+# 启动写者线程（模块导入时自动启动）
+_writer_thread = threading.Thread(target=_writer_loop, daemon=True, name='db-writer')
+_writer_thread.start()
 
 
 def flush_writes():
-    """强制提交所有未写入的数据（由 stats 定时器调用）。"""
-    global _write_count
-    if _write_count > 0:
-        with _db_write_lock:
-            _write_count = 0
-            conn = _get_conn()
-            conn.commit()
+    """等待写者线程处理完当前队列（最多等 2 秒）。"""
+    try:
+        _write_queue.join()
+    except Exception:
+        pass
 
 
 def record_chat(session_id, user_id, user_name, content, grade='', fans_club=''):
-    with _db_write_lock:
-        conn = _get_conn()
-        conn.execute('INSERT OR IGNORE INTO chat_logs (session_id, user_id, user_name, content, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?)',
-                     (session_id, user_id, user_name, content, grade, fans_club))
-        _maybe_commit(conn)
+    try:
+        _write_queue.put_nowait(('chat', session_id, user_id, user_name, content, grade, fans_club))
+    except queue.Full:
+        logger.warning(f"[DB] 写入队列已满，丢弃聊天: uid={user_id}")
 
 
 _gift_dedup_cache = {}  # (user_id, gift_name, diamond_total) → timestamp
@@ -2205,8 +2238,7 @@ def _prune_gift_dedup_cache():
 
 
 def record_gift(session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade='', fans_club=''):
-    """记录礼物（内存时间窗 + UNIQUE 约束双重去重）。"""
-    # 内存去重：相同用户 + 相同礼物 + 相同价值，3 秒窗口内跳过
+    """记录礼物（内存时间窗 + 写者队列双重去重）。"""
     if user_id and gift_name:
         dk = (user_id, gift_name, diamond_total)
         now = time.time()
@@ -2217,24 +2249,10 @@ def record_gift(session_id, user_id, user_name, gift_name, gift_count, diamond_t
         _gift_dedup_cache[dk] = now
         if len(_gift_dedup_cache) > 5000:
             _prune_gift_dedup_cache()
-
-    with _db_write_lock:
-        conn = _get_conn()
-        changes_before = conn.total_changes
-        try:
-            conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                         (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club))
-        except Exception as e:
-            logger.warning(f"[DB] record_gift 8-col insert failed: {e} | sid={session_id} uid={user_id} gift={gift_name}")
-            try:
-                conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total) VALUES (?, ?, ?, ?, ?, ?)',
-                             (session_id, user_id, user_name, gift_name, gift_count, diamond_total))
-            except Exception as e2:
-                logger.error(f"[DB] record_gift 6-col fallback also failed: {e2}")
-        changes_after = conn.total_changes
-        if changes_after == changes_before:
-            logger.debug(f"[DB] record_gift sql-dedup: sid={session_id} uid={user_id} gift={gift_name} x{gift_count} dia={diamond_total}")
-        _maybe_commit(conn)
+    try:
+        _write_queue.put_nowait(('gift', session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club))
+    except queue.Full:
+        logger.warning(f"[DB] 写入队列已满，丢弃礼物: {gift_name} uid={user_id}")
 _VALID_TIERS = {1000, 3000, 10000, 100000}
 
 
