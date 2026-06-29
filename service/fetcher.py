@@ -524,11 +524,15 @@ class DouyinBarrage:
     def room_id(self):
         if self._room_id:
             return self._room_id
-        self._room_info = enter_room_api(
-            self.ttwid, self._ua, self._ua_version,
-            self.live_id, self._http_timeout, session=self.session,
-        )
-        self._room_id = self._room_info['room_id']
+        try:
+            self._room_info = enter_room_api(
+                self.ttwid, self._ua, self._ua_version,
+                self.live_id, self._http_timeout, session=self.session,
+            )
+            self._room_id = self._room_info['room_id']
+        except Exception as e:
+            logger.warning(f"[å¯åŠ¨] HTTP é¢„è¯·æ±‚å¤±è´¥: {e}")
+            self._room_id = None
         set_anchor_name(self.live_id, self.anchor_name)
         status = self._room_info['status']
         status_text = {2: 'ç›´æ’­ä¸­', 4: 'æœªå¼€æ’­'}.get(status, f'æœªçŸ¥({status})')
