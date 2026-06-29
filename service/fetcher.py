@@ -956,7 +956,17 @@ class DouyinBarrage:
                         cur = _get_conn().execute('SELECT status FROM sessions WHERE id = ?', (self._session_id,))
                         row = cur.fetchone()
                         if row and row['status'] == 'ended':
-                            self._session_id = create_session(self.live_id, self.anchor_name)
+                            # æ£€æŸ¥ä¸Šä¸€åœºæ¬¡æ˜¯å¦ä¸ºè™šæµ®åœºæ¬¡ï¼ˆæžå°‘æ•°æ® -> ç›´æ’­å·²ç»“æŸï¼ŒAPI æœªåŠæ—¶æ›´æ–°ï¼‰
+                            cur2 = _get_conn().execute(
+                                'SELECT (SELECT COUNT(*) FROM gift_logs WHERE session_id = ?) as gc, (SELECT COUNT(*) FROM chat_logs WHERE session_id = ?) as cc',
+                                (self._session_id, self._session_id)
+                            )
+                            r2 = cur2.fetchone()
+                            if r2 and r2['gc'] < 5 and r2['cc'] < 10:
+                                logger.info(f"[æŽ§åˆ¶] ä¸Šä¸€åœºæ¬¡ #{self._session_id} ä¸ºè™šæµ®åœºæ¬¡ (ç¤¼ç‰©={r2['gc']} å¼¹å¹•={r2['cc']})ï¼Œè¿›å…¥ç­‰å¾…æ¨¡å¼")
+                                self._enter_wait_mode()
+                            else:
+                                self._session_id = create_session(self.live_id, self.anchor_name)
                     except Exception:
                         pass
 
