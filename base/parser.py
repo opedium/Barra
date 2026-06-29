@@ -2171,28 +2171,24 @@ _db_write_lock = threading.RLock()  # 全局写锁（RLock 支持同一线程重
 
 
 def _maybe_commit(conn):
-    """批量提交：每 _WRITE_BATCH_SIZE 次写入才 commit，减少事务开销。"""
+    """批量提交：每 _WRITE_BATCH_SIZE 次写入才 commit，减少事务开销。
+    注意：必须在 _db_write_lock 保护下调用（由 record_chat/record_gift 确保）。
+    """
     global _write_count
     _write_count += 1
     if _write_count >= _WRITE_BATCH_SIZE:
-        with _db_write_lock:
-            try:
-                conn.commit()
-            finally:
-                _write_count = 0
+        _write_count = 0
+        conn.commit()
 
 
 def flush_writes():
     """强制提交所有未写入的数据（由 stats 定时器调用）。"""
     global _write_count
     if _write_count > 0:
-        try:
+        with _db_write_lock:
+            _write_count = 0
             conn = _get_conn()
-            with _db_write_lock:
-                conn.commit()
-                _write_count = 0
-        except Exception:
-            pass
+            conn.commit()
 
 
 def record_chat(session_id, user_id, user_name, content, grade='', fans_club=''):
