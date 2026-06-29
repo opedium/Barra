@@ -970,8 +970,8 @@ def _extract_subscribe(payload):
                 continue
             if s in known_words:
                 continue
-            # 跳过 protobuf 消息类型名（如 WebcastRoomMessage、Common 等）
-            if re.match(r'^Webcast[A-Z]|[A-Z][a-z]+Message$', s):
+            # 跳过 protobuf 消息类型名（WebcastRoomMessage、Common、Response 等）
+            if re.match(r'^(Webcast|Common|Response|PushFrame|RoomMessage)', s) or s.endswith('Message'):
                 continue
             clean = s.lstrip('"').rstrip('" ').strip()
             if not clean or len(clean) > 50:
