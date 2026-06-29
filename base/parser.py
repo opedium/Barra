@@ -2173,7 +2173,7 @@ def flush_to_sqlite(session_id):
 
 _write_count = 0
 _WRITE_BATCH_SIZE = 10  # 每 10 次写入批量 commit 一次（降低锁持有时间）
-_db_write_lock = threading.Lock()  # 全局写锁，所有线程通过此锁串行化 SQLite 写入
+_db_write_lock = threading.RLock()  # 全局写锁（RLock 支持同一线程重入，避免嵌套加锁死锁）
 
 
 def _maybe_commit(conn):
@@ -2181,8 +2181,11 @@ def _maybe_commit(conn):
     global _write_count
     _write_count += 1
     if _write_count >= _WRITE_BATCH_SIZE:
-        conn.commit()
-        _write_count = 0
+        with _db_write_lock:
+            try:
+                conn.commit()
+            finally:
+                _write_count = 0
 
 
 def flush_writes():
@@ -2191,21 +2194,23 @@ def flush_writes():
     if _write_count > 0:
         try:
             conn = _get_conn()
-            conn.commit()
-            _write_count = 0
+            with _db_write_lock:
+                conn.commit()
+                _write_count = 0
         except Exception:
             pass
 
 
 def record_chat(session_id, user_id, user_name, content, grade='', fans_club=''):
-    conn = _get_conn()
-    conn.execute('INSERT OR IGNORE INTO chat_logs (session_id, user_id, user_name, content, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?)',
-                 (session_id, user_id, user_name, content, grade, fans_club))
-    _maybe_commit(conn)
+    with _db_write_lock:
+        conn = _get_conn()
+        conn.execute('INSERT OR IGNORE INTO chat_logs (session_id, user_id, user_name, content, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?)',
+                     (session_id, user_id, user_name, content, grade, fans_club))
+        _maybe_commit(conn)
 
 
 _gift_dedup_cache = {}  # (user_id, gift_name, diamond_total) → timestamp
-_GIFT_DEDUP_WINDOW = 3.0  # 相同用户相同礼物在 3 秒内视为重复
+_GIFT_DEDUP_WINDOW = 3.0
 
 
 def _prune_gift_dedup_cache():
@@ -2229,23 +2234,23 @@ def record_gift(session_id, user_id, user_name, gift_name, gift_count, diamond_t
         if len(_gift_dedup_cache) > 5000:
             _prune_gift_dedup_cache()
 
-    conn = _get_conn()
-    changes_before = conn.total_changes
-    # 兼容旧表：没有 grade/fans_club 列时静默忽略
-    try:
-        conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                     (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club))
-    except Exception as e:
-        logger.warning(f"[DB] record_gift 8-col insert failed: {e} | sid={session_id} uid={user_id} gift={gift_name}")
+    with _db_write_lock:
+        conn = _get_conn()
+        changes_before = conn.total_changes
         try:
-            conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total) VALUES (?, ?, ?, ?, ?, ?)',
-                         (session_id, user_id, user_name, gift_name, gift_count, diamond_total))
-        except Exception as e2:
-            logger.error(f"[DB] record_gift 6-col fallback also failed: {e2}")
-    changes_after = conn.total_changes
-    if changes_after == changes_before:
-        logger.debug(f"[DB] record_gift sql-dedup: sid={session_id} uid={user_id} gift={gift_name} x{gift_count} dia={diamond_total}")
-    _maybe_commit(conn)
+            conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                         (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club))
+        except Exception as e:
+            logger.warning(f"[DB] record_gift 8-col insert failed: {e} | sid={session_id} uid={user_id} gift={gift_name}")
+            try:
+                conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total) VALUES (?, ?, ?, ?, ?, ?)',
+                             (session_id, user_id, user_name, gift_name, gift_count, diamond_total))
+            except Exception as e2:
+                logger.error(f"[DB] record_gift 6-col fallback also failed: {e2}")
+        changes_after = conn.total_changes
+        if changes_after == changes_before:
+            logger.debug(f"[DB] record_gift sql-dedup: sid={session_id} uid={user_id} gift={gift_name} x{gift_count} dia={diamond_total}")
+        _maybe_commit(conn)
 _VALID_TIERS = {1000, 3000, 10000, 100000}
 
 
