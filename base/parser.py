@@ -1740,7 +1740,12 @@ def _get_conn():
         os.makedirs(DB_DIR, exist_ok=True)
         _local.conn = sqlite3.connect(DB_PATH)
         _local.conn.execute('PRAGMA journal_mode=WAL')
-        _local.conn.execute('PRAGMA busy_timeout=5000')
+        _local.conn.execute('PRAGMA synchronous=NORMAL')
+        _local.conn.execute('PRAGMA busy_timeout=10000')
+        _local.conn.execute('PRAGMA cache_size=-16000')
+        _local.conn.execute('PRAGMA mmap_size=268435456')
+        _local.conn.execute('PRAGMA temp_store=MEMORY')
+        _local.conn.execute('PRAGMA foreign_keys=ON')
         _local.conn.row_factory = sqlite3.Row
         if not _db_schema_inited:
             with _db_schema_lock:
@@ -1878,6 +1883,19 @@ def init_db():
         UPDATE sessions SET end_time = start_time, status = 'ended'
         WHERE status = 'live' AND start_time < datetime('now', '+8 hours', '-12 hours')
     """)
+    # 数据库完整性检查
+    try:
+        integrity = conn.execute('PRAGMA integrity_check').fetchone()[0]
+        if integrity != 'ok':
+            logger.error(f"[DB] 完整性检查失败: {integrity}")
+    except Exception:
+        pass
+    # 开启自动增量 VACUUM，防止文件无限膨胀
+    try:
+        conn.execute('PRAGMA auto_vacuum=INCREMENTAL')
+        conn.execute('PRAGMA incremental_vacuum(0)')
+    except Exception:
+        pass
     conn.commit()
     logger.info(f"[DB] 已初始化: {DB_PATH}")
     return True
