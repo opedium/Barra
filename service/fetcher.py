@@ -1473,25 +1473,16 @@ class DouyinBarrage:
                                             final_uid = sub_uid if re.match(r'^\d+$', str(sub_uid)) else ''
                                             final_name = sub_uname or ('ç”¨æˆ·' + str(sub_douyin_id or sub_uid)[-6:])
 
-                                            # å½“ final_uid æ— æ•ˆæ—¶ï¼Œé€šè¿‡æ‰€æœ‰å¯èƒ½æ ‡è¯†åœ¨ DB ä¸­æŸ¥æ‰¾
+                                            # ç”¨æˆ·åæ˜¯å”¯ä¸€å¯é çš„ç¼–è¯†ï¼Œé¿å…ç”¨ msg_id å½“ user_id æŸ¥
                                             if not final_uid or final_uid == '0':
-                                                db_conditions = []
-                                                db_params = []
-                                                for candidate_id in [sub_uid, sub_douyin_id, uid]:
-                                                    if candidate_id and re.match(r'^\d+$', str(candidate_id)):
-                                                        db_conditions.append('user_id = ?')
-                                                        db_params.append(candidate_id)
                                                 if sub_uname:
-                                                    db_conditions.append('user_name = ?')
-                                                    db_params.append(sub_uname)
-                                                if db_conditions:
                                                     found = _get_conn().execute(
-                                                        f'SELECT user_id FROM users WHERE {" OR ".join(db_conditions)} LIMIT 1',
-                                                        db_params
+                                                        'SELECT user_id FROM users WHERE user_name = ? LIMIT 1',
+                                                        (sub_uname,)
                                                     ).fetchone()
                                                     if found:
                                                         final_uid = found['user_id']
-                                                        logger.debug(f"[è®¢é˜…] é€šè¿‡ DB æŸ¥æ‰¾åˆ°ç”¨æˆ·: {final_uid}")
+                                                        logger.debug(f"[subscribe] found user by name: {final_uid}")
 
                                             if final_uid and final_uid != '0':
                                                 upsert_user(final_uid, final_name, sub_grade, sub_club, sub_sec_uid, sub_avatar)

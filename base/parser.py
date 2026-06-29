@@ -948,10 +948,8 @@ def _extract_subscribe(payload):
                if not any(p in s for p in noise_keywords)
                and s not in ('', '小葵花', '送{0}')]
 
-    # 提取 douyin_id (display_id, 10-12位数字)
+    # 提取 douyin_id（注意：订阅消息中此值为 Common.msg_id，不是用户 ID）
     douyin_id = _extract_douyin_id(payload)
-    # 提取数字 user_id (17-19位, 与 douyin_id 不同)
-    user_id = _extract_douyin_id(payload)
 
     # ── 辅助：从字符串列表中找用户名 ──
     def _find_username(candidates):
@@ -1014,7 +1012,7 @@ def _extract_subscribe(payload):
                     except Exception:
                         pass
             return {'event': '会员', 'action': action, 'type': sub_type,
-                    'user': user, 'douyin_id': douyin_id, 'user_id': user_id}
+                    'user': user, 'douyin_id': douyin_id}
 
     # ── 星守护 ──
     has_star_template = any('星守护' in s for s in all_strings)
@@ -1030,7 +1028,7 @@ def _extract_subscribe(payload):
                     pass
         if user or douyin_id:
             return {'event': '星守护', 'action': '开通', 'type': '月度',
-                    'user': user, 'douyin_id': douyin_id, 'user_id': user_id}
+                    'user': user, 'douyin_id': douyin_id}
 
     return None
 
@@ -1102,21 +1100,13 @@ def parse_room_msg(payload, enable_outputs=None):
         except Exception as e:
             logger.debug(f"[订阅调试] protobuf 解析异常: {e}")
 
-        # protobuf 未提供 user_id 时，使用字节扫描的 user_id
-        if not real_uid:
-            byte_uid = sub_info.get('user_id', '')
-            if byte_uid:
-                real_uid = byte_uid
-                logger.debug(f"[订阅] 使用字节扫描 user_id={byte_uid} (protobuf 未提供)")
-
         results.append({
             'type': 'subscribe',
             'msg': f'[订阅] {user} {action}{sub_type}{event} ({price}钻石)',
             'data': {
                 'time': time.strftime('%H:%M:%S'),
                 'user_name': user,
-                'douyin_id': douyin_id,
-                'user_id': real_uid,
+                'douyin_id': douyin_id,  # 此为 Common.msg_id，仅用于去重，不是用户 ID
                 'sec_uid': real_sec_uid,
                 'avatar_url': real_avatar,
                 'grade': real_grade,
