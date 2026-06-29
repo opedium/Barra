@@ -2120,11 +2120,36 @@ def flush_to_sqlite(session_id):
     conn.commit()
 
 
+_write_count = 0
+_WRITE_BATCH_SIZE = 50  # 每 50 次写入批量 commit 一次
+
+
+def _maybe_commit(conn):
+    """批量提交：每 _WRITE_BATCH_SIZE 次写入才 commit，减少事务开销。"""
+    global _write_count
+    _write_count += 1
+    if _write_count >= _WRITE_BATCH_SIZE:
+        conn.commit()
+        _write_count = 0
+
+
+def flush_writes():
+    """强制提交所有未写入的数据（由 stats 定时器调用）。"""
+    global _write_count
+    if _write_count > 0:
+        try:
+            conn = _get_conn()
+            conn.commit()
+            _write_count = 0
+        except Exception:
+            pass
+
+
 def record_chat(session_id, user_id, user_name, content, grade='', fans_club=''):
     conn = _get_conn()
     conn.execute('INSERT OR IGNORE INTO chat_logs (session_id, user_id, user_name, content, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?)',
                  (session_id, user_id, user_name, content, grade, fans_club))
-    conn.commit()
+    _maybe_commit(conn)
 
 
 _gift_dedup_cache = {}  # (user_id, gift_name, diamond_total) → timestamp
@@ -2168,7 +2193,7 @@ def record_gift(session_id, user_id, user_name, gift_name, gift_count, diamond_t
     changes_after = conn.total_changes
     if changes_after == changes_before:
         logger.debug(f"[DB] record_gift sql-dedup: sid={session_id} uid={user_id} gift={gift_name} x{gift_count} dia={diamond_total}")
-    conn.commit()
+    _maybe_commit(conn)
 _VALID_TIERS = {1000, 3000, 10000, 100000}
 
 

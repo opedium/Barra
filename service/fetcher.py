@@ -46,7 +46,7 @@ from base.utils import (
     rotate_ua, set_current_anchor, set_anchor_name,
 )
 from base.output import setup_logger, ThroughputCounter, BARRAGE, RoomLogFilter, display_width, is_ci_environment
-from base.parser import get_dedup_stats, init_db, create_session, end_session, flush_to_sqlite, record_chat, record_gift, upsert_user, _get_conn, flush_all_buffers, flush_combo_buffer, set_gift_finalize_callback, remove_gift_finalize_callback
+from base.parser import get_dedup_stats, init_db, create_session, end_session, flush_to_sqlite, flush_writes, record_chat, record_gift, upsert_user, _get_conn, flush_all_buffers, flush_combo_buffer, set_gift_finalize_callback, remove_gift_finalize_callback
 from service.network import (
     fetch_ttwid, enter_room_api, download_image,
     fetch_user_info,
@@ -614,7 +614,11 @@ class DouyinBarrage:
         except Exception:
             pass
 
-        # æ¸…ç©ºæ‰€æœ‰ç¼“å†²åŒºï¼ˆåŒ…å«å¾…å®š comboï¼‰
+        # å¼ºåˆ¶ commit å‰©ä½™æ‰¹é‡ + æ¸…ç©ºæ‰€æœ‰ç¼“å†²åŒº
+        try:
+            flush_writes()
+        except Exception:
+            pass
         try:
             flush_all_buffers()
         except Exception:
@@ -1662,7 +1666,8 @@ class DouyinBarrage:
                 if self._frame_total > 0:
                     gap_pct = self._frame_gaps / (self._frame_total + self._frame_gaps) * 100
                     logger.info(f"[å¸§åº] frames={self._frame_total} gaps={self._frame_gaps} loss={gap_pct:.2f}%")
-                # â”€â”€ å¼ºåˆ¶åˆ·æ–° combo ç¼“å†² + è´¡çŒ®å†™å…¥ SQLite â”€â”€
+                # â”€â”€ å¼ºåˆ¶åˆ·æ–° combo ç¼“å†² + è´¡çŒ®å†™å…¥ SQLite + æ‰¹é‡ commit â”€â”€
+                flush_writes()
                 try:
                     flush_combo_buffer()
                 except Exception:
