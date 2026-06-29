@@ -1440,55 +1440,65 @@ class DouyinBarrage:
                                 elif rec_type == 'subscribe' and rec_data.get('diamond'):
                                     # ä¼šå‘˜/æ˜Ÿå®ˆæŠ¤è®¢é˜…ï¼šä¼˜å…ˆç”¨ protobuf User å¯¹è±¡çš„çœŸå®žä¿¡æ¯
                                     sub_name = rec_data.get('event', '') + rec_data.get('sub_type', '')
-                                    sub_douyin_id = rec_data.get('douyin_id', '')
+                                    sub_douyin_id = rec_data.get('douyin_id', '')  # display_id (10-12ä½)
                                     sub_uname = rec_data.get('user_name', '')
-                                    sub_uid = sub_douyin_id or uid
+                                    # sub_uid: ä¼˜å…ˆ protobuf è§£æžçš„ user_idï¼Œå…¶æ¬¡å­—èŠ‚æ‰«æçš„ user_id
+                                    proto_uid = rec_data.get('user_id', '')
+                                    sub_uid = proto_uid if (proto_uid and re.match(r'^\d+$', str(proto_uid))) else (sub_douyin_id or uid)
                                     sub_grade = rec_data.get('grade', '')
                                     sub_club = rec_data.get('fans_club', '')
                                     sub_sec_uid = rec_data.get('sec_uid', '')
                                     sub_avatar = rec_data.get('avatar_url', '')
-                                    # å¦‚æžœ protobuf è§£æžåˆ°äº†çœŸå®ž user_idï¼Œç”¨å®ƒè¦†ç›–å­—èŠ‚æ‰«æçš„ douyin_id
-                                    proto_uid = rec_data.get('user_id', '')
-                                    if proto_uid and re.match(r'^\d+$', str(proto_uid)):
-                                        sub_uid = proto_uid
-                                        if sub_douyin_id != proto_uid:
-                                            logger.debug(f"[è®¢é˜…] protobuf è§£æžåˆ°çœŸå®ž user_id={proto_uid}ï¼Œè¦†ç›–å­—èŠ‚æ‰«æ douyin_id={sub_douyin_id}")
-                                            sub_douyin_id = proto_uid
-                                    # éªŒè¯ç”¨æˆ·åæ˜¯å¦åˆæ³•
-                                    def _is_valid_name(n):
-                                        return n and len(n) >= 2 and any(c.isalpha() or ord(c) > 127 for c in n)
-                                    if not _is_valid_name(sub_uname):
-                                        logger.warning(f"[è®¢é˜…] æ— æ³•è¯†åˆ«è®¢é˜…ç”¨æˆ· (id={sub_douyin_id})ï¼Œè·³è¿‡è®°å½•")
+
+                                    # ç”¨æˆ·åå®½æ¾éªŒè¯ï¼Œæ— æ•ˆæ—¶ç”Ÿæˆå…šåº•åä½†ä¸è·³è¿‡
+                                    if not sub_uname or len(sub_uname.strip()) < 1:
+                                        logger.warning(f"[è®¢é˜…] ç”¨æˆ·åè¯†åˆ«å¤±è´¥ (douyin_id={sub_douyin_id}, uid={sub_uid})ï¼Œä½¿ç”¨å…šåº•å")
                                         sub_uname = ''
-                                    # è®¢é˜…åŽ»é‡ + ä¿å­˜ï¼ˆå¼‚å¸¸ç”¨æˆ·è·³è¿‡ï¼Œå› ä¸ºæ— æ³•å½’å› ï¼‰
-                                    if sub_uname:
+
+                                    # åŽ»é‡ + ä¿å­˜ï¼ˆä»…åœ¨æ²¡æœ‰ä»»ä½•èº«ä»½æ ‡è¯†æ—¶è·³è¿‡ï¼‰
+                                    dedup_key = sub_douyin_id or sub_uid or ''
+                                    if not dedup_key and not sub_uname:
+                                        logger.warning(f"[è®¢é˜…] å®Œå…¨æ— æ³•è¯†åˆ«ç”¨æˆ·ï¼Œè·³è¿‡è®°å½• (douyin_id={sub_douyin_id}, uid={sub_uid})")
+                                    else:
                                         now_ts = time.time()
-                                        sub_key = (str(sub_douyin_id), str(sub_name))
-                                        if sub_key in self._subscribe_dedup and now_ts - self._subscribe_dedup[sub_key] < 120:
-                                            logger.debug(f"[è®¢é˜…] åŽ»é‡è·³è¿‡ {sub_key}")
+                                        sk = (str(dedup_key or sub_uid or 'unknown'), str(sub_name))
+                                        if sk in self._subscribe_dedup and now_ts - self._subscribe_dedup[sk] < 120:
+                                            logger.debug(f"[è®¢é˜…] åŽ»é‡è·³è¿‡ {sk}")
                                         else:
-                                            self._subscribe_dedup[sub_key] = now_ts
+                                            self._subscribe_dedup[sk] = now_ts
                                             stale = [k for k, t in list(self._subscribe_dedup.items()) if now_ts - t > 180]
                                             for k in stale: del self._subscribe_dedup[k]
-                                            final_uid = sub_uid if re.match(r'^\d+$', str(sub_uid)) else sub_douyin_id
-                                            final_name = sub_uname or ('ç”¨æˆ·' + str(sub_douyin_id)[-6:])
+
+                                            # ç¡®å®šæœ€ç»ˆ user_id
+                                            final_uid = sub_uid if re.match(r'^\d+$', str(sub_uid)) else ''
+                                            final_name = sub_uname or ('ç”¨æˆ·' + str(sub_douyin_id or sub_uid)[-6:])
+
+                                            # å½“ final_uid æ— æ•ˆæ—¶ï¼Œé€šè¿‡æ‰€æœ‰å¯èƒ½æ ‡è¯†åœ¨ DB ä¸­æŸ¥æ‰¾
                                             if not final_uid or final_uid == '0':
-                                                # è®¢é˜…æ¶ˆæ¯æœªèƒ½è§£æžå‡ºç”¨æˆ·IDï¼Œå°è¯•é€šè¿‡ douyin_id æˆ–ç”¨æˆ·åæŸ¥æ‰¾
-                                                found = _get_conn().execute(
-                                                    'SELECT user_id FROM users WHERE user_id = ? OR user_name = ? LIMIT 1',
-                                                    (sub_douyin_id, sub_uname)
-                                                ).fetchone()
-                                                if found:
-                                                    final_uid = found['user_id']
+                                                db_conditions = []
+                                                db_params = []
+                                                for candidate_id in [sub_uid, sub_douyin_id, uid]:
+                                                    if candidate_id and re.match(r'^\d+$', str(candidate_id)):
+                                                        db_conditions.append('user_id = ?')
+                                                        db_params.append(candidate_id)
+                                                if sub_uname:
+                                                    db_conditions.append('user_name = ?')
+                                                    db_params.append(sub_uname)
+                                                if db_conditions:
+                                                    found = _get_conn().execute(
+                                                        f'SELECT user_id FROM users WHERE {" OR ".join(db_conditions)} LIMIT 1',
+                                                        db_params
+                                                    ).fetchone()
+                                                    if found:
+                                                        final_uid = found['user_id']
+                                                        logger.debug(f"[è®¢é˜…] é€šè¿‡ DB æŸ¥æ‰¾åˆ°ç”¨æˆ·: {final_uid}")
+
                                             if final_uid and final_uid != '0':
-                                                if sub_sec_uid or sub_avatar:
-                                                    upsert_user(final_uid, final_name, sub_grade, sub_club, sub_sec_uid, sub_avatar)
-                                                elif sub_douyin_id and sub_uname:
-                                                    upsert_user(final_uid, final_name, sub_grade, sub_club, '', '')
-                                                else:
-                                                    upsert_user(final_uid, 'ç”¨æˆ·' + str(sub_douyin_id)[-6:], '', '', '', '')
+                                                upsert_user(final_uid, final_name, sub_grade, sub_club, sub_sec_uid, sub_avatar)
                                                 record_gift(self._session_id, final_uid, final_name, sub_name or 'è®¢é˜…',
                                                     1, rec_data.get('diamond', 0), sub_grade, sub_club)
+                                            else:
+                                                logger.warning(f"[è®¢é˜…] æ— æ³•ç¡®å®šç”¨æˆ·IDï¼Œè·³è¿‡ gift è®°å½• (douyin_id={sub_douyin_id}, proto_uid={proto_uid}, name={sub_uname})")
                             except Exception as e:
                                 logger.error(f"[DB] SQLite write failed in _process_item: {e} | type={rec_type} user={uid}")
 

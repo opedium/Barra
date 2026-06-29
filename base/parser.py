@@ -930,6 +930,71 @@ def _extract_douyin_id(payload):
     return ''
 
 
+def _extract_user_id(payload):
+    """从 protobuf 原始字节中提取数字 user_id（17-19位）。
+
+    订阅类型 payload 中，user_id 与 douyin_id、username 位于同一个
+    User 子消息内。此函数扫描所有 varint，收集 17-19 位的数值
+    （包含 user_id 和可能出现的 room_id），通过 field number 和
+    嵌套深度区分：User 消息中 fn=1 的 varint 即为 user_id。
+
+    Returns:
+        str: 提取到的 user_id，或 ''。
+    """
+    if not payload:
+        return ''
+
+    candidates = []  # (fn, depth, value)
+    stack = [(payload, 0)]
+    while stack:
+        data, depth = stack.pop()
+        if depth > 6:
+            continue
+        j = 0
+        while j < len(data):
+            tag = 0; shift = 0
+            while j < len(data):
+                b = data[j]; j += 1
+                tag |= (b & 0x7f) << shift; shift += 7
+                if not (b & 0x80): break
+            fn = tag >> 3; wt = tag & 0x7
+            if wt == 0:
+                val = 0; shift = 0
+                while j < len(data):
+                    b = data[j]; j += 1
+                    val |= (b & 0x7f) << shift; shift += 7
+                    if not (b & 0x80): break
+                # 17-19 位的大数值，可能是 user_id 或 room_id
+                if val > 10**15:
+                    candidates.append((fn, depth, val))
+            elif wt == 2:
+                length = 0; pos = j; shift = 0
+                while j < len(data):
+                    b = data[j]; j += 1
+                    length |= (b & 0x7f) << shift; shift += 7
+                    if not (b & 0x80): break
+                raw = data[j:j+length] if j + length <= len(data) else b''
+                if raw:
+                    stack.append((raw, depth + 1))
+                j += length
+            elif wt == 5:
+                j += 4
+            else:
+                break
+
+    if not candidates:
+        return ''
+
+    # 优先选择 fn=1 的候选值（User.id 的 field number 为 1）
+    for fn, depth, val in candidates:
+        if fn == 1:
+            return str(val)
+
+    # 回退：选择最小的候选值（user_id 通常比 room_id 数值小）
+    vals = sorted(v for _, _, v in candidates)
+    return str(vals[0])
+
+
 def _extract_subscribe(payload):
     """从 RoomMessage 原始 payload 提取会员/星守护订阅信息。
     返回 dict 或 None。"""
@@ -946,8 +1011,10 @@ def _extract_subscribe(payload):
                if not any(p in s for p in noise_keywords)
                and s not in ('', '小葵花', '送{0}')]
 
-    # 提取 douyin_id
+    # 提取 douyin_id (display_id, 10-12位数字)
     douyin_id = _extract_douyin_id(payload)
+    # 提取数字 user_id (17-19位, 与 douyin_id 不同)
+    user_id = _extract_user_id(payload)
 
     # ── 辅助：从字符串列表中找用户名 ──
     def _find_username(candidates):
@@ -1010,7 +1077,7 @@ def _extract_subscribe(payload):
                     except Exception:
                         pass
             return {'event': '会员', 'action': action, 'type': sub_type,
-                    'user': user, 'douyin_id': douyin_id}
+                    'user': user, 'douyin_id': douyin_id, 'user_id': user_id}
 
     # ── 星守护 ──
     has_star_template = any('星守护' in s for s in all_strings)
@@ -1026,7 +1093,7 @@ def _extract_subscribe(payload):
                     pass
         if user or douyin_id:
             return {'event': '星守护', 'action': '开通', 'type': '月度',
-                    'user': user, 'douyin_id': douyin_id}
+                    'user': user, 'douyin_id': douyin_id, 'user_id': user_id}
 
     return None
 
@@ -1084,7 +1151,7 @@ def parse_room_msg(payload, enable_outputs=None):
                 uid = get_user_id(u)
                 if uid:
                     real_uid = uid
-                    douyin_id = real_uid
+                    # 保持 douyin_id 为字节扫描的 display_id，不覆盖为 user_id
                     user = get_user_name(u) or user
                     real_sec_uid = get_user_sec_uid(u)
                     real_avatar = get_user_avatar_url(u)
@@ -1097,6 +1164,13 @@ def parse_room_msg(payload, enable_outputs=None):
                            f"has_common={has_common} has_user={has_user}")
         except Exception as e:
             logger.debug(f"[订阅调试] protobuf 解析异常: {e}")
+
+        # protobuf 未提供 user_id 时，使用字节扫描的 user_id
+        if not real_uid:
+            byte_uid = sub_info.get('user_id', '')
+            if byte_uid:
+                real_uid = byte_uid
+                logger.debug(f"[订阅] 使用字节扫描 user_id={byte_uid} (protobuf 未提供)")
 
         results.append({
             'type': 'subscribe',
