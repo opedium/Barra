@@ -1016,7 +1016,7 @@ class DouyinBarrage:
 
                 # â”€â”€ è¿žæŽ¥ WebSocket â”€â”€
                 connect_kwargs = {
-                    'extra_headers': additional_headers,
+                    'additional_headers': additional_headers,
                     'ping_interval': 30,
                     'ping_timeout': 10,
                     'max_size': 2 ** 23,
