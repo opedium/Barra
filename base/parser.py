@@ -1966,6 +1966,9 @@ def _detect_anonymous(user_name):
     # dou + 纯数字（如 dou9495919），系统生成的设备 ID 类匿名名
     if re.match(r'dou\d+$', user_name, re.IGNORECASE):
         return True, user_name
+    # 损坏的用户名：以 2@ 开头或含有控制字符（protobuf 解析污染）
+    if user_name.startswith('2@') or any(ord(c) < 32 for c in user_name):
+        return True, user_name
     return False, ''
 
 
@@ -2706,7 +2709,7 @@ def query_chat(user_id='', keyword='', page=1, size=50):
 def query_anonymous(page=1, size=50, search=''):
     conn = _get_conn()
     offset = (page - 1) * size
-    where = "u.is_anonymous = 1 AND COALESCE(u.anonymous_label, '') != 'fake'"
+    where = "COALESCE(u.anonymous_label, '') != '' AND COALESCE(u.anonymous_label, '') != 'fake'"
     params = []
     if search:
         where += ' AND (u.user_name LIKE ? OR u.user_id LIKE ?)'

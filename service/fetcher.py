@@ -201,6 +201,7 @@ class DouyinBarrage:
         self._output_dir = None
         # â”€â”€ åŒ¿åç”¨æˆ·è§£æžè·Ÿè¸ªï¼ˆé¿å…é‡å¤ API è°ƒç”¨ï¼‰â”€â”€
         self._resolving_anon = set()
+        self._last_anon_resolve = 0
         self._subscribe_dedup = {}  # sub_key -> timestampï¼Œè®¢é˜…æ¶ˆæ¯ 30s çª—å£åŽ»é‡
 
         # â”€â”€ ç»Ÿè®¡å®šæ—¶æ‰“å° â”€â”€
@@ -1380,7 +1381,7 @@ class DouyinBarrage:
                                                     conn = _get_conn()
                                                     for muid in ({resolved_uid, uid} if resolved_uid and resolved_uid != uid else {uid}):
                                                         conn.execute(
-                                                            'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0, anonymous_label = "" WHERE user_id = ?',
+                                                            'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0 WHERE user_id = ?',
                                                             (resolved, resolved_sec, resolved_sec, resolved_avatar, resolved_avatar, muid)
                                                         )
                                                     conn.commit()
@@ -1666,6 +1667,10 @@ class DouyinBarrage:
                 if self._frame_total > 0:
                     gap_pct = self._frame_gaps / (self._frame_total + self._frame_gaps) * 100
                     logger.info(f"[å¸§åº] frames={self._frame_total} gaps={self._frame_gaps} loss={gap_pct:.2f}%")
+                # â”€â”€ æ¯ 5 åˆ†é’Ÿè§¦å‘ä¸€æ¬¡åŒ¿åè§£æžï¼ˆæ–°å¢žåŒ¿åç”¨æˆ·ä¼šè¢«è¡¥è§£æžï¼‰â”€â”€
+                self._stats_count = getattr(self, '_stats_count', 0) + 1
+                if self._stats_count % 10 == 0:
+                    self._batch_resolve_anonymous()
                 # â”€â”€ å¼ºåˆ¶åˆ·æ–° combo ç¼“å†² + è´¡çŒ®å†™å…¥ SQLite + æ‰¹é‡ commit â”€â”€
                 flush_writes()
                 try:
@@ -1750,12 +1755,12 @@ class DouyinBarrage:
                             sec = info.get('sec_uid', '')
                             avatar = info.get('avatar_url', '')
                             conn.execute(
-                                'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0, anonymous_label = "" WHERE user_id = ?',
+                                'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0 WHERE user_id = ?',
                                 (nick, sec, sec, avatar, avatar, uid)
                             )
                             if rid and rid != uid:
                                 conn.execute(
-                                    'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0, anonymous_label = "" WHERE user_id = ?',
+                                    'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0 WHERE user_id = ?',
                                     (nick, sec, sec, avatar, avatar, rid)
                                 )
                             conn.commit()

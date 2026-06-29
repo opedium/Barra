@@ -1186,12 +1186,12 @@ def api_anonymous_resolve():
                     sec = info.get('sec_uid', '')
                     avatar = info.get('avatar_url', '')
                     conn.execute(
-                        'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0, anonymous_label = "" WHERE user_id = ?',
+                        'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0 WHERE user_id = ?',
                         (nick, sec, sec, avatar, avatar, uid)
                     )
                     if resolved_id and resolved_id != uid:
                         conn.execute(
-                            'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0, anonymous_label = "" WHERE user_id = ?',
+                            'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0 WHERE user_id = ?',
                             (nick, sec, sec, avatar, avatar, resolved_id)
                         )
                     conn.commit()
