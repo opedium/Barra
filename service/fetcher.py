@@ -1560,7 +1560,12 @@ class DouyinBarrage:
                     payload_type='ack',
                     payload=response.internal_ext.encode('utf-8'),
                 )._pb.SerializeToString()
-                asyncio.create_task(self._ws.send(ack))
+                async def _safe_ack():
+                    try:
+                        await self._ws.send(ack)
+                    except Exception:
+                        pass
+                asyncio.create_task(_safe_ack())
             except Exception as e:
                 pass
 
