@@ -309,7 +309,7 @@
 <!-- Cookie Management -->
 <div class="card" id="cookie-manager-card">
     <div class="table-header">
-        <h2>&#128273; Cookie 管理</h2>
+        <h2>🔑 Cookie 管理</h2>
     </div>
     <div id="cookie-status-area">
         <div class="cookie-status-row">
@@ -319,21 +319,124 @@
         <div class="cookie-meta" id="cookie-meta-text"></div>
     </div>
 
-    <!-- Manual Input Panel (仅保留此面板) -->
-    <div class="cookie-panel active" id="cookie-panel-manual">
-        <textarea class="cookie-textarea" id="cookie-input"
-            placeholder="从浏览器导出 Cookie 粘贴到此处&#10;支持格式：name1=value1; name2=value2 或 Netscape cookie jar"></textarea>
-        <div class="cookie-hint">
-            打开浏览器 → F12 开发者工具 → Application → Cookies → douyin.com → 复制所有 cookie 的 name=value 对，用分号分隔
+    <p class="text-muted text-sm" style="margin-top:12px;">
+        多个抖音号分散使用，避免单 cookie 被限流。系统自动轮询分配。
+    </p>
+    <div id="multi-cookie-list" style="margin-bottom:12px;">
+        <div class="text-muted" style="padding:8px 0;">加载中...</div>
+    </div>
+
+    <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);font-size:13px;">
+        <div style="font-weight:600;margin-bottom:8px;">➕ 添加 / 编辑 Cookie</div>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+            <span style="font-size:12px;color:var(--text-muted);white-space:nowrap;">文件名:</span>
+            <input id="new-cookie-filename" type="text" value="cookie2.txt"
+                style="width:140px;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--font-mono);">
         </div>
-        <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
-            <button class="btn-cookie" id="btn-manual-save" onclick="manualSaveCookie()">验证并保存</button>
-            <span id="manual-result" style="font-size:12px;"></span>
+        <textarea id="new-cookie-content" class="cookie-textarea"
+            placeholder="从浏览器导出 Cookie 粘贴到此处
+支持格式：name1=value1; name2=value2 或 Netscape cookie jar"></textarea>
+        <div class="cookie-hint">
+            打开浏览器 → F12 开发者工具 → Application → Cookies → douyin.com → 复制所有 cookie 的 name=value 对
+        </div>
+        <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
+            <button class="btn-cookie" onclick="saveMultiCookie()">验证并保存</button>
+            <span id="multi-cookie-result" style="font-size:12px;"></span>
         </div>
     </div>
 </div>
-
 <script>
+function loadMultiCookies() {
+    fetch('/api/cookies/list')
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            var el = document.getElementById('multi-cookie-list');
+            if (!d.cookies || d.cookies.length === 0) {
+                el.innerHTML = '<div class="text-muted" style="padding:8px 0;">暂无 cookie 文件，请先在上方添加</div>';
+                return;
+            }
+            var html = '<table style="width:100%;font-size:13px;"><thead><tr>' +
+                '<th style="text-align:left;padding:6px 8px;">文件名</th>' +
+                '<th style="text-align:left;padding:6px 8px;">状态</th>' +
+                '<th style="text-align:left;padding:6px 8px;">条目</th>' +
+                '<th style="text-align:left;padding:6px 8px;">过期</th>' +
+                '<th style="text-align:left;padding:6px 8px;">操作</th></tr></thead><tbody>';
+            d.cookies.forEach(function(c) {
+                var isActive = c.file === d.active_file;
+                var dotCls = c.has_session ? 'green' : 'gray';
+                var statusHtml = '<span class="cookie-status-dot ' + dotCls + '" style="display:inline-block;vertical-align:middle;"></span>' +
+                    ' <span style="vertical-align:middle;">' + (c.has_session ? '已登录' : '游客') + '</span>' +
+                    (c.nickname ? '<br><small style="color:var(--text-muted);font-size:11px;margin-left:14px;">' + c.nickname + '</small>' : '');
+                var delBtn = c.file === 'cookie.txt' ? '' : '<button class="btn-sm btn-del" onclick="deleteCookie(\'' + c.file + '\')">删除</button>';
+                html += '<tr>' +
+                    '<td style="padding:6px 8px;">' + (isActive ? '<strong>' : '') + c.file + (isActive ? ' &#11088;</strong>' : '') + '</td>' +
+                    '<td style="padding:6px 8px;">' + statusHtml + '</td>' +
+                    '<td style="padding:6px 8px;">' + c.items + ' 项</td>' +
+                    '<td style="padding:6px 8px;font-size:12px;">' + (c.expire || '-') + '</td>' +
+                    '<td style="padding:6px 8px;">' + delBtn + '</td>' +
+                    '</tr>';
+            });
+            html += '</tbody></table>';
+            el.innerHTML = html;
+        })
+        .catch(function() {
+            document.getElementById('multi-cookie-list').innerHTML = '<div class="text-muted" style="padding:8px 0;color:var(--danger);">加载失败</div>';
+        });
+}
+
+function saveMultiCookie() {
+    var filename = document.getElementById('new-cookie-filename').value.trim();
+    var content = document.getElementById('new-cookie-content').value.trim();
+    var result = document.getElementById('multi-cookie-result');
+    if (!content) { result.textContent = '内容不能为空'; result.style.color = 'var(--danger)'; return; }
+    if (!filename) { result.textContent = '文件名不能为空'; result.style.color = 'var(--danger)'; return; }
+    fetch('/api/cookies/save', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({filename: filename, content: content})
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+        result.textContent = d.message;
+        result.style.color = d.success ? 'var(--success)' : 'var(--danger)';
+        if (d.success) {
+            document.getElementById('new-cookie-content').value = '';
+            // Auto-increment filename
+            var curName = document.getElementById('new-cookie-filename').value;
+            var match = curName.match(/cookie(\d*)\.txt$/);
+            if (match) {
+                var n = parseInt(match[1] || '1') || 1;
+                document.getElementById('new-cookie-filename').value = 'cookie' + (n + 1) + '.txt';
+            } else {
+                document.getElementById('new-cookie-filename').value = 'cookie2.txt';
+            }
+            loadMultiCookies();
+        }
+    })
+    .catch(function(err) {
+        result.textContent = '请求失败: ' + err.message;
+        result.style.color = 'var(--danger)';
+    });
+}
+
+function deleteCookie(filename) {
+    if (!confirm('确定删除 ' + filename + ' 吗？')) return;
+    fetch('/api/cookies/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({filename: filename})
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+        if (d.success) { loadMultiCookies(); }
+        else { alert(d.message); }
+    })
+    .catch(function(err) { alert('删除失败: ' + err.message); });
+}
+
+// 在现有 refreshCookieStatus 之后也加载多 cookie
+setTimeout(loadMultiCookies, 500);
+
 /* ── Streamer Monitor ── */
 var STREAMER_POLL_MS = 5000;
 var _streamerTimer = null;
@@ -360,6 +463,9 @@ function buildStreamerRow(s) {
     var disabled = '';
     var name = s.anchor_name || s.live_id;
     var subtitle = s.room_id ? '房间 ' + s.room_id : '';
+    if (s.cookie_file) {
+        subtitle += (subtitle ? ' · ' : '') + '🍪' + s.cookie_file;
+    }
     if (s.status === 'collecting' && s.message_count > 0) {
         subtitle += (subtitle ? ' · ' : '') + s.message_count.toLocaleString() + ' 条消息';
     }

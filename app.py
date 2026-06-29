@@ -174,6 +174,8 @@ class StreamerManager:
     def __init__(self):
         self._instances = {}   # live_id → DouyinBarrage
         self._lock = threading.Lock()
+        self._cookie_index = 0
+        self._cookie_assignments = {}  # live_id → cookie_filename
 
     # ── helpers ──────────────────────────────────────────────
 
@@ -249,8 +251,23 @@ class StreamerManager:
                 c.commit()
 
         try:
+            # 多 cookie 轮询分配，绕过单 cookie 限流
+            import os
+            _base = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookie.txt')
+            _cookie_file = _base
+            if os.path.exists(_base):
+                _cookies_avail = [_base]
+                for _i in range(2, 100):
+                    _cf = _base.replace('.txt', str(_i) + '.txt')
+                    if os.path.exists(_cf):
+                        _cookies_avail.append(_cf)
+                _cookie_file = _cookies_avail[self._cookie_index]
+                self._cookie_index = (self._cookie_index + 1) % len(_cookies_avail)
+            with self._lock:
+                self._cookie_assignments[live_id] = os.path.basename(_cookie_file)
             instance = DouyinBarrage(
-                live_id, multi_room=True, on_room_info=_on_room_info)
+                live_id, multi_room=True, on_room_info=_on_room_info,
+                cookie_file=_cookie_file)
             instance.config['live_stop'] = False   # wait for re-broadcast
 
             thread = threading.Thread(
@@ -324,6 +341,7 @@ class StreamerManager:
                     'room_id': info.get('room_id', ''),
                     'uptime_seconds': info.get('uptime_seconds', 0),
                     'last_error': info.get('last_error', ''),
+                    'cookie_file': self._cookie_assignments.get(live_id, ''),
                 }
             else:
                 entry = {
@@ -337,6 +355,7 @@ class StreamerManager:
                     'room_id': '',
                     'uptime_seconds': 0,
                     'last_error': '',
+                    'cookie_file': '',
                 }
 
             result.append(entry)
@@ -1389,6 +1408,79 @@ def api_cookie_login_manual():
     cookie_string = data.get('cookie_string', '').strip()
     ok, message, details = _cookie_manager.manual_save(cookie_string)
     return jsonify({'success': ok, 'message': message, 'details': details})
+
+
+@app.route('/api/cookies/list')
+def api_cookies_list():
+    """列出所有可用的 cookie 文件，含登录态、昵称、过期时间"""
+    import os
+    basedir = os.path.dirname(os.path.abspath(__file__))
+    cookies = []
+    from base.utils import load_cookies
+    for f in sorted(os.listdir(basedir)):
+        if f.startswith('cookie') and f.endswith('.txt'):
+            fp = os.path.join(basedir, f)
+            size = os.path.getsize(fp)
+            content = open(fp, 'r', encoding='utf-8').read().strip()
+            if ';' in content and '\t' not in content:
+                item_count = len([p for p in content.split(';') if '=' in p])
+            else:
+                item_count = len([l for l in content.splitlines() if l.strip() and not l.startswith('#') and '\t' in l])
+            # 检查登录态、过期
+            ck = load_cookies(fp)
+            has_session = bool(ck.get('sessionid') or ck.get('sessionid_ss'))
+            expire = _cookie_manager._extract_expiry(ck) if hasattr(_cookie_manager, '_extract_expiry') else ''
+            # 获取账号昵称
+            try:
+                nick = _cookie_manager._fetch_nickname(ck) or ''
+            except Exception:
+                nick = ''
+            cookies.append({
+                'file': f, 'size': size, 'items': item_count,
+                'status': 'active' if has_session else 'guest',
+                'has_session': has_session,
+                'expire': expire or '',
+                'nickname': nick,
+            })
+    return jsonify({'cookies': cookies, 'active_file': 'cookie.txt'})
+
+
+@app.route('/api/cookies/save', methods=['POST'])
+def api_cookies_save():
+    """保存 cookie 到指定文件"""
+    import os
+    data = request.get_json(force=True, silent=True) or {}
+    filename = data.get('filename', 'cookie.txt')
+    content = data.get('content', '').strip()
+    basedir = os.path.dirname(os.path.abspath(__file__))
+    # Validate filename
+    if not filename.startswith('cookie') or not filename.endswith('.txt'):
+        return jsonify({'success': False, 'message': '文件名必须以 cookie 开头、.txt 结尾'})
+    # Validate content
+    if not content:
+        return jsonify({'success': False, 'message': '内容不能为空'})
+    filepath = os.path.join(basedir, filename)
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(content + '\n')
+    return jsonify({'success': True, 'message': f'{filename} 已保存（{len(content)} 字节）'})
+
+
+@app.route('/api/cookies/delete', methods=['POST'])
+def api_cookies_delete():
+    """删除 cookie 文件"""
+    import os
+    data = request.get_json(force=True, silent=True) or {}
+    filename = data.get('filename', '')
+    if not filename.startswith('cookie') or not filename.endswith('.txt'):
+        return jsonify({'success': False, 'message': '无效文件名'})
+    if filename == 'cookie.txt':
+        return jsonify({'success': False, 'message': '不能删除默认 cookie.txt'})
+    basedir = os.path.dirname(os.path.abspath(__file__))
+    fp = os.path.join(basedir, filename)
+    if os.path.exists(fp):
+        os.remove(fp)
+        return jsonify({'success': True, 'message': f'{filename} 已删除'})
+    return jsonify({'success': False, 'message': '文件不存在'})
 
 
 # ── CSV Export ──

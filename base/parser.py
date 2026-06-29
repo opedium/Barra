@@ -56,7 +56,6 @@ def set_sse_callback(cb):
 
 _gift_dedup = {}        # (group_id, gift_id, user_id) -> (last_repeat_count, last_update_time, combo_ended)
 _rc1_dedup = {}         # (gift_id, user_id) -> last_accept_time (rc=1 500ms 短窗口去重)
-_gift_total_tracker = {}  # (user_id, gift_id) -> total_count（绝对累计值，跨 combo 去重）
 _dedup_lock = threading.Lock()
 
 # ── trace_id 影子去重 (shadow mode) ────────────────
@@ -472,24 +471,8 @@ def parse_gift_msg(payload, enable_outputs=None):
     is_combo = combo_cnt > 0
     now = time.time()
 
-    # ── 全局 total_count 去重（跨连击拆分，不跨场次）──
-    total_cnt = msg.total_count or 0
-    if total_cnt > 0 and uid and gft_id:
-        tk = (str(uid), str(gft_id))
-        last_total = _gift_total_tracker.get(tk, 0)
-        if total_cnt <= last_total:
-            if total_cnt < last_total:
-                _gift_total_tracker[tk] = total_cnt  # 新场次，重置
-                rc = total_cnt
-            else:
-                _dedup_diag['rejected'] += 1
-                return []  # 重复
-        else:
-            rc = total_cnt - last_total
-            _gift_total_tracker[tk] = total_cnt
-        if len(_gift_total_tracker) > 10000:
-            _gift_total_tracker.clear()
-    elif combo_cnt > 0:
+    # ── 计算有效计数（combo_count 优先，repeat_count 回退）──
+    if combo_cnt > 0:
         rc = combo_cnt
     else:
         rc = msg.repeat_count or 1
