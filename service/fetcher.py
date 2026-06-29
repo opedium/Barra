@@ -1422,7 +1422,7 @@ class DouyinBarrage:
                                                 new_lv = int(m.group(1))
                                                 if new_lv >= 40:
                                                     old_lv = _old_lv_saved
-                                                    if new_lv > old_lv:
+                                                    if old_lv > 0 and new_lv > old_lv:
                                                         record_upgrade(self._session_id, uid, uname, 'grade', old_lv, new_lv, self.anchor_name)
                                                         logger.info(f"[å‡çº§] è´¢å¯Œç­‰çº§ {uname}[{uid}]: {old_lv} â†’ {new_lv}")
                                         # ç²‰ä¸å›¢ç¯ç‰Œå‡çº§æ£€æµ‹ï¼ˆ>= 15 çº§ï¼‰
@@ -1432,7 +1432,7 @@ class DouyinBarrage:
                                                 new_fc = int(m.group(1))
                                                 if new_fc >= 15:
                                                     old_fc = _old_fc_saved
-                                                    if new_fc > old_fc:
+                                                    if old_fc > 0 and new_fc > old_fc:
                                                         record_upgrade(self._session_id, uid, uname, 'fansclub', old_fc, new_fc, self.anchor_name)
                                                         logger.info(f"[å‡çº§] ç²‰ä¸å›¢ {uname}[{uid}]: Lv{old_fc} â†’ Lv{new_fc}")
                                     except Exception as _upgrade_err:
