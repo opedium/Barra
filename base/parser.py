@@ -309,7 +309,7 @@ def _prune_dedup_state(max_age=600):
 # 这消除了 delta_zero / out_of_order / combo_block 等误杀。
 _gift_combo_buffer = {}
 _gift_combo_lock = threading.Lock()
-_gift_combo_timeout = 5.0
+_gift_combo_timeout = 30.0
 _gift_finalize_callbacks = {}  # anchor_name → callable
 
 def set_gift_finalize_callback(anchor_name, cb):
@@ -2178,6 +2178,9 @@ def _flush_write_batch(conn, batch):
                              (sid, uid, uname, content, grade, club))
             elif op == 'gift':
                 _, sid, uid, uname, gname, cnt, dia, grade, club = item
+                # 同用户同礼物更高连击数时，覆盖之前的低 count 记录（防超长连击拆分）
+                conn.execute('DELETE FROM gift_logs WHERE session_id = ? AND user_id = ? AND gift_name = ? AND diamond_total = ? AND gift_count < ?',
+                             (sid, uid, gname, dia, cnt))
                 conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                              (sid, uid, uname, gname, cnt, dia, grade, club))
             elif op == 'upsert':
