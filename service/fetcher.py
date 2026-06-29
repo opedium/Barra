@@ -236,7 +236,7 @@ class DouyinBarrage:
         self._executor = ThreadPoolExecutor(max_workers=2)
 
         # â”€â”€ æ¶ˆæ¯å¤„ç†é˜Ÿåˆ—ï¼ˆæ”¶/ç®—åˆ†ç¦»ï¼Œé˜²é«˜å³°æ‹¥å¡žï¼‰â”€â”€
-        self._msg_queue = queue.Queue(maxsize=5000)
+        self._msg_queue = queue.Queue(maxsize=20000)
         self._process_thread = None
         self._pending_signal = None  # å¤„ç†çº¿ç¨‹æ£€æµ‹åˆ°çš„æŽ§åˆ¶ä¿¡å·
 
@@ -1118,6 +1118,9 @@ class DouyinBarrage:
                         gc.enable()
 
                 # æ­£å¸¸é€€å‡ºï¼ˆws context manager å·²å…³é—­è¿žæŽ¥ï¼‰
+                # é‡è¿žå‰åˆ·æ–° combo ç¼“å†²ï¼Œé¿å… PK/é«˜å³°æœŸé‡è¿žå¤±åŽ»æœªå®Œæˆçš„è¿žå‡»ç¤¼ç‰©
+                flush_combo_buffer()
+                flush_writes()
                 self._connected_event.clear()
 
             except asyncio.CancelledError:
