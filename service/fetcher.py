@@ -1606,7 +1606,7 @@ class DouyinBarrage:
         check_interval = max(min(self._silence_timeout // 3, 10), 3)
         first_check_done = False
         first_check_timeout = check_interval + 10   # å¿…é¡» > check_intervalï¼Œå¦åˆ™é¦–æ¬¡æ£€æŸ¥å¿…è§¦å‘
-        normal_check_timeout = 30.0
+        normal_check_timeout = 180.0
 
         while not self._stop_event.is_set():
             await asyncio.sleep(check_interval)
