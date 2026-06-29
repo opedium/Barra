@@ -1472,14 +1472,23 @@ class DouyinBarrage:
                                             for k in stale: del self._subscribe_dedup[k]
                                             final_uid = sub_uid if re.match(r'^\d+$', str(sub_uid)) else sub_douyin_id
                                             final_name = sub_uname or ('ç”¨æˆ·' + str(sub_douyin_id)[-6:])
-                                            if sub_sec_uid or sub_avatar:
-                                                upsert_user(final_uid, final_name, sub_grade, sub_club, sub_sec_uid, sub_avatar)
-                                            elif sub_douyin_id and sub_uname:
-                                                upsert_user(final_uid, final_name, sub_grade, sub_club, '', '')
-                                            else:
-                                                upsert_user(final_uid, 'ç”¨æˆ·' + str(sub_douyin_id)[-6:], '', '', '', '')
-                                            record_gift(self._session_id, final_uid, final_name, sub_name or 'è®¢é˜…',
-                                                1, rec_data.get('diamond', 0), sub_grade, sub_club)
+                                            if not final_uid or final_uid == '0':
+                                                # è®¢é˜…æ¶ˆæ¯æœªèƒ½è§£æžå‡ºç”¨æˆ·IDï¼Œå°è¯•é€šè¿‡ douyin_id æˆ–ç”¨æˆ·åæŸ¥æ‰¾
+                                                found = _get_conn().execute(
+                                                    'SELECT user_id FROM users WHERE user_id = ? OR user_name = ? LIMIT 1',
+                                                    (sub_douyin_id, sub_uname)
+                                                ).fetchone()
+                                                if found:
+                                                    final_uid = found['user_id']
+                                            if final_uid and final_uid != '0':
+                                                if sub_sec_uid or sub_avatar:
+                                                    upsert_user(final_uid, final_name, sub_grade, sub_club, sub_sec_uid, sub_avatar)
+                                                elif sub_douyin_id and sub_uname:
+                                                    upsert_user(final_uid, final_name, sub_grade, sub_club, '', '')
+                                                else:
+                                                    upsert_user(final_uid, 'ç”¨æˆ·' + str(sub_douyin_id)[-6:], '', '', '', '')
+                                                record_gift(self._session_id, final_uid, final_name, sub_name or 'è®¢é˜…',
+                                                    1, rec_data.get('diamond', 0), sub_grade, sub_club)
                             except Exception as e:
                                 logger.error(f"[DB] SQLite write failed in _process_item: {e} | type={rec_type} user={uid}")
 
