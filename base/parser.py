@@ -2127,8 +2127,31 @@ def record_chat(session_id, user_id, user_name, content, grade='', fans_club='')
     conn.commit()
 
 
+_gift_dedup_cache = {}  # (user_id, gift_name, diamond_total) → timestamp
+_GIFT_DEDUP_WINDOW = 3.0  # 相同用户相同礼物在 3 秒内视为重复
+
+
+def _prune_gift_dedup_cache():
+    now = time.time()
+    stale = [k for k, ts in list(_gift_dedup_cache.items()) if now - ts > _GIFT_DEDUP_WINDOW * 2]
+    for k in stale:
+        _gift_dedup_cache.pop(k, None)
+
+
 def record_gift(session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade='', fans_club=''):
-    """记录礼物（UNIQUE 约束防重复，parser.py 的 delta 去重配合使用）。"""
+    """记录礼物（内存时间窗 + UNIQUE 约束双重去重）。"""
+    # 内存去重：相同用户 + 相同礼物 + 相同价值，3 秒窗口内跳过
+    if user_id and gift_name:
+        dk = (user_id, gift_name, diamond_total)
+        now = time.time()
+        last_ts = _gift_dedup_cache.get(dk)
+        if last_ts and now - last_ts < _GIFT_DEDUP_WINDOW:
+            logger.debug(f"[DB] record_gift mem-dedup: sid={session_id} uid={user_id} gift={gift_name} x{gift_count} dia={diamond_total}")
+            return
+        _gift_dedup_cache[dk] = now
+        if len(_gift_dedup_cache) > 5000:
+            _prune_gift_dedup_cache()
+
     conn = _get_conn()
     changes_before = conn.total_changes
     # 兼容旧表：没有 grade/fans_club 列时静默忽略
@@ -2144,7 +2167,7 @@ def record_gift(session_id, user_id, user_name, gift_name, gift_count, diamond_t
             logger.error(f"[DB] record_gift 6-col fallback also failed: {e2}")
     changes_after = conn.total_changes
     if changes_after == changes_before:
-        logger.debug(f"[DB] record_gift dedup: sid={session_id} uid={user_id} gift={gift_name} x{gift_count} dia={diamond_total}")
+        logger.debug(f"[DB] record_gift sql-dedup: sid={session_id} uid={user_id} gift={gift_name} x{gift_count} dia={diamond_total}")
     conn.commit()
 _VALID_TIERS = {1000, 3000, 10000, 100000}
 
