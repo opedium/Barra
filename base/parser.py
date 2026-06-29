@@ -465,13 +465,29 @@ def parse_gift_msg(payload, enable_outputs=None):
 
     # ── 提取关键字段 ──
     combo_cnt = msg.combo_count or 0
-    rc = combo_cnt if combo_cnt > 0 else (msg.repeat_count or 0)
     gid = str(msg.group_id) if msg.group_id else '0'
     log_id = msg.log_id or ''
     trace_id = msg.trace_id or ''
     send_time = msg.send_time or 0
     is_combo = combo_cnt > 0
     now = time.time()
+
+    # ── 全局 total_count 去重（唯一可靠的去重手段，永不回退）──
+    total_cnt = msg.total_count or 0
+    if total_cnt > 0 and uid and gft_id:
+        tk = (str(uid), str(gft_id))
+        last_total = _gift_total_tracker.get(tk, 0)
+        if total_cnt <= last_total:
+            _dedup_diag['rejected'] += 1
+            return []  # 已处理，跳过
+        rc = total_cnt - last_total  # 本次消息的有效增量
+        _gift_total_tracker[tk] = total_cnt
+        if len(_gift_total_tracker) > 10000:
+            _gift_total_tracker.clear()
+    elif combo_cnt > 0:
+        rc = combo_cnt
+    else:
+        rc = msg.repeat_count or 1
 
     # ── 计算礼物单价（供 combo buffer 和非连击路径共用）──
     composite_price = 0; composite_name = ''
