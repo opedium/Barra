@@ -472,16 +472,21 @@ def parse_gift_msg(payload, enable_outputs=None):
     is_combo = combo_cnt > 0
     now = time.time()
 
-    # ── 全局 total_count 去重（唯一可靠的去重手段，永不回退）──
+    # ── 全局 total_count 去重（跨连击拆分，不跨场次）──
     total_cnt = msg.total_count or 0
     if total_cnt > 0 and uid and gft_id:
         tk = (str(uid), str(gft_id))
         last_total = _gift_total_tracker.get(tk, 0)
         if total_cnt <= last_total:
-            _dedup_diag['rejected'] += 1
-            return []  # 已处理，跳过
-        rc = total_cnt - last_total  # 本次消息的有效增量
-        _gift_total_tracker[tk] = total_cnt
+            if total_cnt < last_total:
+                _gift_total_tracker[tk] = total_cnt  # 新场次，重置
+                rc = total_cnt
+            else:
+                _dedup_diag['rejected'] += 1
+                return []  # 重复
+        else:
+            rc = total_cnt - last_total
+            _gift_total_tracker[tk] = total_cnt
         if len(_gift_total_tracker) > 10000:
             _gift_total_tracker.clear()
     elif combo_cnt > 0:
