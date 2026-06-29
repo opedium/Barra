@@ -11,20 +11,17 @@
         <span id="total-count" class="total-count-badge" style="display:none;"></span>
     </div>
 
-    <!-- Locked Session Banner -->
-    <div id="locked-banner" class="locked-banner" style="display:none;"></div>
-
-    <!-- Live Session Selector -->
+    <!-- Session Selector with dates -->
     <div id="session-selector" style="display:none;margin-bottom:10px;padding:6px 12px;background:var(--card);border:1px solid var(--border);border-radius:8px;">
-        <span style="font-size:12px;color:var(--text-muted);">切换直播间:</span>
-        <select id="session-select" onchange="onSessionChange(this.value)" style="margin-left:8px;font-size:13px;"></select>
+        <span style="font-size:12px;color:var(--text-muted);">切换场次:</span>
+        <select id="session-select" onchange="onSessionChange(this.value)" style="margin-left:8px;font-size:13px;min-width:200px;"></select>
     </div>
 
     <!-- Controls -->
     <div class="filter-bar lb-filter-bar">
         <div class="btn-group" id="period-group">
             <button class="active" data-period="session">当前直播</button>
-            <button data-period="today">今日</button>
+            <button data-period="recent">最近一场</button>
             <button data-period="month">本月</button>
             <button data-period="30d">近30天</button>
             <button data-period="all">全部</button>
@@ -32,8 +29,8 @@
         </div>
         <input type="month" id="month-picker" class="month-picker" onchange="monthChanged()">
 
-        <span class="threshold-label">主播</span>
-        <select id="streamer-select" onchange="onStreamerChange(this.value)" style="max-width:150px;">
+        <span class="threshold-label" id="streamer-label" style="display:none;">主播</span>
+        <select id="streamer-select" onchange="onStreamerChange(this.value)" style="max-width:150px;display:none;">
             <option value="">全部主播</option>
         </select>
 
@@ -64,19 +61,6 @@
         <button id="sort-btn" class="sort-btn" onclick="toggleSort()">按贡献值</button>
         <button onclick="loadData()" class="btn-refresh">&#x27F3; 刷新</button>
         <button onclick="exportCSV()" class="btn-csv">&#x2B06; 导出CSV</button>
-    </div>
-
-    <!-- Chart -->
-    <div id="lb-chart-card" style="display:none;margin-bottom:16px;">
-        <div class="flex-between" style="margin-bottom:6px;">
-            <h3 style="font-size:13px;color:var(--text-muted);margin:0;">TOP 10 贡献对比</h3>
-            <button id="lb-chart-toggle" onclick="toggleLbChart()"
-                    style="background:none;border:1px solid var(--border);color:var(--text-muted);
-                           font-size:11px;cursor:pointer;padding:2px 8px;border-radius:4px;">隐藏</button>
-        </div>
-        <div id="lb-chart-wrap">
-            <canvas id="lb-bar-chart" style="max-height:280px;"></canvas>
-        </div>
     </div>
 
     <!-- Table -->
@@ -124,39 +108,6 @@
     border: 1px solid var(--border);
 }
 
-/* Locked session banner */
-.locked-banner {
-    background: linear-gradient(135deg, #eef2ff 0%, #dbeafe 100%);
-    border: 1px solid #a5b4fc;
-    border-left: 4px solid var(--primary);
-    border-radius: var(--radius-sm);
-    padding: 12px 16px;
-    margin-bottom: 14px;
-    font-size: 14px;
-    font-weight: 500;
-    color: var(--primary-dark);
-    box-shadow: 0 1px 4px rgba(99,102,241,0.15);
-    line-height: 1.6;
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 8px;
-}
-.locked-banner a {
-    font-weight: 600;
-    color: #fff;
-    background: var(--primary);
-    padding: 3px 12px;
-    border-radius: 4px;
-    transition: background var(--transition-fast);
-    white-space: nowrap;
-    font-size: 12px;
-    margin-left: auto;
-}
-.locked-banner a:hover {
-    background: var(--primary-dark);
-    text-decoration: none;
-}
 
 /* Filter bar refinements */
 .lb-filter-bar { margin-bottom: 14px; }
@@ -278,35 +229,12 @@
 <script>
 var currentPage = 1, currentThreshold = 0, currentPeriod = 'session', currentSort = 'consume', currentMinConsume = 0, currentTopN = 50, currentStreamer = '', currentRoomId = '';
 var lockedSessionId = null;
-var lbBarChart = null;
-
-function toggleLbChart() {
-    var wrap = document.getElementById('lb-chart-wrap');
-    var btn = document.getElementById('lb-chart-toggle');
-    var hidden = wrap.style.display === 'none';
-    wrap.style.display = hidden ? 'block' : 'none';
-    btn.textContent = hidden ? '隐藏' : '显示';
-    localStorage.setItem('lb-chart-visible', hidden ? '1' : '0');
-}
-(function() {
-    if (localStorage.getItem('lb-chart-visible') === '0') {
-        var wrap = document.getElementById('lb-chart-wrap');
-        if (wrap) wrap.style.display = 'none';
-        var btn = document.getElementById('lb-chart-toggle');
-        if (btn) btn.textContent = '显示';
-    }
-})();
 
 // Check URL for session_id
 var params = new URLSearchParams(window.location.search);
 if (params.get('session_id')) {
     lockedSessionId = parseInt(params.get('session_id'));
     if (isNaN(lockedSessionId)) lockedSessionId = null;
-    if (lockedSessionId) {
-        document.getElementById('locked-banner').style.display = 'flex';
-        document.getElementById('locked-banner').innerHTML = '<span>&#128274; 查看场次 #' + lockedSessionId + ' 榜单</span><a href="/leaderboard">取消锁定</a>';
-        document.querySelectorAll('#period-group button').forEach(function(b) { b.disabled = true; b.style.opacity = '0.5'; });
-    }
     loadSessionSelector();
 }
 
@@ -327,7 +255,8 @@ function loadSessionSelector() {
             filtered.forEach(function(s) {
                 var opt = document.createElement('option');
                 opt.value = s.id;
-                var label = (s.anchor_name || s.room_id) + ' (#' + s.id + ')';
+                var dt = (s.start_time || '').substr(0, 16);
+                var label = '#' + s.id + ' ' + dt + ' ' + (s.anchor_name || s.room_id || '');
                 if (s.status === 'live') label = '🔴 ' + label;
                 opt.textContent = label;
                 if (lockedSessionId && s.id === lockedSessionId) opt.selected = true;
@@ -351,7 +280,6 @@ function loadStreamers() {
                 if (currentRoomId === item.id) opt.selected = true;
                 sel.appendChild(opt);
             });
-            sel.style.display = '';
         });
 }
 
@@ -367,9 +295,6 @@ function onStreamerChange(roomId) {
 function onSessionChange(sid) {
     lockedSessionId = parseInt(sid);
     currentPage = 1;
-    document.getElementById('locked-banner').style.display = 'flex';
-    document.getElementById('locked-banner').innerHTML = '<span>&#128274; 查看场次 #' + lockedSessionId + ' 榜单</span><a href="/leaderboard">取消锁定</a>';
-    document.querySelectorAll('#period-group button').forEach(function(b) { b.disabled = true; b.style.opacity = '0.5'; });
     loadData();
 }
 
@@ -384,11 +309,11 @@ function toggleControls(period) {
     document.getElementById('custom-threshold').style.display = showThreshold ? '' : 'none';
 
     // 最低消费: today, month, 30d, all (simple single-input filter)
-    var showMinConsume = period === 'today' || period === 'month' || period === '30d' || period === 'all';
+    var showMinConsume = period === 'recent' || period === 'month' || period === '30d' || period === 'all';
     document.getElementById('min-consume-input').style.display = showMinConsume ? '' : 'none';
 
     // 排序按钮: session, today, month, all (not 30d, not million)
-    var showSort = period === 'session' || period === 'today' || period === 'month' || period === 'all';
+    var showSort = period === 'session' || period === 'recent' || period === 'month' || period === 'all';
     document.getElementById('sort-btn').style.display = showSort ? '' : 'none';
 
     // Top N: today, month, 30d, all (not session, not million)
@@ -403,6 +328,11 @@ function toggleControls(period) {
     // 月选择器: month, million, all
     var showPicker = period === 'month' || period === 'million' || period === 'all';
     document.getElementById('month-picker').style.display = showPicker ? '' : 'none';
+
+    // 主播筛选: month, 30d, all, million (not session/recent)
+    var showStreamer = period === 'month' || period === '30d' || period === 'all' || period === 'million';
+    document.getElementById('streamer-label').style.display = showStreamer ? '' : 'none';
+    document.getElementById('streamer-select').style.display = showStreamer ? '' : 'none';
 
     var picker = document.getElementById('month-picker');
     if (!picker.value) {
@@ -444,6 +374,8 @@ document.getElementById('period-group').addEventListener('click', function(e) {
         toggleControls(currentPeriod);
         if (currentPeriod !== 'month') document.querySelector('[data-period="month"]').textContent = '本月';
         if (currentPeriod !== 'million') document.querySelector('[data-period="million"]').textContent = '月百万';
+        lockedSessionId = null;  // 切换周期时清除锁定的场次
+        document.getElementById('session-selector').style.display = 'none';
         loadData();
     }
 });
@@ -537,6 +469,40 @@ function loadData() {
         return;
     }
 
+    if (currentPeriod === 'recent') {
+        // 最近一场：取当前主播最近已结束的场次，并弹出选场次列表
+        currentPeriod = 'session';
+        var sessionsUrl = '/api/sessions?limit=30';
+        if (currentRoomId) sessionsUrl += '&anchor=' + encodeURIComponent(currentRoomId);
+        fetchWithTimeout(sessionsUrl)
+            .then(function(r) { return r.json(); })
+            .then(function(list) {
+                if (list && list.length > 0) {
+                    // 显示所有已结束场次供选择
+                    var sel = document.getElementById('session-select');
+                    sel.innerHTML = '';
+                    list.forEach(function(s) {
+                        if (s.status === 'ended') {
+                            var opt = document.createElement('option');
+                            opt.value = s.id;
+                            opt.textContent = '#' + s.id + ' ' + (s.start_time || '').substr(0, 16) + ' ' + (s.anchor_name || '');
+                            sel.appendChild(opt);
+                        }
+                    });
+                    if (sel.options.length > 0) {
+                        sel.selectedIndex = 0;
+                        lockedSessionId = parseInt(sel.options[0].value);
+                        document.getElementById('session-selector').style.display = 'flex';
+                    }
+                }
+                doLoadLeaderboard();
+            })
+            .catch(function() { doLoadLeaderboard(); });
+        return;
+    }
+    doLoadLeaderboard();
+
+    function doLoadLeaderboard() {
     var url = '/api/leaderboard?threshold=' + currentThreshold + '&period=' + currentPeriod + '&page=' + currentPage + '&size=' + currentTopN + '&sort_by=' + currentSort + '&min_consume=' + currentMinConsume;
     if (currentRoomId) url += '&room_id=' + encodeURIComponent(currentRoomId);
     if (lockedSessionId) url += '&session_id=' + lockedSessionId;
@@ -561,7 +527,7 @@ function loadData() {
                 var tr = document.createElement('tr');
                 var rankClass = u.rank === 1 ? 'rank-1' : (u.rank === 2 ? 'rank-2' : (u.rank === 3 ? 'rank-3' : ''));
                 var avHtml = u.avatar_url
-                    ? '<img src="' + u.avatar_url + '" style="width:28px;height:28px;border-radius:50%;object-fit:cover;" onerror="this.style.display=\'none\'">'
+                    ? '<img src="' + u.avatar_url + '" loading="lazy" style="width:28px;height:28px;border-radius:50%;object-fit:cover;" onerror="this.style.display=\'none\'">'
                     : '<div style="width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#06b6d4);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff;">' + (u.user_name || '?').charAt(0).toUpperCase() + '</div>';
                 tr.innerHTML = '<td class="' + rankClass + '" style="font-weight:600;text-align:center;">#' + u.rank + '</td>' +
                     '<td style="padding:3px;"><div style="display:flex;align-items:center;gap:8px;">' + avHtml + '<a href="/user?uid=' + u.user_id + '" style="color:var(--primary-dark);font-weight:500;">' + u.user_name + '</a></div></td>' +
@@ -574,7 +540,6 @@ function loadData() {
                 tbody.appendChild(tr);
             });
             tbl.style.display = 'table';
-            renderLeaderboardChart(data.users, currentPeriod);
 
             var pageSize = currentPeriod === 'million' ? 50 : currentTopN;
             var totalPages = Math.ceil(data.total / pageSize);
@@ -592,40 +557,7 @@ function loadData() {
             document.getElementById('table-body').innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--danger);">加载失败: ' + err.message + '</td></tr>';
             document.getElementById('data-table').style.display = 'table';
         });
-}
-
-function renderLeaderboardChart(users, period) {
-    if (lbBarChart) { lbBarChart.destroy(); lbBarChart = null; }
-    var card = document.getElementById('lb-chart-card');
-    if (period === 'million' || !users || users.length < 2) {
-        card.style.display = 'none';
-        return;
-    }
-    card.style.display = 'block';
-    var top = users.slice(0, 10).reverse();
-    var labels = top.map(function(u) { return u.user_name || u.user_id; });
-    var data = top.map(function(u) { return u.consume || u.total_consume || 0; });
-    var colors = top.map(function(_, i) {
-        var idx = top.length - 1 - i;
-        if (idx === 0) return '#f59e0b';
-        if (idx === 1) return '#94a3b8';
-        if (idx === 2) return '#cd7f32';
-        return '#6366f1';
-    });
-    lbBarChart = new Chart(document.getElementById('lb-bar-chart'), {
-        type: 'bar',
-        data: {labels: labels, datasets: [{data: data, backgroundColor: colors, borderRadius: 4}]},
-        options: {
-            indexAxis: 'y',
-            responsive: true,
-            maintainAspectRatio: true,
-            plugins: {legend: {display: false}},
-            scales: {
-                x: {ticks: {font: {size: 10}, callback: function(v) { return v >= 10000 ? (v/10000).toFixed(1)+'w' : v.toLocaleString(); }}, grid: {display: false}},
-                y: {ticks: {font: {size: 11}}}
-            }
-        }
-    });
+    }  // end doLoadLeaderboard
 }
 
 function gotoPage(p) { currentPage = p; loadData(); }

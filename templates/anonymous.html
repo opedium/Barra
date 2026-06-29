@@ -116,7 +116,9 @@
         <button onclick="loadData()">🔍 搜索</button>
         <button onclick="clearSearch()" class="btn-outline">✕ 清除</button>
         <button onclick="exportCSV()" style="background:var(--success);color:#fff;border-color:var(--success);font-weight:600;">&#x2B06; 导出CSV</button>
+        <button onclick="batchResolve()" style="background:#8b5cf6;color:#fff;border-color:#8b5cf6;font-weight:600;">&#x26A1; 批量解析</button>
     </div>
+    <div id="resolve-status" style="display:none;padding:8px 12px;margin-bottom:12px;border-radius:6px;font-size:13px;"></div>
 
     <div class="table-wrap">
         <table id="data-table" style="display:none;">
@@ -182,6 +184,34 @@ function clearSearch() {
     document.getElementById('anon-search-input').value = '';
     loadData();
 }
+function batchResolve() {
+    var btn = event.target;
+    btn.disabled = true;
+    btn.textContent = '⏳ 解析中...';
+    var status = document.getElementById('resolve-status');
+    status.style.display = 'block';
+    status.style.background = '#fef3c7';
+    status.style.color = '#92400e';
+    status.textContent = '正在批量解析，等待响应...';
+    fetch('/api/anonymous/resolve', { method: 'POST' })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            status.style.background = d.resolved > 0 ? '#d1fae5' : '#fef3c7';
+            status.style.color = d.resolved > 0 ? '#065f46' : '#92400e';
+            status.textContent = '✔ 解析完成: ' + d.resolved + ' 成功, ' + d.failed + ' 失败 (共 ' + d.total + ')';
+            btn.disabled = false;
+            btn.textContent = '⚡ 批量解析';
+            loadData();
+        })
+        .catch(function(err) {
+            status.style.background = '#fee2e2';
+            status.style.color = '#991b1b';
+            status.textContent = '✖ 请求失败: ' + err.message;
+            btn.disabled = false;
+            btn.textContent = '⚡ 批量解析';
+        });
+}
+
 function exportCSV() {
     var q = document.getElementById('anon-search-input').value.trim();
     var url = '/api/anonymous/csv';

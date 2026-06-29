@@ -11,6 +11,7 @@ HANDLERS 字典将 WebSocket method 名（如 'WebcastChatMessage'）
 映射到对应的解析函数，供 fetcher.py 消息分发使用。
 """
 
+import csv
 import logging
 import os
 import re
@@ -31,8 +32,7 @@ from base.messages import (
     BattleEndPunishMessage, BattlePowerContainerMessage,
 )
 from base.utils import (
-    get_user_id, get_user_sec_uid, get_user_avatar_url,
-    get_user_name, sanitize_username,
+    get_user_id, get_user_sec_uid, get_user_avatar_url, get_user_name,
     fmt_grade, fmt_fans_club,
 )
 
@@ -47,12 +47,106 @@ def set_sse_callback(cb):
     _sse_callback = cb
 
 
+# ── 礼物 Combo 缓冲器（替代 delta 法）────────────────
+# 连击礼物（combo_count > 0）不通过 delta 法实时写入，而是缓冲到
+# combo 结束（repeat_end=1）或超时（默认 3s）后一次性写入最终 count。
+# 这消除了 delta_zero / out_of_order / combo_block 等误杀。
+#
+# key: (group_id, gift_id, user_id)
+# value: {
+#   'cnt': int (取 MAX),
+#   'unit_price': int,
+#   'display_name': str,
+#   'user_name': str, 'user_id': str, 'grade': str, 'fans_club': str,
+#   'sec_uid': str, 'avatar_url': str, 'display_id': str,
+#   'timer': threading.Timer or None,
+#   'repeat_end_seen': bool,
+#   'last_update': float,
+# }
+
+_gift_combo_buffer = {}
+_gift_combo_lock = threading.Lock()
+_gift_combo_timeout = 3.0  # combo idle timeout (seconds)
+_gift_finalize_callback = None  # (session_id, data) -> None
+
+def set_gift_finalize_callback(cb):
+    """Register callback for combo finalization. Called as cb(session_id, data_dict).
+    Data dict is the record_gift-compatible fields + session_id."""
+    global _gift_finalize_callback
+    _gift_finalize_callback = cb
+
+
+def _combo_finalize(key, update_counter=True):
+    """Finalize a buffered combo: compute final total, write via callback.
+
+    Called by repeat_end or timer expiry.
+    """
+    with _gift_combo_lock:
+        buf = _gift_combo_buffer.pop(key, None)
+    if not buf:
+        return
+    if update_counter:
+        _dedup_diag['passed'] += 1
+    unit_price = buf['unit_price']
+    cnt = buf['cnt']
+    total_value = unit_price * cnt
+    diamond_info = f" ({total_value}钻石)" if total_value > 0 else ""
+    display_name = buf['display_name']
+
+    # 通过回调写入 SQLite (fetcher 注册了此回调，包含 session_id)
+    if _gift_finalize_callback and cnt > 0:
+        data = {
+            'time': time.strftime('%H:%M:%S'),
+            'user_id': buf['user_id'],
+            'douyin_id': buf['display_id'],
+            'user_name': buf['user_name'],
+            'gift_name': display_name,
+            'gift_count': cnt,
+            'diamond_total': total_value,
+            'grade': buf.get('grade', ''),
+            'fans_club': buf.get('fans_club', ''),
+            'sec_uid': buf.get('sec_uid', ''),
+            'avatar_url': buf.get('avatar_url', ''),
+            'group_id': key[0],
+            'raw_repeat_count': cnt,
+            'raw_repeat_end': 1,
+            'raw_combo_count': cnt,
+            'raw_total_count': cnt,
+        }
+        _gift_finalize_callback(data)
+
+    # SSE push for finalized combo
+    if _sse_callback and buf.get('user_id'):
+        _sse_callback('gift', {
+            'user_id': buf['user_id'],
+            'user_name': buf['user_name'],
+            'gift_name': display_name,
+            'gift_count': cnt,
+            'diamond_total': total_value,
+            'group_id': key[0],
+        })
+
+    msg = f"[礼物] {buf['user_name']}[{buf['user_id']}] 礼物:{display_name} x{cnt}{diamond_info}"
+    logger.log(BARRAGE, msg)
+
+    return {
+        'type': 'gift',
+        'msg': msg,
+        'data': data,
+    }
+
+
+def flush_combo_buffer():
+    """Force-finalize all pending combos (on shutdown)."""
+    with _gift_combo_lock:
+        keys = list(_gift_combo_buffer.keys())
+        _gift_combo_buffer.clear()
+    for key in keys:
+        _combo_finalize(key, update_counter=False)
+
 
 # ── 礼物去重状态（delta法）────────────────────────
-# 同一直播间内，相同 (group_id, gift_name) 的 repeat_count 是累计值。
-# 每条消息只统计增量 delta = current_repeat - last_repeat，
-# 避免把累计值当作单次数量导致超采。
-
+# 仅用于非连击礼物的 fallback（trace_id 不可用时）
 _gift_dedup = {}        # (group_id, gift_id, user_id) -> (last_repeat_count, last_update_time, combo_ended)
 _rc1_dedup = {}         # (gift_id, user_id) -> last_accept_time (rc=1 500ms 短窗口去重)
 _dedup_lock = threading.Lock()
@@ -149,21 +243,6 @@ def _mode_label(play_mode):
     mapping = {'0': '1v1', '101': '多人PK', '201': '多人PK', '501': '随机匹配'}
     return mapping.get(play_mode, play_mode or '?')
 
-# ── 礼物元数据回退表 ────────────────────────────────
-# 当 protobuf GiftStruct 解析失败（gift 为 None 或缺失 name/id）
-# 时，用此表按 gift_id 回退，避免数据完全丢失。
-# 参考：DouyinBarrageGrab C# 上游的硬编码回退。
-_GIFT_FALLBACK = {
-    685: {'name': '粉丝灯牌', 'diamond_count': 1, 'combo': False},
-    3389: {'name': '欢乐盲盒', 'diamond_count': 10, 'combo': False},
-    4021: {'name': '欢乐拼图', 'diamond_count': 10, 'combo': False},
-}
-
-# ── 最大合理增量阈值 ──────────────────────────────
-# 单条礼物消息的 delta 超过此值时记录警告，但不拒绝。
-# 用于检测 dedup 状态异常（如 counter reset 后仍累积了大量 delta）。
-_MAX_REASONABLE_DELTA = 10000
-
 # ── 礼物定价覆盖表 ──────────────────────────────────
 # 限定/限时礼物的皮肤变体，protobuf diamond_count 返回的是基类价格而非实际定价。
 # 例：至尊超跑(12,000)的 protobuf 返回跑车基类价(1,200)。
@@ -209,6 +288,86 @@ _dedup_diag = {
     'counter_reset': 0, 'delta_zero': 0, 'out_of_order': 0,
     'rc1_dup': 0, 'bulk_dup': 0,
 }
+_dedup_csv_path = None
+_dedup_csv_lock = threading.Lock()
+
+
+def set_dedup_csv_dir(data_dir):
+    """设置去重诊断 CSV 的输出目录。由 fetcher 在 DataRecorder.open() 后调用。"""
+    global _dedup_csv_path, _rejected_csv_path, _trace_shadow_csv_path
+    import os
+    _dedup_csv_path = os.path.join(data_dir, 'dedup_stats.csv')
+    with open(_dedup_csv_path, 'w', encoding='utf-8') as f:
+        f.write('time,raw,passed,rejected,repeat_zero,combo_block,counter_reset,out_of_order,delta_zero,rc1_dup,bulk_dup\n')
+    _rejected_csv_path = os.path.join(data_dir, 'rejected_gifts.csv')
+    with open(_rejected_csv_path, 'w', encoding='utf-8') as f:
+        f.write('time,user_id,user_name,gift_name,gift_id,diamond_count,repeat_count,group_id,reason,log_id,trace_id,send_time,priority_score,fold_type,anchor_fold_type,msg_filter_k,msg_filter_v,is_dispatch,queue_priority\n')
+    _trace_shadow_csv_path = os.path.join(data_dir, 'trace_shadow.csv')
+    with open(_trace_shadow_csv_path, 'w', encoding='utf-8') as f:
+        f.write('time,user_id,user_name,gift_name,diamond_count,repeat_count,trace_id,current_decision,trace_decision\n')
+    with _trace_shadow_lock:
+        _seen_trace_ids.clear()
+
+_rejected_csv_path = None
+_rejected_csv_lock = threading.Lock()
+
+_trace_shadow_csv_path = None
+_trace_shadow_csv_lock = threading.Lock()
+
+
+def _write_rejected_gift(group_id, gift_id, gift_name, diamond_count, user_id, user_name, repeat_count, reason,
+                         log_id='', trace_id='', send_time='', priority_score=0, fold_type=0, anchor_fold_type=0,
+                         msg_filter_k='', msg_filter_v='', is_dispatch=0, queue_priority=0):
+    global _rejected_csv_path
+    if not _rejected_csv_path:
+        return
+    with _rejected_csv_lock:
+        ts = time.strftime('%H:%M:%S')
+        try:
+            with open(_rejected_csv_path, 'a', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([ts, user_id, user_name, gift_name, gift_id, diamond_count, repeat_count, group_id, reason,
+                                 log_id, trace_id, send_time, priority_score, fold_type, anchor_fold_type, msg_filter_k, msg_filter_v, is_dispatch, queue_priority])
+        except Exception:
+            pass
+
+
+def _write_trace_shadow(user_id, user_name, gift_name, diamond_count, repeat_count, trace_id, current_decision, trace_decision):
+    """记录 trace_id 影子去重与当前逻辑的决策对比。"""
+    global _trace_shadow_csv_path
+    if not _trace_shadow_csv_path:
+        return
+    with _trace_shadow_csv_lock:
+        ts = time.strftime('%H:%M:%S')
+        try:
+            with open(_trace_shadow_csv_path, 'a', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([ts, user_id, user_name, gift_name, diamond_count, repeat_count, trace_id, current_decision, trace_decision])
+        except Exception:
+            pass
+
+
+def _flush_dedup_stats():
+    """将当前 _dedup_diag 累计值追加写入 dedup_stats.csv。不重置计数器。"""
+    global _dedup_csv_path
+    if not _dedup_csv_path:
+        return
+    with _dedup_csv_lock:
+        import os as _os
+        if not _os.path.exists(_dedup_csv_path):
+            return
+        stats = dict(_dedup_diag)
+        ts = time.strftime('%H:%M:%S')
+        try:
+            with open(_dedup_csv_path, 'a', encoding='utf-8') as f:
+                f.write(f"{ts},{stats['raw']},{stats['passed']},{stats['rejected']},{stats['repeat_zero']},{stats['combo_block']},{stats['counter_reset']},{stats['out_of_order']},{stats['delta_zero']},{stats['rc1_dup']},{stats['bulk_dup']}\n")
+        except Exception:
+            pass
+
+
+def flush_dedup_stats():
+    """公开接口：立即写入当前去重诊断快照（不清零计数器）。"""
+    _flush_dedup_stats()
 
 
 def get_dedup_stats():
@@ -282,12 +441,7 @@ def _compute_gift_count(group_id, gift_id, user_id, repeat_count, repeat_end=0):
 
 
 def _prune_dedup_state(max_age=600):
-    """清理超过 max_age 秒未更新的去重状态。
-
-    上游 C# 版本（DouyinBarrageGrab）使用 10 秒超时。
-    我们使用 30 秒作为平衡——足够覆盖连击间隔，又不会让
-    过期条目长时间滞留导致 delta_zero / out_of_order 误杀。
-    """
+    """清理超过 max_age 秒未更新的去重状态。"""
     now = time.time()
     with _dedup_lock:
         stale = [k for k, (_, t, _) in _gift_dedup.items() if now - t > max_age]
@@ -296,81 +450,11 @@ def _prune_dedup_state(max_age=600):
         rc1_stale = [k for k, t in _rc1_dedup.items() if now - t > max_age]
         for k in rc1_stale:
             del _rc1_dedup[k]
-    # 定期清理 trace_id 集合（限制内存增长）
+    # 定期清理 trace_id 集合（每 10 分钟清空，防止无限增长）
     with _trace_shadow_lock:
-        if len(_seen_trace_ids) > 200_000:
+        if len(_seen_trace_ids) > 100_000:
             _seen_trace_ids.clear()
 
-
-# ── 礼物 Combo 缓冲器 ──────────────────────────────
-# 连击礼物（combo_count > 0）不走 delta 法，而是缓冲到
-# combo 结束（repeat_end=1）或超时（5s）后一次性写入最终 count。
-# 这消除了 delta_zero / out_of_order / combo_block 等误杀。
-_gift_combo_buffer = {}
-_gift_combo_lock = threading.Lock()
-_gift_combo_timeout = 5.0
-_gift_finalize_callbacks = {}  # anchor_name → callable
-
-def set_gift_finalize_callback(anchor_name, cb):
-    """按主播名注册礼物最终化回调，支持多房间共存。"""
-    global _gift_finalize_callbacks
-    _gift_finalize_callbacks[anchor_name or ''] = cb
-
-def remove_gift_finalize_callback(anchor_name):
-    """移除指定主播的回调。"""
-    global _gift_finalize_callbacks
-    _gift_finalize_callbacks.pop(anchor_name or '', None)
-
-def _combo_finalize(key):
-    with _gift_combo_lock:
-        buf = _gift_combo_buffer.pop(key, None)
-    if not buf:
-        return
-    # passed 已在 parse_gift_msg 入口处计数，这里不再重复计
-    unit_price = buf['unit_price']
-    cnt = buf['cnt']
-    total_value = unit_price * cnt
-    display_name = buf['display_name']
-    if cnt > 0:
-        anchor = buf.get('anchor_name', '')
-        data = {
-            'time': time.strftime('%H:%M:%S'),
-            'user_id': buf['user_id'],
-            'douyin_id': buf.get('douyin_id', ''),
-            'user_name': buf['user_name'],
-            'gift_name': display_name,
-            'gift_count': cnt,
-            'diamond_total': total_value,
-            'grade': buf.get('grade', ''),
-            'fans_club': buf.get('fans_club', ''),
-            'sec_uid': buf.get('sec_uid', ''),
-            'avatar_url': buf.get('avatar_url', ''),
-            'anchor_name': anchor,
-        }
-        cb = _gift_finalize_callbacks.get(anchor)
-        if cb:
-            cb(data)
-    if _sse_callback and buf.get('user_id'):
-        _sse_callback('gift', {
-            'user_id': buf['user_id'],
-            'user_name': buf['user_name'],
-            'gift_name': display_name,
-            'gift_count': cnt,
-            'diamond_total': total_value,
-        })
-    diamond_info = f" ({total_value}钻石)" if total_value > 0 else ""
-    msg = f"[礼物] {buf['user_name']}[{buf['user_id']}] 礼物:{display_name} x{cnt}{diamond_info}"
-    logger.log(15, msg)
-
-def flush_combo_buffer():
-    with _gift_combo_lock:
-        keys = list(_gift_combo_buffer.keys())
-        _gift_combo_buffer.clear()
-    for key in keys:
-        _combo_finalize(key)
-
-def flush_all_buffers():
-    flush_combo_buffer()
 
 # ── 解析函数 ──────────────────────────────────────
 
@@ -389,12 +473,11 @@ def parse_chat_msg(payload, enable_outputs=None):
     msg = parse_proto(ChatMessage, payload)
     user = msg.user
     uid = get_user_id(user)
-    uname = get_user_name(user)
     common = {
         'time': time.strftime('%H:%M:%S'),
         'user_id': uid,
         'douyin_id': user.display_id,
-        'user_name': uname,
+        'user_name': get_user_name(user),
         'gender': {1: "男", 2: "女"}.get(user.gender, "未知"),
         'grade': fmt_grade(user),
         'fans_club': fmt_fans_club(user),
@@ -410,29 +493,24 @@ def parse_chat_msg(payload, enable_outputs=None):
         if enable_outputs.get('lucky_bag', True):
             results.append({
                 'type': 'lucky_bag',
-                'msg': f"[福袋口令] {uname}[{uid}] 内容:{msg.content}",
+                'msg': f"[福袋口令] {get_user_name(user)}[{uid}] 内容:{msg.content}",
                 'data': {**common, 'content': msg.content},
             })
     else:  # 普通聊天
         if enable_outputs.get('chat', True):
             results.append({
                 'type': 'chat',
-                'msg': f"[聊天] {uname}[{uid}] 内容:{msg.content}",
+                'msg': f"[聊天] {get_user_name(user)}[{uid}] 内容:{msg.content}",
                 'data': {**common, 'content': msg.content},
             })
     return results
 
 
 def parse_gift_msg(payload, enable_outputs=None):
-    """解析礼物消息。
+    """解析礼物消息，使用 delta 法去重。
 
-    混合去重策略：
-    - 连击礼物（combo_count > 0）：缓冲到 combo 结束，取 MAX 累计值一次性写入。
-    - 非连击礼物：用 trace_id 去重，即时写入。
-    - 无 trace_id 兜底：delta 法。
-
-    null/损坏保护：
-    - gift 对象为 None 时按 gift_id 查 _GIFT_FALLBACK 表回退
+    同组同礼物的 repeat_count 是累计值，每条消息只统计增量，
+    避免将累计值当作单次数量导致超采。
     """
     if not enable_outputs.get('gift', True):
         return []
@@ -442,29 +520,13 @@ def parse_gift_msg(payload, enable_outputs=None):
     uid = get_user_id(user)
     gift = msg.gift
 
-    # ── null/gift 回退保护 ──
-    if gift is None or not gift.name:
-        gft_id = msg.gift_id or 0
-        fallback = _GIFT_FALLBACK.get(gft_id)
-        if fallback:
-            class _FallbackGift:
-                name = fallback['name']; id = gft_id
-                diamond_count = fallback['diamond_count']; combo = fallback['combo']; type = 0; image = None
-            gift = _FallbackGift()
-        else:
-            class _MinGift:
-                name = f"gift_{gft_id}"; id = gft_id; diamond_count = 0; combo = False; type = 0; image = None
-            gift = _MinGift()
-    else:
-        gft_id = gift.id or msg.gift_id or 0
-
-    user_display_name = get_user_name(user)
-    douyin_id = getattr(user, 'display_id', '') or ''
-
-    # ── 提取关键字段 ──
+    # ── 混合去重策略 ──
+    # 连击礼物（combo_count > 0）：缓冲到 combo 结束，取 MAX count 一次性写入。
+    # 非连击礼物（combo_count == 0）：用 trace_id 去重，即时写入。
     combo_cnt = msg.combo_count or 0
     rc = combo_cnt if combo_cnt > 0 else (msg.repeat_count or 0)
     gid = str(msg.group_id) if msg.group_id else '0'
+    gft_id = gift.id or 0
     log_id = msg.log_id or ''
     trace_id = msg.trace_id or ''
     send_time = msg.send_time or 0
@@ -472,7 +534,8 @@ def parse_gift_msg(payload, enable_outputs=None):
     now = time.time()
 
     # ── 计算礼物单价（供 combo buffer 和非连击路径共用）──
-    composite_price = 0; composite_name = ''
+    composite_price = 0
+    composite_name = ''
     diy_raw = getattr(msg, 'diy_item_info', '') or ''
     if diy_raw:
         try:
@@ -486,9 +549,11 @@ def parse_gift_msg(payload, enable_outputs=None):
         except (json.JSONDecodeError, TypeError, AttributeError):
             pass
     if composite_price > 0:
-        unit_price = composite_price; display_name = composite_name or gift.name
+        unit_price = composite_price
+        display_name = composite_name or gift.name
     else:
-        unit_price = _GIFT_PRICE_OVERRIDE.get(gift.name, gift.diamond_count); display_name = gift.name
+        unit_price = _GIFT_PRICE_OVERRIDE.get(gift.name, gift.diamond_count)
+        display_name = gift.name
 
     # ── 路径 A：连击礼物 → Combo 缓冲器 ──
     if is_combo:
@@ -496,88 +561,171 @@ def parse_gift_msg(payload, enable_outputs=None):
         with _gift_combo_lock:
             entry = _gift_combo_buffer.get(key)
             if entry is None:
-                from base.utils import get_current_anchor
+                # 新连击：创建缓冲
                 entry = {
-                    'cnt': rc, 'unit_price': unit_price, 'display_name': display_name,
-                    'user_name': user_display_name or str(uid), 'user_id': uid,
-                    'douyin_id': douyin_id, 'grade': fmt_grade(user),
-                    'fans_club': fmt_fans_club(user), 'sec_uid': get_user_sec_uid(user),
-                    'avatar_url': get_user_avatar_url(user), 'group_id': gid,
-                    'timer': None, 'repeat_end_seen': bool(msg.repeat_end or 0), 'last_update': now,
-                    'anchor_name': get_current_anchor() or '',
+                    'cnt': rc,
+                    'unit_price': unit_price,
+                    'display_name': display_name,
+                    'user_name': get_user_name(user) or str(uid),
+                    'user_id': uid,
+                    'grade': fmt_grade(user),
+                    'fans_club': fmt_fans_club(user),
+                    'sec_uid': get_user_sec_uid(user),
+                    'avatar_url': get_user_avatar_url(user),
+                    'display_id': user.display_id or '',
+                    'group_id': gid,
+                    'timer': None,
+                    'repeat_end_seen': bool(msg.repeat_end or 0),
+                    'last_update': now,
                 }
                 _gift_combo_buffer[key] = entry
             else:
+                # 已有缓冲：取 MAX count
                 entry['cnt'] = max(entry['cnt'], rc)
                 entry['last_update'] = now
-                if msg.repeat_end: entry['repeat_end_seen'] = True
+                if msg.repeat_end:
+                    entry['repeat_end_seen'] = True
+                # 取消旧计时器
                 if entry.get('timer'):
-                    try: entry['timer'].cancel()
-                    except: pass
+                    try:
+                        entry['timer'].cancel()
+                    except Exception:
+                        pass
                     entry['timer'] = None
-            should_finalize = entry['repeat_end_seen']
-            cnt_final = entry['cnt']
-            price = entry['unit_price']
-            uname = entry['user_name']
-        # 在锁外调用 _combo_finalize，避免死锁
-        if should_finalize:
-            _combo_finalize(key)
-            _dedup_diag['passed'] += 1  # 最终化也计数
-            total_value = price * cnt_final
-            diamond_info = f" ({total_value}钻石)" if total_value > 0 else ""
-            return [{'type': 'gift', 'msg': f"[礼物] {uname}[{uid}] 礼物:{display_name} x{cnt_final}{diamond_info}", 'data': {'_combo_progress': True}}]
-        else:
-            _dedup_diag['passed'] += 1
-            def _on_timeout(k=key): return _combo_finalize(k)
-            timer = threading.Timer(_gift_combo_timeout, _on_timeout); timer.daemon = True; timer.start()
-            with _gift_combo_lock:
-                if key in _gift_combo_buffer:
-                    _gift_combo_buffer[key]['timer'] = timer
-            total_value = price * cnt_final
-            diamond_info = f" ({total_value}钻石)" if total_value > 0 else ""
-            return [{'type': 'gift', 'msg': f"[礼物] {uname}[{uid}] 礼物:{display_name} x{cnt_final}", 'data': {'_combo_progress': True}}]
+
+            # 如果 repeat_end 到达 → 立即结束
+            if entry['repeat_end_seen']:
+                _combo_finalize(key)
+                _dedup_diag['passed'] += 1
+                # 返回 BARRAGE 日志
+                unit_price = entry['unit_price'] or _GIFT_PRICE_OVERRIDE.get(gift.name, gift.diamond_count)
+                total_value = unit_price * entry['cnt']
+                msg_text = f"[礼物] {entry['user_name']}[{uid}] 礼物:{gift.name} x{entry['cnt']} ({total_value}钻石)" if total_value > 0 else f"[礼物] {entry['user_name']}[{uid}] 礼物:{gift.name} x{entry['cnt']}"
+                return [{
+                    'type': 'gift',
+                    'msg': msg_text,
+                    'data': {'_combo_progress': True},
+                }]
+            else:
+                # 未结束：设定时器（防止丢包导致 repeat_end 永远不达）
+                def _on_timeout(k=key):
+                    return _combo_finalize(k)
+                timer = threading.Timer(_gift_combo_timeout, _on_timeout)
+                timer.daemon = True
+                timer.start()
+                entry['timer'] = timer
+                # 返回 BARRAGE 日志（不写入 DB）
+                unit_price = entry['unit_price'] or _GIFT_PRICE_OVERRIDE.get(gift.name, gift.diamond_count)
+                total_value = unit_price * entry['cnt']
+                msg_text = f"[礼物] {entry['user_name']}[{uid}] 礼物:{gift.name} x{entry['cnt']}"
+                return [{
+                    'type': 'gift',
+                    'msg': msg_text,
+                    'data': {'_combo_progress': True},
+                }]
 
     # ── 路径 B：非连击礼物 → 即时写入（trace_id 去重）──
+    # 单次送礼（rc=1）：每条消息是独立事件。trace_id 去重，无 trace_id 时直接接受。
     if rc == 1:
         if trace_id:
             with _trace_shadow_lock:
-                if trace_id in _seen_trace_ids: cnt, reason = 0, 'rc1_dup'
-                else: _seen_trace_ids.add(trace_id); cnt, reason = 1, ''
+                if trace_id in _seen_trace_ids:
+                    _dedup_diag['rc1_dup'] += 1
+                    cnt, reason = 0, 'rc1_dup'
+                else:
+                    _seen_trace_ids.add(trace_id)
+                    cnt, reason = 1, ''
         else:
             cnt, reason = 1, ''
     elif rc > 1 and trace_id:
+        # 非连击批量礼物（人气票 x999）：atomic 批次，trace_id 去重
         with _trace_shadow_lock:
-            if trace_id in _seen_trace_ids: cnt, reason = 0, 'bulk_dup'
-            else: _seen_trace_ids.add(trace_id); cnt, reason = rc, ''
+            if trace_id in _seen_trace_ids:
+                _dedup_diag['bulk_dup'] += 1
+                cnt, reason = 0, 'bulk_dup'
+            else:
+                _seen_trace_ids.add(trace_id)
+                cnt, reason = rc, ''
     else:
+        # 无 trace_id 的兜底：用 delta 法
         cnt, reason = _compute_gift_count(gid, gft_id, uid, rc, repeat_end=msg.repeat_end or 0)
 
-    if cnt > _MAX_REASONABLE_DELTA:
-        logger.warning(f"[礼物] delta={cnt} 超过阈值({_MAX_REASONABLE_DELTA}) gift={gift.name} user={user_display_name} rc={rc} gid={gid} reason={reason}")
-
+    # 定期清理
     if rc > 0 and (rc % 100) == 0:
         _prune_dedup_state()
+    if _dedup_diag['raw'] % 500 == 0:
+        _flush_dedup_stats()
+
+    # 影子去重
+    trace_seen = False
+    with _trace_shadow_lock:
+        if trace_id:
+            if trace_id in _seen_trace_ids:
+                trace_seen = True
+            else:
+                _seen_trace_ids.add(trace_id)
+
     if cnt <= 0:
-        _dedup_diag['rejected'] += 1; return []
+        _dedup_diag['rejected'] += 1
+        _write_rejected_gift(gid, gft_id, gift.name, gift.diamond_count, uid, get_user_name(user), rc, reason,
+                             log_id=log_id, trace_id=trace_id, send_time=send_time,
+                             priority_score=msg.common.priority_score if msg.common else 0,
+                             fold_type=msg.common.fold_type if msg.common else 0,
+                             anchor_fold_type=msg.common.anchor_fold_type if msg.common else 0,
+                             msg_filter_k=msg.common.msg_process_filter_k if msg.common else '',
+                             msg_filter_v=msg.common.msg_process_filter_v if msg.common else '',
+                             is_dispatch=1 if (msg.common and msg.common.is_dispatch) else 0,
+                             queue_priority=msg.priority.priority if msg.priority else 0)
+        # 影子记录：当前拒绝，trace 判断
+        cur_dec = f'reject_{reason}' if reason else 'reject'
+        trace_dec = 'reject_dup' if trace_seen else 'accept'
+        _write_trace_shadow(uid, get_user_name(user), gift.name, gift.diamond_count, rc, trace_id, cur_dec, trace_dec)
+        return []  # 重复消息或增量为零，跳过
     _dedup_diag['passed'] += 1
 
+    # SSE push for accepted gifts
     if _sse_callback and uid:
-        _sse_callback('gift', {'user_id': uid, 'user_name': user_display_name, 'gift_name': display_name, 'gift_count': cnt, 'diamond_total': unit_price * cnt, 'group_id': gid})
+        gid_str = str(gft_id) if gft_id else '0'
+        _sse_callback('gift', {
+            'user_id': uid,
+            'user_name': get_user_name(user),
+            'gift_name': display_name,
+            'gift_count': cnt,
+            'diamond_total': unit_price * cnt,
+            'group_id': gid_str,
+        })
 
+    # 影子记录：当前接受，trace 判断
+    cur_dec = 'accept'
+    trace_dec = 'reject_dup' if trace_seen else 'accept'
+    _write_trace_shadow(uid, get_user_name(user), gift.name, gift.diamond_count, rc, trace_id, cur_dec, trace_dec)
     total_value = unit_price * cnt
     diamond_info = f" ({total_value}钻石)" if total_value > 0 else ""
     return [{
         'type': 'gift',
-        'msg': f"[礼物] {user_display_name}[{uid}] 礼物:{display_name} x{cnt}{diamond_info}",
+        'msg': f"[礼物] {get_user_name(user)}[{uid}] 礼物:{display_name} x{cnt}{diamond_info}",
         'data': {
-            'time': time.strftime('%H:%M:%S'), 'user_id': uid, 'douyin_id': douyin_id,
-            'user_name': user_display_name, 'gender': {1: "男", 2: "女"}.get(user.gender, "未知"),
-            'gift_name': display_name, 'gift_count': cnt, 'diamond_total': total_value,
-            'grade': fmt_grade(user), 'fans_club': fmt_fans_club(user),
-            'sec_uid': get_user_sec_uid(user), 'avatar_url': get_user_avatar_url(user),
-            'group_id': gid, 'raw_repeat_count': msg.repeat_count, 'raw_repeat_end': msg.repeat_end,
-            'raw_combo_count': msg.combo_count, 'raw_total_count': msg.total_count,
-            'log_id': log_id, 'trace_id': trace_id, 'send_time': send_time,
+            'time': time.strftime('%H:%M:%S'),
+            'user_id': uid,
+            'douyin_id': user.display_id,
+            'user_name': get_user_name(user),
+            'gender': {1: "男", 2: "女"}.get(user.gender, "未知"),
+            'gift_name': display_name,
+            'gift_count': cnt,
+            'diamond_total': total_value,
+            'grade': fmt_grade(user),
+            'fans_club': fmt_fans_club(user),
+            'sec_uid': get_user_sec_uid(user),
+            'avatar_url': get_user_avatar_url(user),
+            'group_id': gid,
+            'raw_repeat_count': msg.repeat_count,
+            'raw_repeat_end': msg.repeat_end,
+            'raw_combo_count': msg.combo_count,
+            'raw_total_count': msg.total_count,
+            'log_id': log_id,
+            'trace_id': trace_id,
+            'send_time': send_time,
+            # protobuf 过滤字段 (Kimi 建议：区分折叠 vs 过滤)
             'priority_score': msg.common.priority_score if msg.common else 0,
             'fold_type': msg.common.fold_type if msg.common else 0,
             'anchor_fold_type': msg.common.anchor_fold_type if msg.common else 0,
@@ -649,13 +797,12 @@ def parse_like_msg(payload, enable_outputs=None):
     msg = parse_proto(LikeMessage, payload)
     user = msg.user
     uid = get_user_id(user)
-    uname = get_user_name(user)
     return [{
         'type': 'like',
-        'msg': f"[点赞] {uname}[{uid}] 点赞:{msg.count}个, 累计{msg.total}赞",
+        'msg': f"[点赞] {get_user_name(user)}[{uid}] 点赞:{msg.count}个, 累计{msg.total}赞",
         'data': {
             'time': time.strftime('%H:%M:%S'),
-            'user_id': uid, 'user_name': uname,
+            'user_id': uid, 'user_name': get_user_name(user),
             'count': msg.count, 'total': msg.total,
             'grade': fmt_grade(user), 'fans_club': fmt_fans_club(user),
             'sec_uid': get_user_sec_uid(user),
@@ -679,15 +826,14 @@ def parse_member_msg(payload, enable_outputs=None):
     msg = parse_proto(MemberMessage, payload)
     user = msg.user
     uid = get_user_id(user)
-    uname = get_user_name(user)
     gender = {0: "未知", 1: "男", 2: "女"}.get(user.gender, "未知")
     extras = f" (直播间人数:{msg.member_count})" if msg.member_count else ""
     return [{
         'type': 'member',
-        'msg': f"[进场] {uname}[{uid}][{gender}] 进入了直播间{extras}",
+        'msg': f"[进场] {get_user_name(user)}[{uid}][{gender}] 进入了直播间{extras}",
         'data': {
             'time': time.strftime('%H:%M:%S'),
-            'user_id': uid, 'user_name': uname, 'gender': gender,
+            'user_id': uid, 'user_name': get_user_name(user), 'gender': gender,
             'grade': fmt_grade(user), 'fans_club': fmt_fans_club(user),
             'sec_uid': get_user_sec_uid(user),
             'avatar_url': get_user_avatar_url(user),
@@ -713,15 +859,14 @@ def parse_social_msg(payload, enable_outputs=None):
         return []
     user = msg.user
     uid = get_user_id(user)
-    uname = get_user_name(user)
     action = {1: "关注了主播", 2: "分享了直播间"}.get(msg.action, "互动")
     follow = f"(第{msg.follow_count}个关注)" if msg.follow_count else ""
     return [{
         'type': 'social',
-        'msg': f"[关注/分享] {uname}[{uid}] {action} {follow}",
+        'msg': f"[关注/分享] {get_user_name(user)}[{uid}] {action} {follow}",
         'data': {
             'time': time.strftime('%H:%M:%S'),
-            'user_id': uid, 'user_name': uname, 'action': action,
+            'user_id': uid, 'user_name': get_user_name(user), 'action': action,
             'follow_count': msg.follow_count or '',
             'grade': fmt_grade(user), 'fans_club': fmt_fans_club(user),
             'sec_uid': get_user_sec_uid(user),
@@ -792,14 +937,13 @@ def parse_fansclub_msg(payload, enable_outputs=None):
     msg = parse_proto(FansclubMessage, payload)
     user = msg.user
     uid = get_user_id(user)
-    uname = get_user_name(user)
     t = {1: "升级", 2: "加入"}.get(msg.type, "变动")
     return [{
         'type': 'fansclub',
-        'msg': f"[粉丝团] {uname}[{uid}] {t}: {msg.content}",
+        'msg': f"[粉丝团] {get_user_name(user)}[{uid}] {t}: {msg.content}",
         'data': {
             'time': time.strftime('%H:%M:%S'),
-            'user_id': uid, 'user_name': uname,
+            'user_id': uid, 'user_name': get_user_name(user),
             'type': t, 'content': msg.content,
             'grade': fmt_grade(user), 'fans_club': fmt_fans_club(user),
             'sec_uid': get_user_sec_uid(user),
@@ -823,14 +967,13 @@ def parse_emoji_chat_msg(payload, enable_outputs=None):
     msg = parse_proto(EmojiChatMessage, payload)
     user = msg.user
     uid = get_user_id(user)
-    uname = get_user_name(user)
     content = msg.default_content or f"[表情{msg.emoji_id}]"
     return [{
         'type': 'emoji',
-        'msg': f"[表情] {uname}[{uid}]: {content}",
+        'msg': f"[表情] {get_user_name(user)}[{uid}]: {content}",
         'data': {
             'time': time.strftime('%H:%M:%S'),
-            'user_id': uid, 'user_name': uname,
+            'user_id': uid, 'user_name': get_user_name(user),
             'emoji_id': msg.emoji_id, 'content': content,
             'grade': fmt_grade(user), 'fans_club': fmt_fans_club(user),
             'sec_uid': get_user_sec_uid(user),
@@ -950,42 +1093,26 @@ def _extract_subscribe(payload):
 
     # ── 辅助：从字符串列表中找用户名 ──
     def _find_username(candidates):
-        """从候选字符串中提取最可能的用户名（评分法，优先含汉字的）。"""
+        """从候选字符串中提取可能的用户名（排除已知关键词）。"""
         known_words = {'开通', '续费', '月度', '季度', '年度', '会员', '星守护',
                        'subscribe_anchor_mvp_v2', 'webcast', 'douyin', 'room'}
-        best = ''
-        best_score = -1
         for s in candidates:
             if not s or len(s) > 60:
                 continue
+            # 跳过模板占位符
             if s.startswith('{') and s.endswith('}'):
                 continue
-            import re as _re
-            if _re.search(r'\{\d+:', s):
-                continue  # 跳过 i18n 模板 {0:user} {1:string}...
+            # 跳过纯数字（可能是 ID）
             if s.isdigit():
                 continue
+            # 跳过已知关键词（精确匹配或包含）
             if s in known_words:
                 continue
+            # 清理引号
             clean = s.lstrip('"').rstrip('" ').strip()
-            if not clean or len(clean) > 50:
-                continue
-            # 评分：汉字 > 字母 > 纯符号
-            score = 0
-            has_cjk = any('一' <= c <= '鿿' for c in clean)
-            has_alpha = any(c.isalpha() for c in clean)
-            if has_cjk:
-                score += 100  # 含汉字的优先
-            if has_alpha:
-                score += 10
-            if clean.isascii() and not clean.isalpha():
-                score -= 20  # 纯符号/混合符号扣分
-            if len(clean) >= 3:
-                score += 5   # 长度 >= 3 加分
-            if score > best_score:
-                best_score = score
-                best = clean
-        return best
+            if clean and len(clean) <= 50:
+                return clean
+        return ''
 
     # ── 会员订阅 ──
     has_vip_template = any('会员' in s for s in all_strings)
@@ -1067,36 +1194,6 @@ def parse_room_msg(payload, enable_outputs=None):
         douyin_id = sub_info.get('douyin_id', '')
         price = _SUBSCRIBE_PRICES.get((event, action, sub_type), 0)
 
-        # 从 RoomMessage.common.user 获取真实用户信息（比字节扫描更可靠）
-        real_uid = ''; real_sec_uid = ''; real_avatar = ''; real_grade = ''; real_fans_club = ''
-        try:
-            room_msg = parse_proto(RoomMessage, payload)
-            # 调试：看 common.user 到底有没有
-            has_common = bool(room_msg.common)
-            has_user = bool(room_msg.common and room_msg.common.user)
-            user_id_from_proto = ''
-            user_name_from_proto = ''
-            if has_user:
-                u = room_msg.common.user
-                user_id_from_proto = str(get_user_id(u) or '')
-                user_name_from_proto = get_user_name(u) or ''
-                uid = get_user_id(u)
-                if uid:
-                    real_uid = uid
-                    douyin_id = real_uid
-                    user = get_user_name(u) or user
-                    real_sec_uid = get_user_sec_uid(u)
-                    real_avatar = get_user_avatar_url(u)
-                    real_grade = fmt_grade(u)
-                    real_fans_club = fmt_fans_club(u)
-            # 调试日志：记录解析结果和字节扫描结果的对比
-            if sub_info.get('douyin_id') != user_id_from_proto or sub_info.get('user') != user_name_from_proto:
-                logger.info(f"[订阅调试] bytescan_id={sub_info.get('douyin_id','')} proto_id={user_id_from_proto} "
-                           f"bytescan_name={sub_info.get('user','')} proto_name={user_name_from_proto} "
-                           f"has_common={has_common} has_user={has_user}")
-        except Exception as e:
-            logger.debug(f"[订阅调试] protobuf 解析异常: {e}")
-
         results.append({
             'type': 'subscribe',
             'msg': f'[订阅] {user} {action}{sub_type}{event} ({price}钻石)',
@@ -1104,11 +1201,6 @@ def parse_room_msg(payload, enable_outputs=None):
                 'time': time.strftime('%H:%M:%S'),
                 'user_name': user,
                 'douyin_id': douyin_id,
-                'user_id': real_uid,
-                'sec_uid': real_sec_uid,
-                'avatar_url': real_avatar,
-                'grade': real_grade,
-                'fans_club': real_fans_club,
                 'event': event,
                 'action': action,
                 'sub_type': sub_type,
@@ -1187,16 +1279,15 @@ def parse_rank_msg(payload, enable_outputs=None):
         if not r.score_str:
             continue
         uid = get_user_id(r.user)
-        uname = get_user_name(r.user)
         results.append({
             'type': 'rank',
-            'msg': f"[排行榜] 第{i}名: {uname} 积分:{r.score_str}",
+            'msg': f"[排行榜] 第{i}名: {get_user_name(r.user)} 积分:{r.score_str}",
             'data': {
                 'time': time.strftime('%H:%M:%S'),
                 'rank_pos': i,
                 'user_id': uid,
                 'douyin_id': r.user.display_id,
-                'user_name': uname,
+                'user_name': get_user_name(r.user),
                 'score': r.score_str,
                 'sec_uid': get_user_sec_uid(r.user),
                 'avatar_url': get_user_avatar_url(r.user),
@@ -1712,6 +1803,11 @@ try:
         _migrate_conn.commit()
     except sqlite3.OperationalError:
         pass
+    try:
+        _migrate_conn.execute('ALTER TABLE users ADD COLUMN display_id TEXT DEFAULT ""')
+        _migrate_conn.commit()
+    except sqlite3.OperationalError:
+        pass
     # 升级礼物去重索引：同一秒内同用户同礼物去重，不同秒的保留（防止 websocket 重放但不误伤连刷）
     try:
         _migrate_conn.execute('DROP INDEX IF EXISTS idx_gift_dedup')
@@ -1724,6 +1820,24 @@ try:
         _migrate_conn.commit()
     except sqlite3.OperationalError:
         pass
+    try:
+        _migrate_conn.execute('''CREATE TABLE IF NOT EXISTS pk_rounds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER REFERENCES sessions(id),
+            start_time TEXT NOT NULL,
+            end_time TEXT,
+            duration_sec INTEGER DEFAULT 0,
+            mode TEXT DEFAULT '',
+            participants TEXT DEFAULT '',
+            participant_count INTEGER DEFAULT 0,
+            self_score INTEGER DEFAULT 0,
+            opponent_score INTEGER DEFAULT 0,
+            result TEXT DEFAULT '',
+            created_at DATETIME DEFAULT (datetime('now', '+8 hours'))
+        )''')
+        _migrate_conn.commit()
+    except sqlite3.OperationalError:
+        pass
     _migrate_conn.close()
 except Exception:
     pass
@@ -1731,22 +1845,16 @@ except Exception:
 
 
 
-_db_schema_inited = False
-_db_schema_lock = threading.Lock()
-
 def _get_conn():
-    global _db_schema_inited
     if not hasattr(_local, 'conn') or _local.conn is None:
         os.makedirs(DB_DIR, exist_ok=True)
         _local.conn = sqlite3.connect(DB_PATH)
         _local.conn.execute('PRAGMA journal_mode=WAL')
-        _local.conn.execute('PRAGMA busy_timeout=5000')
+        _local.conn.execute('PRAGMA synchronous=NORMAL')
+        _local.conn.execute('PRAGMA wal_autocheckpoint=100')
+        _local.conn.execute('PRAGMA journal_size_limit=67108864')
+        _local.conn.execute('PRAGMA busy_timeout=2000')
         _local.conn.row_factory = sqlite3.Row
-        if not _db_schema_inited:
-            with _db_schema_lock:
-                if not _db_schema_inited:
-                    init_db()
-                    _db_schema_inited = True
     return _local.conn
 
 
@@ -1802,17 +1910,6 @@ def init_db():
             fans_club TEXT DEFAULT '',
             created_at DATETIME DEFAULT (datetime('now', '+8 hours'))
         );
-        CREATE TABLE IF NOT EXISTS upgrade_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER DEFAULT 0,
-            user_id TEXT NOT NULL,
-            user_name TEXT NOT NULL,
-            upgrade_type TEXT NOT NULL,
-            from_level INTEGER DEFAULT 0,
-            to_level INTEGER DEFAULT 0,
-            anchor_name TEXT DEFAULT '',
-            created_at DATETIME DEFAULT (datetime('now', '+8 hours'))
-        );
         CREATE TABLE IF NOT EXISTS gift_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id INTEGER REFERENCES sessions(id),
@@ -1857,6 +1954,20 @@ def init_db():
             enabled INTEGER DEFAULT 0,
             added_at DATETIME DEFAULT (datetime('now', '+8 hours'))
         );
+        CREATE TABLE IF NOT EXISTS pk_rounds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER REFERENCES sessions(id),
+            start_time TEXT NOT NULL,
+            end_time TEXT,
+            duration_sec INTEGER DEFAULT 0,
+            mode TEXT DEFAULT '',
+            participants TEXT DEFAULT '',
+            participant_count INTEGER DEFAULT 0,
+            self_score INTEGER DEFAULT 0,
+            opponent_score INTEGER DEFAULT 0,
+            result TEXT DEFAULT '',
+            created_at DATETIME DEFAULT (datetime('now', '+8 hours'))
+        );
         CREATE INDEX IF NOT EXISTS idx_contributions_session ON contributions(session_id);
         CREATE INDEX IF NOT EXISTS idx_contributions_user ON contributions(user_id);
         CREATE INDEX IF NOT EXISTS idx_chat_logs_user ON chat_logs(user_id);
@@ -1864,9 +1975,6 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_daily_stats ON daily_stats(date, sessions_1000 DESC);
         CREATE INDEX IF NOT EXISTS idx_contributions_qualified ON contributions(qualified_1000);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_gift_dedup_ts ON gift_logs(session_id, user_id, gift_name, diamond_total, gift_count, created_at);
-        CREATE INDEX IF NOT EXISTS idx_upgrade_logs_session ON upgrade_logs(session_id);
-        CREATE INDEX IF NOT EXISTS idx_upgrade_logs_type ON upgrade_logs(upgrade_type);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_upgrade_logs_dedup ON upgrade_logs(session_id, user_id, upgrade_type, from_level, to_level);
     ''')
     # 兼容旧表：给 users 表补充 grade 字段
     try:
@@ -1930,13 +2038,10 @@ def delete_session(session_id):
 
 
 def _detect_anonymous(user_name):
-    """检测是否为抖音匿名用户（神秘人或 dou 开头的设备 ID 类名称）。
+    """检测是否为抖音神秘人（匿名用户）。
 
-    匿名特征：
-    - 以"神秘人"开头，后面不含其他中文字符（系统分配的匿名显示名）
-    - 以"dou"开头（大小写不敏感），可能是设备 ID 或系统生成名
-
-    返回 (is_anonymous, anonymous_label)。
+    神秘人由抖音分配匿名显示名（如"神秘人七阶"、"神秘人523150"），
+    特征：以"神秘人"开头，后面不含其他中文字符。
     """
     if not user_name:
         return False, ''
@@ -1945,79 +2050,65 @@ def _detect_anonymous(user_name):
         suffix = user_name[3:]
         if not re.search(r'[一-鿿]', suffix):
             return True, user_name
-    # dou + 纯数字（如 dou9495919），系统生成的设备 ID 类匿名名
-    if re.match(r'dou\d+$', user_name, re.IGNORECASE):
-        return True, user_name
     return False, ''
 
 
-def _parse_fans_club_string(s):
-    """解析粉丝团字符串为 {club_name: level} 字典。
-
-    "[粉丝团:迅猛龙 Lv20] [粉丝团:孙恩盛 Lv5]" → {"迅猛龙": 20, "孙恩盛": 5}
-    """
-    if not s:
-        return {}
-    import re as _re
-    clubs = {}
-    for m in _re.finditer(r'\[粉丝团:([^\]]+?) Lv(\d+)\]', s):
-        name, lv = m.group(1), int(m.group(2))
-        clubs[name] = max(clubs.get(name, 0), lv)
-    return clubs
-
-
-def _merge_fans_club_strings(existing, new_val):
-    """合并新旧粉丝团字符串，同名称保留最高等级。"""
-    if not new_val:
-        return existing or ''
-    if not existing:
-        return new_val
-    merged = _parse_fans_club_string(existing)
-    for name, lv in _parse_fans_club_string(new_val).items():
-        merged[name] = max(merged.get(name, 0), lv)
-    # 按等级降序排列输出
-    sorted_names = sorted(merged.keys(), key=lambda n: merged[n], reverse=True)
-    return ' '.join(f'[粉丝团:{n} Lv{merged[n]}]' for n in sorted_names)
-
-
-def upsert_user(user_id, user_name, grade='', fans_club='', sec_uid='', avatar_url=''):
+def upsert_user(user_id, user_name, grade='', fans_club='', sec_uid='', avatar_url='', display_id=''):
     """更新或插入用户信息（财富等级、粉丝团、sec_uid、头像URL等）。线程安全。
 
     Args:
         user_id: 抖音用户数字 ID。
         user_name: 昵称。
         grade: 消费等级标签。
-        fans_club: 粉丝团标签（同名称保留最高等级）。
+        fans_club: 粉丝团标签。
         sec_uid: 抖音永久用户标识（~50位字符串），仅在非空时更新。
         avatar_url: 用户头像 URL，仅在非空时更新。
+        display_id: 抖音显示 ID（@ 号），仅在非空时更新。
     """
     if not user_id:
         return
     is_anon, anon_label = _detect_anonymous(user_name)
     conn = _get_conn()
-    # 合并粉丝团：保留已有数据中的最高等级
-    if fans_club:
-        existing = conn.execute('SELECT fans_club FROM users WHERE user_id = ?', (user_id,)).fetchone()
-        if existing and existing['fans_club']:
-            fans_club = _merge_fans_club_strings(existing['fans_club'], fans_club)
+
+    # 两步 API 解析：user_id → sec_uid → 真实昵称+头像
+    # 仅对可疑名称执行（神秘人、dou开头、含控制字符）
+    need_resolve = is_anon or (user_name and (user_name.lower().startswith('dou') or any(ord(c) < 32 for c in user_name)))
+    if need_resolve and user_id:
+        try:
+            from service.network import resolve_user_info
+            resolved = resolve_user_info(user_id)
+            if resolved and resolved.get('nickname'):
+                nick = resolved['nickname'].strip()
+                if nick and len(nick) >= 2 and not nick.startswith('神秘人'):
+                    user_name = nick
+                    # 同时更新头像和 sec_uid（API 返回的值更准确）
+                    if resolved.get('avatar_url'):
+                        avatar_url = resolved['avatar_url']
+                    if resolved.get('sec_uid'):
+                        sec_uid = resolved['sec_uid']
+        except Exception:
+            pass
+
     conn.execute('''
-        INSERT INTO users (user_id, user_name, grade, fans_club, sec_uid, avatar_url, is_anonymous, anonymous_label, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime("now", "+8 hours"))
+        INSERT INTO users (user_id, user_name, grade, fans_club, sec_uid, avatar_url, display_id, is_anonymous, anonymous_label, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime("now", "+8 hours"))
         ON CONFLICT(user_id) DO UPDATE SET
             user_name = CASE WHEN ? != '' THEN ? ELSE user_name END,
             grade = CASE WHEN ? != '' THEN ? ELSE grade END,
             fans_club = CASE WHEN ? != '' THEN ? ELSE fans_club END,
             sec_uid = CASE WHEN ? != '' THEN ? ELSE sec_uid END,
             avatar_url = CASE WHEN ? != '' THEN ? ELSE avatar_url END,
+            display_id = CASE WHEN ? != '' THEN ? ELSE display_id END,
             is_anonymous = CASE WHEN ? = 1 THEN 1 ELSE is_anonymous END,
             anonymous_label = CASE WHEN ? != '' THEN ? ELSE anonymous_label END,
             last_seen = datetime("now", "+8 hours")
-    ''', (user_id, user_name, grade, fans_club, sec_uid, avatar_url, is_anon, anon_label,
+    ''', (user_id, user_name, grade, fans_club, sec_uid, avatar_url, display_id, is_anon, anon_label,
           user_name, user_name,
           grade, grade,
           fans_club, fans_club,
           sec_uid, sec_uid,
           avatar_url, avatar_url,
+          display_id, display_id,
           is_anon, anon_label, anon_label))
     conn.commit()
 
@@ -2120,81 +2211,83 @@ def flush_to_sqlite(session_id):
     conn.commit()
 
 
-def record_chat(session_id, user_id, user_name, content, grade='', fans_club=''):
+# ── 批量写入缓冲区（线程隔离）──
+# 单条 commit 在高负载下（200+ msg/s）会导致 SQLite 写锁饥荒。
+# 改为缓冲批量提交：每 100 条或 500ms 刷新一次，减少 50x fsync。
+_local._gift_buf = []
+_local._chat_buf = []
+_local._buf_last_flush = 0
+
+def _flush_buffers(force=False):
+    """将当前线程的礼物/弹幕缓冲区批量写入 SQLite。"""
     conn = _get_conn()
-    conn.execute('INSERT OR IGNORE INTO chat_logs (session_id, user_id, user_name, content, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?)',
-                 (session_id, user_id, user_name, content, grade, fans_club))
-    conn.commit()
+    now = time.time()
+    last = getattr(_local, '_buf_last_flush', 0)
+    gifts = getattr(_local, '_gift_buf', [])
+    chats = getattr(_local, '_chat_buf', [])
+    # 触发条件：强制、超 500ms、或任一队列超 100 条
+    if not force and (now - last < 0.5) and len(gifts) < 100 and len(chats) < 100:
+        return
+    if not gifts and not chats:
+        return
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        if gifts:
+            conn.executemany(
+                'INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                gifts)
+            gifts.clear()
+        if chats:
+            conn.executemany(
+                'INSERT OR IGNORE INTO chat_logs (session_id, user_id, user_name, content, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?)',
+                chats)
+            chats.clear()
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        # 恢复数据到缓冲区（避免丢失）
+        if gifts:
+            _local._gift_buf = gifts + _local._gift_buf
+        if chats:
+            _local._chat_buf = chats + _local._chat_buf
+        logger.error(f"[DB] batch flush failed: {e} — data retained in buffer")
+    _local._buf_last_flush = time.time()
+
+
+def record_chat(session_id, user_id, user_name, content, grade='', fans_club=''):
+    buf = getattr(_local, '_chat_buf', None)
+    if buf is None:
+        _local._chat_buf = []
+        buf = _local._chat_buf
+    buf.append((session_id, user_id, user_name, content, grade, fans_club))
+    _flush_buffers()
 
 
 def record_gift(session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade='', fans_club=''):
-    """记录礼物（UNIQUE 约束防重复，parser.py 的 delta 去重配合使用）。"""
-    conn = _get_conn()
-    changes_before = conn.total_changes
-    # 兼容旧表：没有 grade/fans_club 列时静默忽略
+    """记录礼物（缓冲批量写入，减少 SQLite 写锁竞争）。"""
+    buf = getattr(_local, '_gift_buf', None)
+    if buf is None:
+        _local._gift_buf = []
+        buf = _local._gift_buf
+    buf.append((session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club))
+    _flush_buffers()
+
+
+def flush_all_buffers():
+    """强制刷新当前线程的所有缓冲区（在 collector stop 时调用）。"""
     try:
-        conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                     (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club))
-    except Exception as e:
-        logger.warning(f"[DB] record_gift 8-col insert failed: {e} | sid={session_id} uid={user_id} gift={gift_name}")
-        try:
-            conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total) VALUES (?, ?, ?, ?, ?, ?)',
-                         (session_id, user_id, user_name, gift_name, gift_count, diamond_total))
-        except Exception as e2:
-            logger.error(f"[DB] record_gift 6-col fallback also failed: {e2}")
-    changes_after = conn.total_changes
-    if changes_after == changes_before:
-        logger.debug(f"[DB] record_gift dedup: sid={session_id} uid={user_id} gift={gift_name} x{gift_count} dia={diamond_total}")
-    conn.commit()
+        _flush_buffers(force=True)
+    except Exception:
+        pass
+    # 强制结束所有待定 combo（在 collector stop 时调用）
+    try:
+        flush_combo_buffer()
+    except Exception:
+        pass
 _VALID_TIERS = {1000, 3000, 10000, 100000}
-
-
-def record_upgrade(session_id, user_id, user_name, upgrade_type, from_level, to_level, anchor_name=''):
-    """记录用户升级事件（财富等级/粉丝团），使用 INSERT OR IGNORE 防重复。
-    仅记录 from_level > 0 的真实升级（首次检测到的高等级不计为升级事件）。"""
-    if not user_id or not upgrade_type or to_level <= 0 or from_level <= 0:
-        return
-    try:
-        conn = _get_conn()
-        conn.execute(
-            'INSERT OR IGNORE INTO upgrade_logs (session_id, user_id, user_name, upgrade_type, from_level, to_level, anchor_name) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            (session_id or 0, user_id, user_name, upgrade_type, from_level, to_level, anchor_name)
-        )
-        conn.commit()
-    except Exception as e:
-        logger.debug(f"[DB] record_upgrade failed: {e}")
-
-
-def query_upgrades(upgrade_type='', session_id=None, min_level=0, anchor_name='', page=1, size=100):
-    """查询升级记录。"""
-    conn = _get_conn()
-    where = []
-    params = []
-    if upgrade_type:
-        where.append('u.upgrade_type = ?')
-        params.append(upgrade_type)
-    if session_id is not None:
-        where.append('u.session_id = ?')
-        params.append(session_id)
-    if min_level > 0:
-        where.append('u.to_level >= ?')
-        params.append(min_level)
-    if anchor_name:
-        where.append('u.anchor_name = ?')
-        params.append(anchor_name)
-
-    w = ' AND '.join(where) if where else '1=1'
-    total = conn.execute(f'SELECT COUNT(*) FROM upgrade_logs u WHERE {w}', params).fetchone()[0]
-    offset = (page - 1) * size
-    rows = conn.execute(f'''
-        SELECT u.*, COALESCE(usr.avatar_url, '') as avatar_url
-        FROM upgrade_logs u
-        LEFT JOIN users usr ON usr.user_id = u.user_id
-        WHERE {w}
-        ORDER BY u.id DESC LIMIT ? OFFSET ?
-    ''', params + [size, offset]).fetchall()
-    return {'upgrades': [dict(r) for r in rows], 'total': total, 'page': page}
-
 
 def _resolve_tier(threshold):
     """将 threshold 映射到已知 tier，若为 0 或非标准值则返回 None。"""
@@ -2203,21 +2296,10 @@ def _resolve_tier(threshold):
     return None
 
 
-def query_leaderboard(threshold=1000, period='session', page=1, size=100, session_id=None, year_month='', min_consume=0, anchor_name='', room_id=''):
+def query_leaderboard(threshold=1000, period='session', page=1, size=100, session_id=None, year_month='', min_consume=0, room_id=''):
     conn = _get_conn()
     offset = (page - 1) * size
     tier = _resolve_tier(threshold)
-
-    # 主播筛选（session 级别已锁定单场，无需重复过滤）
-    # 优先按 room_id 过滤（稳定数字 ID，避免 anchor_name 字符串编码问题）
-    anchor_filter = ''
-    anchor_params = ()
-    if room_id and period != 'session':
-        anchor_filter = 'AND s.room_id = ?'
-        anchor_params = (room_id,)
-    elif anchor_name and period != 'session':
-        anchor_filter = 'AND TRIM(s.anchor_name) = ?'
-        anchor_params = (anchor_name.strip(),)
 
     if period == 'session' and session_id:
         if tier is not None:
@@ -2230,8 +2312,13 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
                 where_extra = f'AND c.consume >= {int(threshold)}'
             total = conn.execute(f'SELECT COUNT(*) FROM contributions WHERE session_id = ? AND consume > 0', (session_id,)).fetchone()[0]
         rows = conn.execute(f'''
-            SELECT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name, c.consume,
-                   COALESCE(NULLIF(u.fans_club, ''), CASE WHEN s.anchor_name != '' THEN '[粉丝团:' || s.anchor_name || ']' ELSE '' END) AS fans_club,
+            SELECT c.user_id, c.user_name, c.consume,
+                   COALESCE(
+                       NULLIF(u.fans_club, ''),
+                       NULLIF(c.fans_club, ''),
+                       (SELECT fans_club FROM chat_logs WHERE user_id = c.user_id AND fans_club != '' ORDER BY id DESC LIMIT 1),
+                       ''
+                   ) AS fans_club,
                    COALESCE(
                        u.grade,
                        (SELECT grade FROM chat_logs WHERE user_id = c.user_id AND grade != '' ORDER BY id DESC LIMIT 1),
@@ -2242,7 +2329,6 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
                    1 AS sessions_count
             FROM contributions c
             LEFT JOIN users u ON u.user_id = c.user_id
-            JOIN sessions s ON s.id = c.session_id
             WHERE c.session_id = ? AND c.consume > 0 {where_extra}
             ORDER BY c.consume DESC LIMIT ? OFFSET ?
         ''', (session_id, size, offset)).fetchall()
@@ -2254,95 +2340,92 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
         return {'users': users_list, 'total': total, 'page': page}
     elif period == 'today':
         today = datetime.now().strftime('%Y-%m-%d')
-        having = 'HAVING SUM(c.consume) >= ?' if min_consume > 0 else ''
-        sessions_col_today = f'SUM(CASE WHEN c.consume >= {int(min_consume)} THEN 1 ELSE 0 END)' if min_consume > 0 else 'COUNT(DISTINCT c.session_id)'
+        room_where = 'AND s.room_id = ?' if room_id else ''
+        # threshold 控制上榜门槛：各session消费需 >= threshold 才算上榜一次
+        t = max(int(threshold), max(int(min_consume), 0))
+
         params_today = [today]
-        total_params = (today,)
-        if anchor_params:
-            params_today.extend(anchor_params)
-            total_params = total_params + anchor_params
-        if min_consume > 0:
-            params_today.append(min_consume)
-            total_params = total_params + (min_consume,)
-        params_today.extend([size, offset])
+        if room_id:
+            params_today.append(room_id)
+        params_today.extend([t, size, offset])
+
+        total_params = tuple([today] + ([room_id] if room_id else []) + [t])
+
         rows = conn.execute(f'''
-            SELECT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name, SUM(c.consume) AS consume,
+            SELECT c.user_id, c.user_name, SUM(c.consume) AS consume,
                    COALESCE(u.fans_club, '') AS fans_club,
                    COALESCE(u.grade, '') AS grade,
                    u.sec_uid, u.avatar_url, u.notes, u.tags,
-                   {sessions_col_today} AS sessions_count
+                   (SELECT COUNT(DISTINCT c2.session_id) FROM contributions c2
+                    JOIN sessions s2 ON c2.session_id = s2.id AND date(s2.start_time) = ?
+                    WHERE c2.user_id = c.user_id AND c2.consume >= ?) AS sessions_count
             FROM contributions c
             JOIN sessions s ON c.session_id = s.id AND date(s.start_time) = ?
             LEFT JOIN users u ON u.user_id = c.user_id
-            WHERE c.consume > 0 {anchor_filter}
-            GROUP BY c.user_id {having}
+            WHERE c.consume > 0 {room_where}
+            GROUP BY c.user_id
+            HAVING SUM(c.consume) >= ?
             ORDER BY consume DESC LIMIT ? OFFSET ?
-        ''', params_today).fetchall()
+        ''', (today, t, today, *params_today[1:])).fetchall()
         total = conn.execute(f'''
             SELECT COUNT(*) FROM (
                 SELECT c.user_id FROM contributions c
                 JOIN sessions s ON c.session_id = s.id AND date(s.start_time) = ?
-                WHERE c.consume > 0 {anchor_filter}
-                GROUP BY c.user_id {having}
+                WHERE c.consume > 0 {room_where} GROUP BY c.user_id HAVING SUM(c.consume) >= ?
             )
         ''', total_params).fetchone()[0]
     elif period == 'month':
         month = year_month or datetime.now().strftime('%Y-%m')
-        having = 'HAVING SUM(c.consume) >= ?' if min_consume > 0 else ''
-        sessions_col_month = f'SUM(CASE WHEN c.consume >= {int(min_consume)} THEN 1 ELSE 0 END)' if min_consume > 0 else 'COUNT(DISTINCT c.session_id)'
+        room_where = 'AND s.room_id = ?' if room_id else ''
+        t = max(int(threshold), max(int(min_consume), 0))
+
         params = [month]
-        total_params = (month,)
-        if anchor_params:
-            params.extend(anchor_params)
-            total_params = total_params + anchor_params
-        if min_consume > 0:
-            params.append(min_consume)
-            total_params = total_params + (min_consume,)
-        params.extend([size, offset])
+        if room_id:
+            params.append(room_id)
+        params.extend([t, size, offset])
+
+        total_params = tuple([month] + ([room_id] if room_id else []) + [t])
+
         rows = conn.execute(f'''
-            SELECT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name, SUM(c.consume) AS consume,
+            SELECT c.user_id, c.user_name, SUM(c.consume) AS consume,
                    COALESCE(u.fans_club, '') AS fans_club,
                    COALESCE(u.grade, '') AS grade,
                    u.sec_uid, u.avatar_url, u.notes, u.tags,
-                   {sessions_col_month} AS sessions_count
+                   (SELECT COUNT(DISTINCT c2.session_id) FROM contributions c2
+                    JOIN sessions s2 ON c2.session_id = s2.id AND strftime('%Y-%m', s2.start_time) = ?
+                    WHERE c2.user_id = c.user_id AND c2.consume >= ?) AS sessions_count
             FROM contributions c
             JOIN sessions s ON c.session_id = s.id AND strftime('%Y-%m', s.start_time) = ?
             LEFT JOIN users u ON u.user_id = c.user_id
-            WHERE c.consume > 0 {anchor_filter}
-            GROUP BY c.user_id {having}
+            WHERE c.consume > 0 {room_where}
+            GROUP BY c.user_id
+            HAVING SUM(c.consume) >= ?
             ORDER BY consume DESC LIMIT ? OFFSET ?
-        ''', params).fetchall()
+        ''', (month, t, month, *params[1:])).fetchall()
         total = conn.execute(f'''
             SELECT COUNT(*) FROM (
                 SELECT c.user_id FROM contributions c
                 JOIN sessions s ON c.session_id = s.id AND strftime('%Y-%m', s.start_time) = ?
-                WHERE c.consume > 0 {anchor_filter}
-                GROUP BY c.user_id {having}
+                WHERE c.consume > 0 {room_where} GROUP BY c.user_id HAVING SUM(c.consume) >= ?
             )
         ''', total_params).fetchone()[0]
     elif period == '30d':
         # 滚动 30 天：从 contributions + sessions 按时间窗口聚合
         # 上榜次数：按最低消费计算符合条件的场次数
-        if min_consume > 0:
-            sessions_col = f'SUM(CASE WHEN c.consume >= {int(min_consume)} THEN 1 ELSE 0 END)'
-        else:
-            sessions_col = 'COUNT(DISTINCT c.session_id)'
+        t = max(int(threshold), max(int(min_consume), 0))
+        sessions_col = f'SUM(CASE WHEN c.consume >= {int(t)} THEN 1 ELSE 0 END)'
 
-        where_extra_30 = ''
-        total_extra_30 = ''
+        room_where = 'AND s.room_id = ?' if room_id else ''
+
         params_30 = []
-        total_params_30 = []
-        if anchor_params:
-            params_30.extend(anchor_params)
-            total_params_30.extend(anchor_params)
-        if min_consume > 0:
-            where_extra_30 = 'AND SUM(c.consume) >= ?'
-            total_extra_30 = 'HAVING SUM(c.consume) >= ?'
-            params_30.append(min_consume)
-            total_params_30.append(min_consume)
+        if room_id:
+            params_30.append(room_id)
         params_30.extend([size, offset])
+
+        where_extra_30 = f'AND SUM(c.consume) >= {int(t)}' if t > 0 else ''
+
         rows = conn.execute(f'''
-            SELECT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name, SUM(c.consume) AS consume,
+            SELECT c.user_id, c.user_name, SUM(c.consume) AS consume,
                    COALESCE(
                        NULLIF(u.fans_club, ''),
                        (SELECT fans_club FROM chat_logs WHERE user_id = c.user_id AND fans_club != '' ORDER BY id DESC LIMIT 1),
@@ -2359,92 +2442,92 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
             JOIN sessions s ON c.session_id = s.id
             LEFT JOIN users u ON u.user_id = c.user_id
             WHERE s.start_time >= datetime('now', '-30 days')
-              AND c.consume > 0 {anchor_filter}
+              AND c.consume > 0 {room_where}
             GROUP BY c.user_id
             HAVING SUM(c.consume) > 0 {where_extra_30}
             ORDER BY consume DESC LIMIT ? OFFSET ?
         ''', params_30).fetchall()
+
+        total_params_30 = []
+        if room_id:
+            total_params_30.append(room_id)
+        total_extra_30 = ''
+        if min_consume > 0:
+            total_extra_30 = 'HAVING SUM(c.consume) >= ?'
+            total_params_30.append(min_consume)
         total = conn.execute(f'''
             SELECT COUNT(*) FROM (
                 SELECT c.user_id, SUM(c.consume) AS total_consume
                 FROM contributions c
                 JOIN sessions s ON c.session_id = s.id
-                WHERE s.start_time >= datetime('now', '-30 days') AND c.consume > 0 {anchor_filter}
+                WHERE s.start_time >= datetime('now', '-30 days') AND c.consume > 0 {room_where}
                 GROUP BY c.user_id
                 {total_extra_30}
             )
         ''', total_params_30).fetchone()[0]
     else:
         # 全部 / 指定月份：从 contributions 聚合
-        having = 'HAVING SUM(c.consume) >= ?' if min_consume > 0 else ''
+        room_where = 'AND s.room_id = ?' if room_id else ''
         month_filter = year_month if year_month else ''
-        sessions_col_all = f'SUM(CASE WHEN c.consume >= {int(min_consume)} THEN 1 ELSE 0 END)' if min_consume > 0 else 'COUNT(DISTINCT c.session_id)'
+        t = max(int(threshold), max(int(min_consume), 0))
 
         if month_filter:
             params_all = [month_filter]
-            if anchor_params:
-                params_all.extend(anchor_params)
-            if min_consume > 0:
-                params_all.append(min_consume)
-            params_all.extend([size, offset])
-            total_params_list = [month_filter]
-            if anchor_params:
-                total_params_list.extend(anchor_params)
-            if min_consume > 0:
-                total_params_list.append(min_consume)
-            total_params = tuple(total_params_list)
+            if room_id:
+                params_all.append(room_id)
+            params_all.extend([t, size, offset])
+            total_params = tuple(params_all[:3])
+
             rows = conn.execute(f'''
-                SELECT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name, SUM(c.consume) AS consume,
+                SELECT c.user_id, c.user_name, SUM(c.consume) AS consume,
                        COALESCE(u.fans_club, '') AS fans_club,
                        COALESCE(u.grade, '') AS grade,
                        u.sec_uid, u.avatar_url, u.notes, u.tags,
-                       {sessions_col_all} AS sessions_count
+                       (SELECT COUNT(DISTINCT c2.session_id) FROM contributions c2
+                        JOIN sessions s2 ON c2.session_id = s2.id AND strftime('%Y-%m', s2.start_time) = ?
+                        WHERE c2.user_id = c.user_id AND c2.consume >= ?) AS sessions_count
                 FROM contributions c
                 JOIN sessions s ON c.session_id = s.id AND strftime('%Y-%m', s.start_time) = ?
                 LEFT JOIN users u ON u.user_id = c.user_id
-                WHERE c.consume > 0 {anchor_filter}
-                GROUP BY c.user_id {having}
+                WHERE c.consume > 0 {room_where}
+                GROUP BY c.user_id HAVING SUM(c.consume) >= ?
                 ORDER BY consume DESC LIMIT ? OFFSET ?
-            ''', params_all).fetchall()
+            ''', (month_filter, t, month_filter, *params_all[1:])).fetchall()
             total = conn.execute(f'''
                 SELECT COUNT(*) FROM (
                     SELECT c.user_id FROM contributions c
                     JOIN sessions s ON c.session_id = s.id AND strftime('%Y-%m', s.start_time) = ?
-                    WHERE c.consume > 0 {anchor_filter}
-                    GROUP BY c.user_id {having}
+                    WHERE c.consume > 0 {room_where} GROUP BY c.user_id HAVING SUM(c.consume) >= ?
                 )
             ''', total_params).fetchone()[0]
         else:
             params_all = []
-            total_params_list = []
-            if anchor_params:
-                params_all.extend(anchor_params)
-                total_params_list.extend(anchor_params)
-            if min_consume > 0:
-                params_all.append(min_consume)
-                total_params_list.append(min_consume)
-            params_all.extend([size, offset])
-            total_params = tuple(total_params_list)
-            sessions_join_all = 'JOIN sessions s ON c.session_id = s.id' if anchor_params else ''
+            if room_id:
+                params_all.append(room_id)
+            params_all.extend([t, size, offset])
+            total_params = tuple(params_all[:2])
+
+            room_join = 'JOIN sessions s ON c.session_id = s.id' if room_id else ''
+
             rows = conn.execute(f'''
-                SELECT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name, SUM(c.consume) AS consume,
+                SELECT c.user_id, c.user_name, SUM(c.consume) AS consume,
                        COALESCE(u.fans_club, '') AS fans_club,
                        COALESCE(u.grade, '') AS grade,
                        u.sec_uid, u.avatar_url, u.notes, u.tags,
-                       {sessions_col_all} AS sessions_count
+                       (SELECT COUNT(DISTINCT c2.session_id) FROM contributions c2
+                        WHERE c2.user_id = c.user_id AND c2.consume >= ?) AS sessions_count
                 FROM contributions c
-                {sessions_join_all}
+                {room_join}
                 LEFT JOIN users u ON u.user_id = c.user_id
-                WHERE c.consume > 0 {anchor_filter}
-                GROUP BY c.user_id {having}
+                WHERE c.consume > 0 {room_where}
+                GROUP BY c.user_id HAVING SUM(c.consume) >= ?
                 ORDER BY consume DESC LIMIT ? OFFSET ?
-            ''', params_all).fetchall()
+            ''', (t, *params_all)).fetchall()
             total = conn.execute(f'''
                 SELECT COUNT(*) FROM (
                     SELECT c.user_id FROM contributions c
-                    {sessions_join_all}
-                    WHERE c.consume > 0 {anchor_filter}
-                    GROUP BY c.user_id {having}
+                    {room_join}
+                    WHERE c.consume > 0 {room_where} GROUP BY c.user_id HAVING SUM(c.consume) >= ?
                 )
             ''', total_params).fetchone()[0]
 
@@ -2534,12 +2617,13 @@ def query_user_detail(user_id):
     result['total_chats'] = total_chats
     result['sessions'] = []
 
-    # 补充财富等级和粉丝团（优先取 users 表，始终为最新合并值）
-    if latest_chat and latest_chat['grade']:
-        result['grade'] = latest_chat['grade']
+    # 补充财富等级和粉丝团（优先取最新弹幕中的值）
+    if latest_chat:
+        result['grade'] = latest_chat['grade'] or result.get('grade', '')
+        if latest_chat['fans_club']:
+            result['fans_club'] = latest_chat['fans_club']
     elif not result.get('grade'):
         result['grade'] = ''
-    # fans_club 以 users 表为准（已合并各消息类型并保留最高等级），不再用 chat_logs 覆盖
 
     for s in rows:
         sd = dict(s)
@@ -2640,7 +2724,7 @@ def query_chat(user_id='', keyword='', page=1, size=50):
 def query_anonymous(page=1, size=50, search=''):
     conn = _get_conn()
     offset = (page - 1) * size
-    where = "u.is_anonymous = 1 AND COALESCE(u.anonymous_label, '') != 'fake'"
+    where = 'u.is_anonymous = 1'
     params = []
     if search:
         where += ' AND (u.user_name LIKE ? OR u.user_id LIKE ?)'
@@ -2650,7 +2734,8 @@ def query_anonymous(page=1, size=50, search=''):
         SELECT u.user_id AS real_user_id, u.user_name,
                u.anonymous_label, u.grade, u.fans_club,
                COALESCE(SUM(c.consume), 0) AS consume,
-               COUNT(c.id) AS sessions_count, MAX(c.recorded_at) AS last_seen
+               COALESCE(SUM(CASE WHEN c.qualified_1000 = 1 THEN 1 ELSE 0 END), 0) AS sessions_count,
+               MAX(c.recorded_at) AS last_seen
         FROM users u LEFT JOIN contributions c ON c.user_id = u.user_id
         WHERE {where}
         GROUP BY u.user_id ORDER BY consume DESC LIMIT ? OFFSET ?
@@ -2742,8 +2827,13 @@ def query_session_detail(session_id, top_n=50):
 
     # 贡献用户 Top N（含粉丝团、财富等级、达标层级）
     top = conn.execute('''
-        SELECT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name, c.consume,
-               COALESCE(NULLIF(u.fans_club, ''), CASE WHEN s.anchor_name != '' THEN '[粉丝团:' || s.anchor_name || ']' ELSE '' END) AS fans_club,
+        SELECT c.user_id, c.user_name, c.consume,
+               COALESCE(
+                   NULLIF(u.fans_club, ''),
+                   NULLIF(c.fans_club, ''),
+                   (SELECT fans_club FROM chat_logs WHERE user_id = c.user_id AND fans_club != '' ORDER BY id DESC LIMIT 1),
+                   ''
+               ) AS fans_club,
                COALESCE(
                    u.grade,
                    (SELECT grade FROM chat_logs WHERE user_id = c.user_id AND grade != '' ORDER BY id DESC LIMIT 1),
@@ -2755,7 +2845,6 @@ def query_session_detail(session_id, top_n=50):
                (SELECT COUNT(*) FROM chat_logs WHERE session_id = c.session_id AND user_id = c.user_id) as chat_count
         FROM contributions c
         LEFT JOIN users u ON u.user_id = c.user_id
-        JOIN sessions s ON s.id = c.session_id
         WHERE c.session_id = ? AND c.consume > 0
         ORDER BY c.consume DESC LIMIT ?
     ''', (session_id, top_n)).fetchall()
@@ -2772,11 +2861,147 @@ def query_session_detail(session_id, top_n=50):
     return result
 
 
+# ── PK 回合 ──────────────────────────────────────
+
+def record_pk_round(session_id, data):
+    """记录 PK 回合到数据库。
+
+    Args:
+        session_id: 场次 ID。
+        data: PK 回合数据 dict（来自 _track_pk_round）。
+    """
+    if not session_id or not data:
+        return
+    try:
+        conn = _get_conn()
+        conn.execute('''
+            INSERT INTO pk_rounds (session_id, start_time, end_time, duration_sec, mode,
+                                   participants, participant_count, self_score, result)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            session_id,
+            data.get('start_time', ''),
+            data.get('end_time', ''),
+            data.get('duration_sec', 0),
+            data.get('mode', ''),
+            str(data.get('participants', '')),
+            data.get('participant_count', 0),
+            data.get('self_score', 0),
+            data.get('result', ''),
+        ))
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"[DB] record_pk_round failed: {e}")
+
+
+def query_pk_rounds(session_id=None, limit=50):
+    """查询 PK 回合列表（含主播名称）。
+
+    Args:
+        session_id: 可选，按场次筛选。
+        limit: 返回条数。
+
+    Returns:
+        list[dict]: PK 回合列表。
+    """
+    conn = _get_conn()
+    if session_id:
+        rows = conn.execute('''
+            SELECT p.*, COALESCE(s.anchor_name, '') as anchor_name,
+                   COALESCE(s.room_id, '') as room_id
+            FROM pk_rounds p
+            LEFT JOIN sessions s ON s.id = p.session_id
+            WHERE p.session_id = ? ORDER BY p.id DESC LIMIT ?
+        ''', (session_id, limit)).fetchall()
+    else:
+        rows = conn.execute('''
+            SELECT p.*, COALESCE(s.anchor_name, '') as anchor_name,
+                   COALESCE(s.room_id, '') as room_id
+            FROM pk_rounds p
+            LEFT JOIN sessions s ON s.id = p.session_id
+            ORDER BY p.id DESC LIMIT ?
+        ''', (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def query_pk_contributors(pk_start, pk_end, session_id=None):
+    """查询 PK 期间的贡献用户（从 gift_logs 按时间窗口匹配）。
+
+    Args:
+        pk_start: PK 开始时间字符串（如 "12:30:00"）。
+        pk_end: PK 结束时间字符串。
+        session_id: 可选，按场次筛选。
+
+    Returns:
+        list[dict]: 按贡献降序排列的用户列表。
+    """
+    conn = _get_conn()
+    if session_id:
+        rows = conn.execute('''
+            SELECT user_id, user_name, COUNT(*) as gift_count,
+                   SUM(gift_count) as total_count, SUM(diamond_total) as total_diamonds
+            FROM gift_logs
+            WHERE session_id = ? AND created_at >= ? AND created_at <= ?
+            GROUP BY user_id ORDER BY total_diamonds DESC LIMIT 50
+        ''', (session_id, pk_start, pk_end)).fetchall()
+    else:
+        rows = conn.execute('''
+            SELECT user_id, user_name, COUNT(*) as gift_count,
+                   SUM(gift_count) as total_count, SUM(diamond_total) as total_diamonds
+            FROM gift_logs
+            WHERE (created_at >= ? AND created_at <= ?)
+            GROUP BY user_id ORDER BY total_diamonds DESC LIMIT 50
+        ''', (pk_start, pk_end)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def query_pk_detail(pk_id):
+    """查询单个 PK 回合详情（含贡献榜）。
+
+    Args:
+        pk_id: PK 回合 ID。
+
+    Returns:
+        dict: PK 回合详情 + contributors 列表，或 None。
+    """
+    conn = _get_conn()
+    row = conn.execute('''
+        SELECT p.*, COALESCE(s.anchor_name, '') as anchor_name,
+               COALESCE(s.room_id, '') as room_id
+        FROM pk_rounds p
+        LEFT JOIN sessions s ON s.id = p.session_id
+        WHERE p.id = ?
+    ''', (pk_id,)).fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    # 查询贡献榜
+    if result.get('start_time') and result.get('end_time'):
+        sid = result.get('session_id')
+        start = result['start_time']
+        end = result['end_time']
+        # 需要将 start/end 拼成完整 datetime
+        # pk_rounds 存的是 "HH:MM:SS" 格式，需要从 session 获取日期
+        s_row = conn.execute(
+            "SELECT start_time FROM sessions WHERE id = ?", (sid,)
+        ).fetchone()
+        if s_row:
+            s_date = str(s_row['start_time'])[:10]  # "2026-06-26"
+            full_start = f"{s_date} {start}"
+            full_end = f"{s_date} {end}"
+            result['contributors'] = query_pk_contributors(full_start, full_end, sid)
+        else:
+            result['contributors'] = []
+    else:
+        result['contributors'] = []
+    return result
+
+
 def query_search(q, page=1, size=20):
     conn = _get_conn()
     offset = (page - 1) * size
     rows = conn.execute('''
-        SELECT DISTINCT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name,
+        SELECT DISTINCT c.user_id, c.user_name,
                COALESCE(m.total_consume, 0) as total_consume,
                COALESCE(m.sessions_1000, 0) as sessions_1000, c.fans_club,
                u.sec_uid, u.avatar_url
@@ -2788,7 +3013,7 @@ def query_search(q, page=1, size=20):
     ''', (q, size, offset)).fetchall()
     if not rows:
         rows = conn.execute('''
-            SELECT DISTINCT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name,
+            SELECT DISTINCT c.user_id, c.user_name,
                    COALESCE(m.total_consume, 0) as total_consume,
                    COALESCE(m.sessions_1000, 0) as sessions_1000, c.fans_club,
                    u.sec_uid, u.avatar_url
@@ -2801,154 +3026,118 @@ def query_search(q, page=1, size=20):
     return {'users': [dict(r) for r in rows], 'total': len(rows), 'page': page}
 
 
+# ── 消息完整性审计 ──────────────────────────────────
+
 def query_audit():
-    """审计诊断：去重健康、时间间隙、场次概览、损坏用户名检测。"""
+    """分析数据库中的消息完整性，检测数据丢失、时间间隙等。
+
+    Returns:
+        dict: 审计结果，包含总体统计、场次分析、间隙检测等。
+    """
     conn = _get_conn()
+    now = time.time()
     result = {}
 
-    # ── 1. 总体概览 ──
-    overview = conn.execute('''
-        SELECT
-            (SELECT COUNT(*) FROM gift_logs) AS total_gifts,
-            (SELECT COALESCE(SUM(diamond_total), 0) FROM gift_logs) AS total_diamond,
-            (SELECT COUNT(*) FROM chat_logs) AS total_chats,
-            (SELECT COUNT(*) FROM sessions) AS total_sessions,
-            (SELECT COUNT(DISTINCT user_id) FROM gift_logs) AS gift_users
-    ''').fetchone()
-    result['overview'] = dict(overview)
-
-    # ── 2. 去重健康状态 ──
-    dd = get_dedup_stats()
-    dd['reject_rate'] = round(dd['rejected'] / dd['raw'] * 100, 2) if dd['raw'] else 0
-    result['dedup'] = dd
-
-    # ── 3. 时间间隙检测（最近 10 场） ──
-    recent = conn.execute(
-        'SELECT id FROM gift_logs GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT 10'
-    ).fetchall()
-    all_gaps = []
-    max_gap = 0
-    total_lost = 0
-    gap_details = []
-    for row in recent:
-        times = conn.execute(
-            'SELECT created_at FROM gift_logs WHERE session_id = ? ORDER BY created_at',
-            (row['id'],)
-        ).fetchall()
-        for i in range(1, len(times)):
-            try:
-                prev = times[i-1]['created_at']
-                curr = times[i]['created_at']
-                if prev and curr:
-                    fmt = '%Y-%m-%d %H:%M:%S'
-                    ps = datetime.strptime(prev[:19], fmt)
-                    cs = datetime.strptime(curr[:19], fmt)
-                    gap = (cs - ps).total_seconds()
-                    if gap >= 5:
-                        all_gaps.append(gap)
-                        if gap > max_gap:
-                            max_gap = gap
-                        total_lost += gap
-                        if len(gap_details) < 10:
-                            gap_details.append({'from': prev[11:19], 'to': curr[11:19], 'gap': int(gap)})
-            except (ValueError, TypeError, KeyError):
-                pass
-    result['gaps'] = {
-        'total_gaps': len(all_gaps),
-        'max_gap_sec': int(max_gap),
-        'total_lost_sec': int(total_lost),
-        'details': gap_details,
+    # 1. 总体统计
+    total_gifts = conn.execute('SELECT COUNT(*) FROM gift_logs').fetchone()[0]
+    total_chats = conn.execute('SELECT COUNT(*) FROM chat_logs').fetchone()[0]
+    total_sessions = conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0]
+    total_users = conn.execute('SELECT COUNT(DISTINCT user_id) FROM gift_logs').fetchone()[0]
+    total_diamonds = conn.execute('SELECT COALESCE(SUM(diamond_total), 0) FROM gift_logs').fetchone()[0]
+    result['overview'] = {
+        'total_gifts': total_gifts,
+        'total_chats': total_chats,
+        'total_sessions': total_sessions,
+        'total_users': total_users,
+        'total_diamonds': total_diamonds,
     }
 
-    # ── 4. 场次详情（最近 50 场） ──
+    # 2. 场次列表（含礼物数、弹幕数、流失估计）
     sessions = conn.execute('''
         SELECT s.id, s.anchor_name, s.start_time, s.end_time, s.status,
-               COALESCE(g.gift_cnt, 0) AS gift_cnt,
-               COALESCE(g.diamond_sum, 0) AS diamond_sum,
-               COALESCE(g.user_cnt, 0) AS user_cnt,
-               COALESCE(c.chat_cnt, 0) AS chat_cnt
-        FROM sessions s
-        LEFT JOIN (
-            SELECT session_id,
-                   COUNT(*) AS gift_cnt,
-                   SUM(diamond_total) AS diamond_sum,
-                   COUNT(DISTINCT user_id) AS user_cnt
-            FROM gift_logs GROUP BY session_id
-        ) g ON g.session_id = s.id
-        LEFT JOIN (
-            SELECT session_id, COUNT(*) AS chat_cnt
-            FROM chat_logs GROUP BY session_id
-        ) c ON c.session_id = s.id
-        ORDER BY s.id DESC LIMIT 50
+               (SELECT COUNT(*) FROM gift_logs WHERE session_id = s.id) as gift_count,
+               (SELECT COUNT(*) FROM chat_logs WHERE session_id = s.id) as chat_count,
+               (SELECT COUNT(DISTINCT user_id) FROM contributions WHERE session_id = s.id) as user_count
+        FROM sessions s ORDER BY s.id DESC LIMIT 50
     ''').fetchall()
     session_list = []
-    for r in sessions:
-        d = dict(r)
-        dur = 0
-        try:
-            if d['start_time'] and d['end_time']:
-                sd = datetime.strptime(d['start_time'][:19], '%Y-%m-%d %H:%M:%S')
-                ed = datetime.strptime(d['end_time'][:19], '%Y-%m-%d %H:%M:%S')
-                dur = max(1, (ed - sd).total_seconds() / 3600)
-        except (ValueError, TypeError):
-            dur = 1
-        d['gifts_per_hour'] = round(d['gift_cnt'] / dur) if dur > 0 else 0
-        session_list.append(d)
+    for s in sessions:
+        sd = dict(s)
+        # 计算采集时长（秒）
+        if sd['start_time']:
+            try:
+                st = datetime.strptime(str(sd['start_time'])[:19], '%Y-%m-%d %H:%M:%S')
+                if sd['end_time']:
+                    et = datetime.strptime(str(sd['end_time'])[:19], '%Y-%m-%d %H:%M:%S')
+                    sd['duration_sec'] = int((et - st).total_seconds())
+                else:
+                    sd['duration_sec'] = int((datetime.now() - st).total_seconds())
+            except Exception:
+                sd['duration_sec'] = 0
+        else:
+            sd['duration_sec'] = 0
+        sd['gifts_per_hour'] = round(sd['gift_count'] / max(sd['duration_sec'] / 3600, 0.01), 1)
+        session_list.append(sd)
     result['sessions'] = session_list
 
-    # ── 5. 异常用户名检测 ──
-    bad = conn.execute('''
-        SELECT user_id, user_name FROM users
-        WHERE user_name LIKE '2@%'
-           OR instr(user_name, x'02') > 0
-           OR instr(user_name, x'03') > 0
-        LIMIT 50
+    # 3. 时间间隙检测：检查每场次的消息间隔
+    gaps = []
+    gap_sessions = conn.execute('''
+        SELECT id, anchor_name, start_time, end_time FROM sessions ORDER BY id DESC LIMIT 10
     ''').fetchall()
-    result['bad_usernames'] = [dict(r) for r in bad]
+    for s in gap_sessions:
+        sid = s['id']
+        times = conn.execute('''
+            SELECT created_at FROM gift_logs WHERE session_id = ? ORDER BY id ASC
+        ''', (sid,)).fetchall()
+        if len(times) < 2:
+            continue
+        prev = None
+        session_gaps = []
+        for t in times:
+            curr = str(t['created_at'])
+            if prev:
+                try:
+                    pt = datetime.strptime(str(prev)[:19], '%Y-%m-%d %H:%M:%S')
+                    ct = datetime.strptime(str(curr)[:19], '%Y-%m-%d %H:%M:%S')
+                    gap_sec = int((ct - pt).total_seconds())
+                    if gap_sec >= 5:
+                        session_gaps.append({'from': str(prev)[11:19], 'to': str(curr)[11:19], 'gap': gap_sec})
+                except Exception:
+                    pass
+            prev = curr
+        if session_gaps:
+            gaps.append({
+                'session_id': sid,
+                'anchor': s['anchor_name'] or str(sid),
+                'total_gaps': len(session_gaps),
+                'max_gap': max(g['gap'] for g in session_gaps),
+                'total_gap_seconds': sum(g['gap'] for g in session_gaps),
+                'gaps': session_gaps[:10],  # 只展示前10个间隙
+            })
+    result['gaps'] = gaps
 
-    # ── 6. 匿名用户解析率 ──
-    anon_total = conn.execute('''
-        SELECT COUNT(*) as total FROM users WHERE is_anonymous = 1
-    ''').fetchone()['total']
-    anon_resolved = conn.execute('''
-        SELECT COUNT(*) as total FROM users
-        WHERE is_anonymous = 1 AND user_name != anonymous_label AND anonymous_label != ''
-    ''').fetchone()['total']
-    anon_by_type = conn.execute('''
-        SELECT
-            SUM(CASE WHEN anonymous_label LIKE '神秘人%' THEN 1 ELSE 0 END) AS mystic,
-            SUM(CASE WHEN anonymous_label LIKE 'dou%' THEN 1 ELSE 0 END) AS dou_prefix
-        FROM users WHERE is_anonymous = 1
-    ''').fetchone()
-    result['anonymous'] = {
-        'total': anon_total,
-        'resolved': anon_resolved,
-        'unresolved': anon_total - anon_resolved,
-        'resolve_rate': round(anon_resolved / anon_total * 100, 1) if anon_total else 0,
-        'mystic': anon_by_type['mystic'] if anon_by_type else 0,
-        'dou_prefix': anon_by_type['dou_prefix'] if anon_by_type else 0,
+    # 4. 去重健康状态
+    dd = get_dedup_stats()
+    reject_rate = round(dd['rejected'] / max(dd['raw'], 1) * 100, 2)
+    result['dedup_health'] = {
+        'raw': dd['raw'],
+        'passed': dd['passed'],
+        'rejected': dd['rejected'],
+        'reject_rate': reject_rate,
+        'delta_zero': dd['delta_zero'],
+        'out_of_order': dd['out_of_order'],
+        'combo_block': dd['combo_block'],
+        'rc1_dup': dd['rc1_dup'],
+        'counter_reset': dd['counter_reset'],
     }
 
-    # ── 7. 每场去重分析（最近 20 场） ──
-    dedup_sessions = conn.execute('''
-        SELECT
-            g.session_id,
-            s.anchor_name,
-            COUNT(*) AS raw_rows,
-            COUNT(DISTINCT g.user_id || ':' || g.gift_name || ':' || g.diamond_total) AS unique_events,
-            SUM(g.diamond_total) AS diamond_sum,
-            COUNT(DISTINCT g.user_id) AS user_cnt
-        FROM gift_logs g
-        JOIN sessions s ON s.id = g.session_id
-        GROUP BY g.session_id
-        ORDER BY g.session_id DESC LIMIT 20
+    # 5. 异常检测：可疑的用户名（含控制字符）
+    bad_names = conn.execute('''
+        SELECT user_id, user_name FROM users
+        WHERE user_name LIKE '2@%' OR instr(user_name, x'02') > 0 OR instr(user_name, x'03') > 0
+        LIMIT 20
     ''').fetchall()
-    dedup_list = []
-    for r in dedup_sessions:
-        d = dict(r)
-        raw = max(d['raw_rows'], 1)
-        d['dup_rate'] = round((1 - d['unique_events'] / raw) * 100, 1)
-        dedup_list.append(d)
-    result['dedup_sessions'] = dedup_list
+    result['corrupted_names'] = [dict(r) for r in bad_names]
 
     return result

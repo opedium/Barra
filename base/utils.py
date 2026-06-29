@@ -400,37 +400,48 @@ def fmt_fans_club(user):
 
     Returns:
         粉丝团标签字符串，多个以空格分隔。格式为：
-        '[粉丝团:名称 Lv等级]' 或 '[粉丝团:本主播 Lv等级]'，
+        '[粉丝团:名称 Lv等级]'，当前主播的粉丝团排在首位，
         无粉丝团时返回空字符串。
     """
     try:
-        clubs = []
+        all_clubs = []
         host = _get_anchor_name()
-        # 主粉丝团 (data)
+
+        def _fmt(name, level):
+            return f"[粉丝团:{name} Lv{level}]"
+
+        # 收集所有粉丝团（去重，保留最高等级）
+        seen = {}  # club_name → fmt_string
         data = user.fans_club.data
         if data and data.level > 0:
-            if data.club_name:
-                clubs.append(f"[粉丝团:{data.club_name} Lv{data.level}]")
-            elif host:
-                clubs.append(f"[粉丝团:{host} Lv{data.level}]")
-            else:
-                clubs.append(f"[粉丝团 Lv{data.level}]")
-        # 附加粉丝团 (prefer_data map) — proto-plus MapField 不支持 .items()
+            cn = data.club_name or host or ''
+            if cn:
+                seen[cn] = seen.get(cn, _fmt(cn, data.level))
         pd = getattr(user.fans_club, 'prefer_data', None)
         if pd:
             try:
-                # proto-plus MapField: iterate keys, get values by key
                 keys = list(pd.keys()) if hasattr(pd, 'keys') else []
                 for key in keys:
                     club = pd.get(key) if hasattr(pd, 'get') else pd[key]
                     if club and club.level > 0 and club.club_name:
-                        # 避免重复（同一 club_name 只保留最高等级）
-                        existing = [c for c in clubs if club.club_name in c]
-                        if not existing:
-                            clubs.append(f"[粉丝团:{club.club_name} Lv{club.level}]")
+                        extant = seen.get(club.club_name)
+                        if not extant:
+                            seen[club.club_name] = _fmt(club.club_name, club.level)
+                        else:
+                            # 同名称保留最高等级
+                            import re as _re
+                            m = _re.search(r'Lv(\d+)', extant)
+                            if m and int(m.group(1)) < club.level:
+                                seen[club.club_name] = _fmt(club.club_name, club.level)
             except (AttributeError, TypeError):
                 pass
-        return ' '.join(clubs)
+
+        # 按顺序输出：当前主播的粉丝团排首位，其余保持稳定
+        all_clubs = list(seen.values())
+        host_entry = seen.pop(host, None) if host else None
+        if host_entry:
+            all_clubs = [host_entry] + [v for v in all_clubs if v != host_entry]
+        return ' '.join(all_clubs)
     except (AttributeError, TypeError):
         pass
     return ''

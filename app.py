@@ -318,6 +318,8 @@ class StreamerManager:
                     'running': info['status'] == 'collecting',
                     'status': info['status'],
                     'message_count': info.get('message_count', 0),
+                    'message_rate': info.get('message_rate', 0),
+                    'by_type': info.get('by_type', {}),
                     'live_status': info.get('live_status', 0),
                     'room_id': info.get('room_id', ''),
                     'uptime_seconds': info.get('uptime_seconds', 0),
@@ -392,6 +394,26 @@ class StreamerManager:
             ids = list(self._instances.keys())
         for lid in ids:
             self.stop_streamer(lid)
+
+
+# ── Collection Stats API ──
+
+@app.route('/api/collection-stats')
+@require_auth
+def api_collection_stats():
+    """返回当前采集中的实时消息速率。"""
+    statuses = _manager.get_all_status()
+    live = [s for s in statuses if s.get('running')]
+    return jsonify({
+        'active_collectors': len(live),
+        'streamers': [{
+            'anchor_name': s.get('anchor_name'),
+            'message_count': s.get('message_count', 0),
+            'message_rate': s.get('message_rate', 0),
+            'uptime_seconds': s.get('uptime_seconds', 0),
+            'by_type': s.get('by_type', {}),
+        } for s in live],
+    })
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -682,6 +704,25 @@ def api_audit():
     return jsonify(_qa())
 
 
+# ── 升级记录 ──
+
+@app.route('/upgrades')
+@require_auth
+def upgrades():
+    return render_template('upgrades.html', auth_enabled=bool(_web_config['password']))
+
+
+@app.route('/api/upgrades')
+@require_auth
+def api_upgrades():
+    from base.parser import query_upgrades
+    upgrade_type = request.args.get('type', '')
+    session_id = request.args.get('session_id', type=int)
+    min_level = request.args.get('min_level', 0, type=int)
+    page = request.args.get('page', 1, type=int)
+    return jsonify(query_upgrades(upgrade_type=upgrade_type, session_id=session_id, min_level=min_level, page=page))
+
+
 @app.route('/session/<int:session_id>')
 @require_auth
 def session_detail(session_id):
@@ -803,6 +844,12 @@ def logout():
 
 
 # ── API ──
+
+@app.route('/leaderboard')
+@require_auth
+def leaderboard():
+    return render_template('leaderboard.html', auth_enabled=bool(_web_config['password']))
+
 
 @app.route('/api/leaderboard')
 def api_leaderboard():
@@ -1109,6 +1156,61 @@ def api_anonymous():
         request.args.get('search', '')))
 
 
+@app.route('/api/anonymous/resolve', methods=['POST'])
+@require_auth
+def api_anonymous_resolve():
+    """批量解析所有未解决的匿名用户。"""
+    from base.parser import _get_conn
+    from service.network import fetch_user_info, fetch_user_info_by_unique_id
+    import re as _re
+    conn = _get_conn()
+    users = conn.execute("""
+        SELECT user_id, user_name FROM users
+        WHERE is_anonymous = 1 AND (user_name LIKE 'dou%' OR user_name LIKE '神秘人%')
+        ORDER BY last_seen DESC
+    """).fetchall()
+    import time
+    resolved = 0
+    failed = 0
+    for u in users:
+        uid = u['user_id']
+        try:
+            if _re.match(r'dou\d+$', uid, _re.IGNORECASE):
+                info = fetch_user_info_by_unique_id(uid)
+            else:
+                info = fetch_user_info(uid)
+            if info and info.get('nickname'):
+                nick = info['nickname']
+                if not nick.startswith('神秘人') and not _re.match(r'dou\d+$', nick, _re.IGNORECASE):
+                    resolved_id = info.get('user_id', uid)
+                    sec = info.get('sec_uid', '')
+                    avatar = info.get('avatar_url', '')
+                    conn.execute(
+                        'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0, anonymous_label = "" WHERE user_id = ?',
+                        (nick, sec, sec, avatar, avatar, uid)
+                    )
+                    if resolved_id and resolved_id != uid:
+                        conn.execute(
+                            'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0, anonymous_label = "" WHERE user_id = ?',
+                            (nick, sec, sec, avatar, avatar, resolved_id)
+                        )
+                    conn.commit()
+                    resolved += 1
+                    continue
+            # API 返回空（用户不存在）+ 无贡献 → 假用户（如订阅垃圾ID），移出匿名统计
+            has_consume = conn.execute('SELECT COUNT(*) FROM contributions WHERE user_id = ?', (uid,)).fetchone()[0]
+            if has_consume == 0:
+                conn.execute('UPDATE users SET is_anonymous = 0, anonymous_label = "fake" WHERE user_id = ?', (uid,))
+                conn.commit()
+                resolved += 1  # 算作"已处理"
+                continue
+            failed += 1
+        except Exception:
+            failed += 1
+        time.sleep(2.5)
+    return jsonify({'resolved': resolved, 'failed': failed, 'total': len(users)})
+
+
 @app.route('/api/million')
 def api_million():
     return jsonify(query_million(
@@ -1132,7 +1234,7 @@ def api_million_csv():
 @app.route('/api/sessions')
 def api_sessions():
     anchor = request.args.get('anchor', '')
-    limit = request.args.get('limit', 20, type=int)
+    limit = request.args.get('limit', 9999, type=int)
     return jsonify(query_sessions(limit=limit, anchor=anchor))
 
 @app.route('/api/sessions/<int:session_id>')

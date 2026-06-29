@@ -37,7 +37,7 @@ network:
   http_timeout: 15               # HTTP 超时（秒），超时后自动 ×1.5，封顶 60s，最多重试 3 次
   ws_connect_timeout: 30         # WebSocket 底层 socket 超时（秒）
   silence_timeout: 60            # 看门狗静默阈值（秒），超过则判定断连并重连
-  user_msg_timeout: 120          # 用户互动消息静默阈值（秒），无弹幕/礼物/点赞时重连
+  user_msg_timeout: 30           # 用户互动消息静默阈值（秒），无弹幕/礼物/点赞时重连
   heartbeat_interval: 10         # 心跳间隔（秒）
   rcvbuf_kb: 1024                # 接收缓冲区（KB），高流量直播间建议 1024
   proxy: null                    # 代理地址，如 {"http": "http://127.0.0.1:8080", "https": "socks5://127.0.0.1:1080"}

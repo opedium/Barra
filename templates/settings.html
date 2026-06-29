@@ -319,36 +319,8 @@
         <div class="cookie-meta" id="cookie-meta-text"></div>
     </div>
 
-    <!-- Mode tabs -->
-    <div class="cookie-mode-tabs">
-        <span class="cookie-mode-tab active" data-mode="qr" onclick="switchCookieMode('qr')">扫码登录</span>
-        <span class="cookie-mode-tab" data-mode="manual" onclick="switchCookieMode('manual')">手动输入</span>
-    </div>
-
-    <!-- QR Code Panel -->
-    <div class="cookie-panel active" id="cookie-panel-qr">
-        <div id="qr-ready" style="text-align:center;padding:8px 0;">
-            <button class="btn-cookie" id="btn-start-qr" onclick="startQrLogin()">开始扫码登录</button>
-            <div class="cookie-hint">启动浏览器获取抖音登录二维码，使用抖音 APP 扫码即可</div>
-        </div>
-        <div id="qr-active" style="display:none;">
-            <div class="qr-container">
-                <img id="qr-image" src="" alt="抖音登录二维码">
-                <div class="qr-status-text" id="qr-status-msg">等待扫码…</div>
-                <div class="qr-timer" id="qr-timer-text"></div>
-            </div>
-            <div class="qr-actions">
-                <button class="btn-cookie-outline" onclick="cancelQrLogin()">取消</button>
-            </div>
-        </div>
-        <div id="qr-result" style="display:none;text-align:center;padding:12px 0;">
-            <div id="qr-result-msg" style="font-size:13px;margin-bottom:10px;"></div>
-            <button class="btn-cookie" onclick="resetQrPanel()">重新开始</button>
-        </div>
-    </div>
-
-    <!-- Manual Input Panel -->
-    <div class="cookie-panel" id="cookie-panel-manual">
+    <!-- Manual Input Panel (仅保留此面板) -->
+    <div class="cookie-panel active" id="cookie-panel-manual">
         <textarea class="cookie-textarea" id="cookie-input"
             placeholder="从浏览器导出 Cookie 粘贴到此处&#10;支持格式：name1=value1; name2=value2 或 Netscape cookie jar"></textarea>
         <div class="cookie-hint">
@@ -514,9 +486,7 @@ function escHtml(s) {
 
 /* ── Cookie Management ── */
 
-var _qrToken = null;
-var _qrTimer = null;
-var _qrDeadline = 0;
+/* QR login removed */
 
 function cookieDotClass(status) {
     if (status === 'active') return 'green';
@@ -562,121 +532,6 @@ function switchCookieMode(mode) {
     document.querySelectorAll('.cookie-panel').forEach(function(p) {
         p.classList.toggle('active', p.id === 'cookie-panel-' + mode);
     });
-    if (mode === 'qr') {
-        resetQrPanel();
-    }
-}
-
-function startQrLogin() {
-    var btn = document.getElementById('btn-start-qr');
-    btn.disabled = true;
-    btn.textContent = '启动中…';
-
-    fetch('/api/cookie-login/qr', { method: 'POST' })
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-            if (!d.success) {
-                showToast(d.message, 'error');
-                btn.disabled = false;
-                btn.textContent = '开始扫码登录';
-                return;
-            }
-            _qrToken = d.token;
-            _qrDeadline = Date.now() + d.timeout_seconds * 1000;
-
-            document.getElementById('qr-ready').style.display = 'none';
-            document.getElementById('qr-active').style.display = 'block';
-            document.getElementById('qr-result').style.display = 'none';
-            document.getElementById('qr-image').src = 'data:image/png;base64,' + d.qr_base64;
-            document.getElementById('qr-status-msg').textContent = '请使用抖音 APP 扫描二维码';
-            document.getElementById('qr-timer-text').textContent = '';
-
-            pollQrStatus();
-            updateQrTimer();
-            _qrTimer = setInterval(function() {
-                pollQrStatus();
-                updateQrTimer();
-            }, 3000);
-        })
-        .catch(function(err) {
-            showToast('网络请求失败: ' + err.message, 'error');
-            btn.disabled = false;
-            btn.textContent = '开始扫码登录';
-        });
-}
-
-function pollQrStatus() {
-    if (!_qrToken) return;
-    fetch('/api/cookie-login/' + _qrToken + '/status')
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-            if (d.status === 'success') {
-                stopQrPolling();
-                showQrResult(true, '登录成功！Cookie 已保存' +
-                    (d.cookie_info ? '（' + d.cookie_info.cookie_count + ' 项）' : ''));
-                refreshCookieStatus();
-            } else if (d.status === 'timeout') {
-                stopQrPolling();
-                showQrResult(false, '扫码超时，二维码已失效，请重新开始');
-            } else if (d.status === 'failed') {
-                stopQrPolling();
-                showQrResult(false, d.message);
-            } else if (d.status === 'cancelled') {
-                stopQrPolling();
-                resetQrPanel();
-            } else {
-                document.getElementById('qr-status-msg').textContent = d.message || '等待扫码…';
-            }
-        })
-        .catch(function() {});
-}
-
-function updateQrTimer() {
-    if (!_qrDeadline) return;
-    var remaining = Math.max(0, Math.floor((_qrDeadline - Date.now()) / 1000));
-    var min = Math.floor(remaining / 60);
-    var sec = remaining % 60;
-    document.getElementById('qr-timer-text').textContent =
-        '剩余时间 ' + min + ':' + (sec < 10 ? '0' : '') + sec;
-    if (remaining <= 0) {
-        stopQrPolling();
-        showQrResult(false, '扫码超时，二维码已失效，请重新开始');
-    }
-}
-
-function stopQrPolling() {
-    if (_qrTimer) { clearInterval(_qrTimer); _qrTimer = null; }
-    _qrDeadline = 0;
-}
-
-function showQrResult(success, msg) {
-    document.getElementById('qr-active').style.display = 'none';
-    document.getElementById('qr-result').style.display = 'block';
-    var el = document.getElementById('qr-result-msg');
-    el.textContent = msg;
-    el.style.color = success ? 'var(--success)' : 'var(--danger)';
-}
-
-function resetQrPanel() {
-    stopQrPolling();
-    _qrToken = null;
-    document.getElementById('qr-ready').style.display = 'block';
-    document.getElementById('qr-active').style.display = 'none';
-    document.getElementById('qr-result').style.display = 'none';
-    var btn = document.getElementById('btn-start-qr');
-    btn.disabled = false;
-    btn.textContent = '开始扫码登录';
-    document.getElementById('qr-image').src = '';
-    refreshCookieStatus();
-}
-
-function cancelQrLogin() {
-    if (_qrToken) {
-        fetch('/api/cookie-login/' + _qrToken + '/cancel', { method: 'POST' })
-            .catch(function() {});
-    }
-    stopQrPolling();
-    resetQrPanel();
 }
 
 function manualSaveCookie() {

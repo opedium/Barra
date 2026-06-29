@@ -19,6 +19,51 @@
         </div>
     </div>
 
+    <!-- 1.5 Live Collection -->
+    <div class="audit-section">
+        <h3>⚡ 实时采集 <span class="badge badge-blue" style="font-weight:400;" id="live-badge">状态</span></h3>
+        <div id="live-stats" style="padding:8px 0;">
+            <div class="text-muted">加载中...</div>
+        </div>
+    </div>
+
+    <script>
+    function refreshLiveStats() {
+        fetch('/api/collection-stats')
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                var el = document.getElementById('live-stats');
+                var badge = document.getElementById('live-badge');
+                if (!d.active_collectors) {
+                    el.innerHTML = '<div class="text-muted">暂无活跃采集</div>';
+                    badge.textContent = '未采集';
+                    badge.className = 'badge badge-amber';
+                    return;
+                }
+                badge.textContent = d.active_collectors + ' 个采集器';
+                badge.className = 'badge badge-green';
+                var html = '';
+                d.streamers.forEach(function(s) {
+                    var types = '';
+                    if (s.by_type) {
+                        var top = Object.entries(s.by_type).sort(function(a,b){return b[1]-a[1];}).slice(0,5);
+                        types = ' [' + top.map(function(t){return t[0]+':'+t[1];}).join(', ') + ']';
+                    }
+                    html += '<div class="stats-row" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));">'
+                        + '<div class="stat-card"><div class="num" style="font-size:18px;">' + s.message_count + '</div><div class="label">消息</div></div>'
+                        + '<div class="stat-card" style="border-color:#06b6d4;"><div class="num" style="font-size:18px;color:#06b6d4;">' + s.message_rate + '</div><div class="label">条/秒</div></div>'
+                        + '<div class="stat-card"><div class="num" style="font-size:18px;">' + Math.floor(s.uptime_seconds/60) + 'm</div><div class="label">采集时长</div></div>'
+                        + '<div class="stat-card" style="grid-column:1/-1;background:var(--bg);"><div class="label" style="font-size:11px;">' + (s.anchor_name || '') + types + '</div></div>'
+                        + '</div>';
+                });
+                el.innerHTML = html;
+            })
+            .catch(function() {});
+    }
+    refreshLiveStats();
+    setInterval(refreshLiveStats, 3000);
+    </script>
+
     <!-- 2. Dedup Health -->
     <div class="audit-section">
         <h3>🔄 去重健康状态</h3>
