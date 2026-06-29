@@ -2034,39 +2034,33 @@ def upsert_user(user_id, user_name, grade='', fans_club='', sec_uid='', avatar_u
     if not user_id:
         return
     is_anon, anon_label = _detect_anonymous(user_name)
-    conn = _get_conn()
-    # 合并粉丝团：保留已有数据中的最高等级
-    if fans_club:
-        existing = conn.execute('SELECT fans_club FROM users WHERE user_id = ?', (user_id,)).fetchone()
-        if existing and existing['fans_club']:
-            fans_club = _merge_fans_club_strings(existing['fans_club'], fans_club)
-    conn.execute('''
-        INSERT INTO users (user_id, user_name, grade, fans_club, sec_uid, avatar_url, is_anonymous, anonymous_label, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime("now", "+8 hours"))
-        ON CONFLICT(user_id) DO UPDATE SET
-            user_name = CASE WHEN ? != '' THEN ? ELSE user_name END,
-            grade = CASE WHEN ? != '' THEN ? ELSE grade END,
-            fans_club = CASE WHEN ? != '' THEN ? ELSE fans_club END,
-            sec_uid = CASE WHEN ? != '' THEN ? ELSE sec_uid END,
-            avatar_url = CASE WHEN ? != '' THEN ? ELSE avatar_url END,
-            is_anonymous = CASE WHEN ? = 1 THEN 1 ELSE is_anonymous END,
-            anonymous_label = CASE WHEN ? != '' THEN ? ELSE anonymous_label END,
-            last_seen = datetime("now", "+8 hours")
-    ''', (user_id, user_name, grade, fans_club, sec_uid, avatar_url, is_anon, anon_label,
-          user_name, user_name,
-          grade, grade,
+    with _db_write_lock:
+        conn = _get_conn()
+        if fans_club:
+            existing = conn.execute('SELECT fans_club FROM users WHERE user_id = ?', (user_id,)).fetchone()
+            if existing and existing['fans_club']:
+                fans_club = _merge_fans_club_strings(existing['fans_club'], fans_club)
+        conn.execute('''
+            INSERT INTO users (user_id, user_name, grade, fans_club, sec_uid, avatar_url, is_anonymous, anonymous_label, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime("now", "+8 hours"))
+            ON CONFLICT(user_id) DO UPDATE SET
+                user_name = CASE WHEN ? != '' THEN ? ELSE user_name END,
+                grade = CASE WHEN ? != '' THEN ? ELSE grade END,
+                fans_club = CASE WHEN ? != '' THEN ? ELSE fans_club END,
+                sec_uid = CASE WHEN ? != '' THEN ? ELSE sec_uid END,
+                avatar_url = CASE WHEN ? != '' THEN ? ELSE avatar_url END,
+                is_anonymous = CASE WHEN ? = 1 THEN 1 ELSE is_anonymous END,
+                anonymous_label = CASE WHEN ? != '' THEN ? ELSE anonymous_label END,
+                last_seen = datetime("now", "+8 hours")
+        ''', (user_id, user_name, grade, fans_club, sec_uid, avatar_url, is_anon, anon_label,
+              user_name, user_name,
+              grade, grade,
           fans_club, fans_club,
           sec_uid, sec_uid,
           avatar_url, avatar_url,
           is_anon, anon_label, anon_label))
-    conn.commit()
+        conn.commit()
 
-
-def _write_lock_conn():
-    """获取带写锁的连接（所有 DB 写线程通过此锁串行化，避免 database is locked）。"""
-    _db_write_lock.acquire()
-    conn = _get_conn()
-    return conn
 
 
     """释放写锁。"""
