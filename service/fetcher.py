@@ -1020,8 +1020,11 @@ class DouyinBarrage:
                 logger.debug(f"[è¿žæŽ¥] WS Cookie å‰ 80 å­—ç¬¦: {additional_headers[0][1][:80]}...")
 
                 # â”€â”€ è¿žæŽ¥ WebSocket â”€â”€
+                # websockets v10- ç”¨ extra_headers, v14+ ç”¨ additional_headers
+                _ws_ver = tuple(int(x) for x in websockets.__version__.split('.')[:2])
+                _headers_kw = 'additional_headers' if _ws_ver >= (14, 0) else 'extra_headers'
                 connect_kwargs = {
-                    'additional_headers': additional_headers,
+                    _headers_kw: additional_headers,
                     'ping_interval': 30,
                     'ping_timeout': 10,
                     'max_size': 2 ** 23,
