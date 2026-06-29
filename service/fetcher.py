@@ -1008,11 +1008,11 @@ class DouyinBarrage:
                 logger.debug(f"[ç­¾å] ç”Ÿæˆ: signature='{signature}', é•¿åº¦={len(signature)}, "
                              f"user_unique_id={self._user_unique_id}, room_id={self._room_id}")
 
-                additional_headers = {
-                    "Cookie": build_ws_cookie(self.ttwid, self._login_cookies),
-                    "User-Agent": self._ua,
-                }
-                logger.debug(f"[è¿žæŽ¥] WS Cookie å‰ 80 å­—ç¬¦: {additional_headers['Cookie'][:80]}...")
+                additional_headers = [
+                    ("Cookie", build_ws_cookie(self.ttwid, self._login_cookies)),
+                    ("User-Agent", self._ua),
+                ]
+                logger.debug(f"[è¿žæŽ¥] WS Cookie å‰ 80 å­—ç¬¦: {additional_headers[0][1][:80]}...")
 
                 # â”€â”€ è¿žæŽ¥ WebSocket â”€â”€
                 connect_kwargs = {
