@@ -60,3 +60,13 @@ web:
     enabled: true                  # 是否启用抖音 API 请求限流
     max_per_minute: 30             # 每分钟最大请求数
 
+# ==================== 数据库配置 ====================
+database:
+  host: localhost
+  port: 5432
+  dbname: douyin_barrage
+  user: barrage
+  password: barrage
+  pool_min: 2
+  pool_max: 10
+

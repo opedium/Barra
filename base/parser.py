@@ -20,6 +20,10 @@ import queue
 import time
 from datetime import datetime
 
+import psycopg2
+from psycopg2 import pool as pg_pool
+from psycopg2.extras import RealDictCursor
+
 from base.messages import (
     parse_proto,
     ChatMessage, GiftMessage, LightGiftMessage, LikeMessage, MemberMessage,
@@ -1680,292 +1684,326 @@ HANDLERS = {
     'WebcastBattlePowerContainerMessage':      _make_pk_handler(BattlePowerContainerMessage, 'BattlePowerContainer'),
 }
 
-# ── SQLite 写入 ──────────────────────────────────
+# ── PostgreSQL 连接池 ──────────────────────────────
 
 DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
-DB_PATH = os.path.join(DB_DIR, 'douyin_barrage.db')
-_local = threading.local()
-_conn_registry = set()  # 跟踪所有 SQLite 连接，退出时关闭
-_conn_lock = threading.Lock()
+DB_PATH = os.path.join(DB_DIR, 'douyin_barrage.db')  # kept for migration script reference only
+
+
+def _load_db_config():
+    """Load database config from config.yaml, with env var overrides."""
+    cfg = {
+        'host': 'localhost', 'port': 5432, 'dbname': 'douyin_barrage',
+        'user': 'barrage', 'password': 'barrage', 'pool_min': 2, 'pool_max': 10,
+    }
+    try:
+        import yaml
+        yaml_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config.yaml')
+        if os.path.exists(yaml_path):
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f) or {}
+                dbc = data.get('database', {})
+                for k in ('host', 'port', 'dbname', 'user', 'password', 'pool_min', 'pool_max'):
+                    if k in dbc:
+                        cfg[k] = dbc[k]
+    except Exception:
+        pass
+    cfg['host'] = os.environ.get('PGHOST', cfg['host'])
+    cfg['port'] = int(os.environ.get('PGPORT', cfg['port']))
+    cfg['dbname'] = os.environ.get('PGDATABASE', cfg['dbname'])
+    cfg['user'] = os.environ.get('PGUSER', cfg['user'])
+    cfg['password'] = os.environ.get('PGPASSWORD', cfg['password'])
+    cfg['pool_min'] = int(os.environ.get('PGPOOL_MIN', cfg['pool_min']))
+    cfg['pool_max'] = int(os.environ.get('PGPOOL_MAX', cfg['pool_max']))
+    return cfg
+
+
+_db_config = _load_db_config()
+
+
+def _create_pool():
+    try:
+        pool = pg_pool.ThreadedConnectionPool(
+            _db_config['pool_min'], _db_config['pool_max'],
+            host=_db_config['host'], port=_db_config['port'],
+            dbname=_db_config['dbname'], user=_db_config['user'],
+            password=_db_config['password'],
+        )
+        logger.info(f"[DB] PostgreSQL 连接池已创建 ({_db_config['host']}:{_db_config['port']}/{_db_config['dbname']})")
+        return pool
+    except Exception as e:
+        logger.critical(f"[DB] PostgreSQL 连接失败: {e}")
+        raise
+
+
+_pool = _create_pool()
+
+
+class _PGConnection:
+    """Wraps a psycopg2 connection to provide sqlite3-compatible .execute() interface.
+    conn.execute(sql, params) -> cursor with RealDictRow support (r['col'] AND r[0] both work).
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.autocommit = conn.autocommit
+        self.closed = conn.closed
+
+    def execute(self, query, params=None):
+        cur = self._conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            cur.execute(query, params)
+            return cur
+        except Exception:
+            cur.close()
+            raise
+
+    def commit(self):
+        return self._conn.commit()
+
+    def rollback(self):
+        return self._conn.rollback()
+
+    def close(self):
+        """Return connection to the pool instead of closing."""
+        conn = getattr(self, '_conn', None)
+        if conn is not None:
+            self._conn = None
+            try:
+                _pool.putconn(conn)
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def cursor(self):
+        return self._conn.cursor()
+
+    def __del__(self):
+        self.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _get_conn():
+    """Borrow a wrapped connection from the pool (thread-safe)."""
+    try:
+        raw = _pool.getconn()
+        if raw.closed:
+            _pool.putconn(raw)
+            raw = _pool.getconn()
+        raw.autocommit = False
+        return _PGConnection(raw)
+    except Exception as e:
+        logger.error(f"[DB] 获取连接失败: {e}")
+        raise
+
+
+def _put_conn(conn):
+    if conn is not None and hasattr(conn, '_conn'):
+        try:
+            _pool.putconn(conn._conn)
+        except Exception:
+            pass
+    elif conn is not None:
+        try:
+            _pool.putconn(conn)
+        except Exception:
+            pass
+
+
+class _db_conn:
+    """Context manager: borrow from pool, return on exit."""
+
+    def __enter__(self):
+        self.conn = _get_conn()
+        return self.conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+        _put_conn(self.conn)
+        return False
 
 
 def _close_all_connections():
-    """进程退出时关闭所有 SQLite 连接，防止 fd 泄漏。"""
-    with _conn_lock:
-        for c in list(_conn_registry):
-            try:
-                c.close()
-            except Exception:
-                pass
-        _conn_registry.clear()
+    global _pool
+    try:
+        if _pool is not None:
+            _pool.closeall()
+            logger.info("[DB] 连接池已关闭")
+    except Exception:
+        pass
 
 
 import atexit
 atexit.register(_close_all_connections)
 
-# ── 启动时自动迁移旧表结构 ──
-try:
-    os.makedirs(DB_DIR, exist_ok=True)
-    _migrate_conn = sqlite3.connect(DB_PATH)
-    _migrate_conn.execute('PRAGMA journal_mode=WAL')
-    try:
-        _migrate_conn.execute('ALTER TABLE users ADD COLUMN grade TEXT DEFAULT ""')
-        _migrate_conn.commit()
-    except sqlite3.OperationalError:
-        pass
-    try:
-        _migrate_conn.execute('ALTER TABLE gift_logs ADD COLUMN grade TEXT DEFAULT ""')
-        _migrate_conn.execute('ALTER TABLE gift_logs ADD COLUMN fans_club TEXT DEFAULT ""')
-        _migrate_conn.commit()
-    except sqlite3.OperationalError:
-        pass
-    try:
-        _migrate_conn.execute('ALTER TABLE users ADD COLUMN sec_uid TEXT DEFAULT ""')
-        _migrate_conn.commit()
-    except sqlite3.OperationalError:
-        pass
-    try:
-        _migrate_conn.execute('ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT ""')
-        _migrate_conn.commit()
-    except sqlite3.OperationalError:
-        pass
-    try:
-        _migrate_conn.execute('ALTER TABLE users ADD COLUMN notes TEXT DEFAULT ""')
-        _migrate_conn.commit()
-    except sqlite3.OperationalError:
-        pass
-    try:
-        _migrate_conn.execute('ALTER TABLE users ADD COLUMN tags TEXT DEFAULT ""')
-        _migrate_conn.commit()
-    except sqlite3.OperationalError:
-        pass
-    # 升级礼物去重索引：同一秒内同用户同礼物去重，不同秒的保留（防止 websocket 重放但不误伤连刷）
-    try:
-        _migrate_conn.execute('DROP INDEX IF EXISTS idx_gift_dedup')
-        _migrate_conn.execute('DROP INDEX IF EXISTS idx_gift_logs_user')
-        _migrate_conn.commit()
-    except sqlite3.OperationalError:
-        pass
-    try:
-        _migrate_conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_gift_dedup_ts ON gift_logs(session_id, user_id, gift_name, diamond_total, gift_count, created_at)')
-        _migrate_conn.commit()
-    except sqlite3.OperationalError:
-        pass
-    _migrate_conn.close()
-except Exception:
-    pass
-
-
-
 
 _db_schema_inited = False
 _db_schema_lock = threading.Lock()
 
-def _get_conn():
-    global _db_schema_inited
-    if not hasattr(_local, 'conn') or _local.conn is None:
-        os.makedirs(DB_DIR, exist_ok=True)
-        _local.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        with _conn_lock:
-            _conn_registry.add(_local.conn)
-        _local.conn.execute('PRAGMA journal_mode=WAL')
-        _local.conn.execute('PRAGMA synchronous=NORMAL')
-        _local.conn.execute('PRAGMA busy_timeout=60000')
-        _local.conn.execute('PRAGMA wal_autocheckpoint=4000')
-        _local.conn.execute('PRAGMA journal_size_limit=134217728')
-        _local.conn.execute('PRAGMA cache_size=-16000')
-        _local.conn.execute('PRAGMA mmap_size=268435456')
-        _local.conn.execute('PRAGMA temp_store=MEMORY')
-        _local.conn.execute('PRAGMA foreign_keys=ON')
-        _local.conn.row_factory = sqlite3.Row
-        if not _db_schema_inited:
-            with _db_schema_lock:
-                if not _db_schema_inited:
-                    init_db()
-                    _db_schema_inited = True
-    return _local.conn
-
 
 def init_db():
-    conn = _get_conn()
-    conn.executescript('''
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            room_id TEXT NOT NULL,
-            anchor_name TEXT DEFAULT '',
-            start_time DATETIME DEFAULT (datetime('now', '+8 hours')),
-            end_time DATETIME,
-            status TEXT DEFAULT 'live'
-        );
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT UNIQUE NOT NULL,
-            user_name TEXT NOT NULL,
-            fans_club TEXT DEFAULT '',
-            grade TEXT DEFAULT '',
-            sec_uid TEXT DEFAULT '',
-            avatar_url TEXT DEFAULT '',
-            notes TEXT DEFAULT '',
-            tags TEXT DEFAULT '',
-            is_anonymous INTEGER DEFAULT 0,
-            anonymous_label TEXT DEFAULT '',
-            first_seen DATETIME DEFAULT (datetime('now', '+8 hours')),
-            last_seen DATETIME DEFAULT (datetime('now', '+8 hours'))
-        );
-        CREATE TABLE IF NOT EXISTS contributions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER NOT NULL REFERENCES sessions(id),
-            user_id TEXT NOT NULL,
-            user_name TEXT NOT NULL,
-            consume INTEGER DEFAULT 0,
-            rank INTEGER DEFAULT 0,
-            fans_club TEXT DEFAULT '',
-            source TEXT DEFAULT 'websocket',
-            qualified_1000 INTEGER DEFAULT 0,
-            qualified_3000 INTEGER DEFAULT 0,
-            qualified_10000 INTEGER DEFAULT 0,
-            qualified_100000 INTEGER DEFAULT 0,
-            recorded_at DATETIME DEFAULT (datetime('now', '+8 hours')),
-            UNIQUE(session_id, user_id)
-        );
-        CREATE TABLE IF NOT EXISTS chat_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER REFERENCES sessions(id),
-            user_id TEXT NOT NULL,
-            user_name TEXT NOT NULL,
-            content TEXT NOT NULL,
-            grade TEXT DEFAULT '',
-            fans_club TEXT DEFAULT '',
-            created_at DATETIME DEFAULT (datetime('now', '+8 hours'))
-        );
-        CREATE TABLE IF NOT EXISTS upgrade_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER DEFAULT 0,
-            user_id TEXT NOT NULL,
-            user_name TEXT NOT NULL,
-            upgrade_type TEXT NOT NULL,
-            from_level INTEGER DEFAULT 0,
-            to_level INTEGER DEFAULT 0,
-            anchor_name TEXT DEFAULT '',
-            created_at DATETIME DEFAULT (datetime('now', '+8 hours'))
-        );
-        CREATE TABLE IF NOT EXISTS gift_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER REFERENCES sessions(id),
-            user_id TEXT NOT NULL,
-            user_name TEXT NOT NULL,
-            gift_name TEXT NOT NULL,
-            gift_count INTEGER DEFAULT 1,
-            diamond_total INTEGER DEFAULT 0,
-            created_at DATETIME DEFAULT (datetime('now', '+8 hours'))
-        );
-        CREATE TABLE IF NOT EXISTS daily_stats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            user_name TEXT NOT NULL,
-            date TEXT NOT NULL,
-            total_consume INTEGER DEFAULT 0,
-            sessions_1000 INTEGER DEFAULT 0,
-            sessions_3000 INTEGER DEFAULT 0,
-            sessions_10000 INTEGER DEFAULT 0,
-            sessions_100000 INTEGER DEFAULT 0,
-            gift_count INTEGER DEFAULT 0,
-            chat_count INTEGER DEFAULT 0,
-            UNIQUE(user_id, date)
-        );
-        CREATE TABLE IF NOT EXISTS monthly_stats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            user_name TEXT NOT NULL,
-            year_month TEXT NOT NULL,
-            total_consume INTEGER DEFAULT 0,
-            sessions_1000 INTEGER DEFAULT 0,
-            sessions_3000 INTEGER DEFAULT 0,
-            sessions_10000 INTEGER DEFAULT 0,
-            sessions_100000 INTEGER DEFAULT 0,
-            days_active INTEGER DEFAULT 0,
-            max_rank INTEGER DEFAULT 0,
-            UNIQUE(user_id, year_month)
-        );
-        CREATE TABLE IF NOT EXISTS streamer_config (
-            live_id TEXT PRIMARY KEY,
-            anchor_name TEXT DEFAULT '',
-            enabled INTEGER DEFAULT 0,
-            added_at DATETIME DEFAULT (datetime('now', '+8 hours'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_contributions_session ON contributions(session_id);
-        CREATE INDEX IF NOT EXISTS idx_contributions_user ON contributions(user_id);
-        CREATE INDEX IF NOT EXISTS idx_chat_logs_user ON chat_logs(user_id);
-        CREATE INDEX IF NOT EXISTS idx_monthly_stats ON monthly_stats(year_month, sessions_1000 DESC);
-        CREATE INDEX IF NOT EXISTS idx_daily_stats ON daily_stats(date, sessions_1000 DESC);
-        CREATE INDEX IF NOT EXISTS idx_contributions_qualified ON contributions(qualified_1000);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_gift_dedup_ts ON gift_logs(session_id, user_id, gift_name, diamond_total, gift_count, created_at);
-        CREATE INDEX IF NOT EXISTS idx_upgrade_logs_session ON upgrade_logs(session_id);
-        CREATE INDEX IF NOT EXISTS idx_upgrade_logs_type ON upgrade_logs(upgrade_type);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_upgrade_logs_dedup ON upgrade_logs(session_id, user_id, upgrade_type, from_level, to_level);
-    ''')
-    # 兼容旧表：给 users 表补充 grade 字段
-    try:
-        conn.execute('ALTER TABLE users ADD COLUMN grade TEXT DEFAULT ""')
-    except Exception:
-        pass
-    # 清理僵尸场次：结束标记为"直播中"但开始时间超过 12 小时前的场次
-    conn.execute("""
-        UPDATE sessions SET end_time = start_time, status = 'ended'
-        WHERE status = 'live' AND start_time < datetime('now', '+8 hours', '-12 hours')
-    """)
-    # 数据库完整性检查
-    try:
-        integrity = conn.execute('PRAGMA integrity_check').fetchone()[0]
-        if integrity != 'ok':
-            logger.error(f"[DB] 完整性检查失败: {integrity}")
-    except Exception:
-        pass
-    # 开启自动增量 VACUUM，防止文件无限膨胀
-    try:
-        conn.execute('PRAGMA auto_vacuum=INCREMENTAL')
-        conn.execute('PRAGMA incremental_vacuum(0)')
-    except Exception:
-        pass
-    conn.commit()
-    logger.info(f"[DB] 已初始化: {DB_PATH}")
+    """Initialize PostgreSQL schema — tables, indexes, startup cleanup."""
+    """Initialize PostgreSQL schema — tables, indexes, startup cleanup."""
+    global _db_schema_inited
+    with _db_schema_lock:
+        if _db_schema_inited:
+            return True
+        conn = _get_conn()
+        try:
+            conn.execute('''CREATE TABLE IF NOT EXISTS sessions (
+                id SERIAL PRIMARY KEY, room_id TEXT NOT NULL,
+                anchor_name TEXT DEFAULT '',
+                start_time TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai'),
+                end_time TIMESTAMP, status TEXT DEFAULT 'live')''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY, user_id TEXT UNIQUE NOT NULL,
+                user_name TEXT NOT NULL, fans_club TEXT DEFAULT '',
+                grade TEXT DEFAULT '', sec_uid TEXT DEFAULT '',
+                avatar_url TEXT DEFAULT '', notes TEXT DEFAULT '',
+                tags TEXT DEFAULT '', is_anonymous INTEGER DEFAULT 0,
+                anonymous_label TEXT DEFAULT '',
+                first_seen TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai'),
+                last_seen TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai'))''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS contributions (
+                id SERIAL PRIMARY KEY,
+                session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL, user_name TEXT NOT NULL,
+                consume INTEGER DEFAULT 0, rank INTEGER DEFAULT 0,
+                fans_club TEXT DEFAULT '', source TEXT DEFAULT 'websocket',
+                qualified_1000 INTEGER DEFAULT 0, qualified_3000 INTEGER DEFAULT 0,
+                qualified_10000 INTEGER DEFAULT 0, qualified_100000 INTEGER DEFAULT 0,
+                recorded_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai'),
+                UNIQUE(session_id, user_id))''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS chat_logs (
+                id SERIAL PRIMARY KEY,
+                session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL, user_name TEXT NOT NULL,
+                content TEXT NOT NULL, grade TEXT DEFAULT '',
+                fans_club TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai'))''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS upgrade_logs (
+                id SERIAL PRIMARY KEY, session_id INTEGER DEFAULT 0,
+                user_id TEXT NOT NULL, user_name TEXT NOT NULL,
+                upgrade_type TEXT NOT NULL, from_level INTEGER DEFAULT 0,
+                to_level INTEGER DEFAULT 0, anchor_name TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai'))''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS gift_logs (
+                id SERIAL PRIMARY KEY,
+                session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL, user_name TEXT NOT NULL,
+                gift_name TEXT NOT NULL, gift_count INTEGER DEFAULT 1,
+                diamond_total INTEGER DEFAULT 0, grade TEXT DEFAULT '',
+                fans_club TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai'))''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS daily_stats (
+                id SERIAL PRIMARY KEY, user_id TEXT NOT NULL,
+                user_name TEXT NOT NULL, date TEXT NOT NULL,
+                total_consume INTEGER DEFAULT 0, sessions_1000 INTEGER DEFAULT 0,
+                sessions_3000 INTEGER DEFAULT 0, sessions_10000 INTEGER DEFAULT 0,
+                sessions_100000 INTEGER DEFAULT 0, gift_count INTEGER DEFAULT 0,
+                chat_count INTEGER DEFAULT 0, UNIQUE(user_id, date))''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS monthly_stats (
+                id SERIAL PRIMARY KEY, user_id TEXT NOT NULL,
+                user_name TEXT NOT NULL, year_month TEXT NOT NULL,
+                total_consume INTEGER DEFAULT 0, sessions_1000 INTEGER DEFAULT 0,
+                sessions_3000 INTEGER DEFAULT 0, sessions_10000 INTEGER DEFAULT 0,
+                sessions_100000 INTEGER DEFAULT 0, days_active INTEGER DEFAULT 0,
+                max_rank INTEGER DEFAULT 0, UNIQUE(user_id, year_month))''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS streamer_config (
+                live_id TEXT PRIMARY KEY, anchor_name TEXT DEFAULT '',
+                enabled INTEGER DEFAULT 0,
+                added_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai'))''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS pk_rounds (
+                id SERIAL PRIMARY KEY,
+                session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+                start_time TEXT NOT NULL, end_time TEXT,
+                duration_sec INTEGER DEFAULT 0, mode TEXT DEFAULT '',
+                participants TEXT DEFAULT '', participant_count INTEGER DEFAULT 0,
+                self_score INTEGER DEFAULT 0, opponent_score INTEGER DEFAULT 0,
+                result TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai'))''')
+
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_contributions_session ON contributions(session_id)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_contributions_user ON contributions(user_id)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_chat_logs_user ON chat_logs(user_id)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_monthly_stats ON monthly_stats(year_month, sessions_1000 DESC)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_daily_stats ON daily_stats(date, sessions_1000 DESC)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_contributions_qualified ON contributions(qualified_1000)')
+            conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_gift_dedup_ts ON gift_logs(session_id, user_id, gift_name, diamond_total, gift_count, created_at)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_upgrade_logs_session ON upgrade_logs(session_id)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_upgrade_logs_type ON upgrade_logs(upgrade_type)')
+            conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_upgrade_logs_dedup ON upgrade_logs(session_id, user_id, upgrade_type, from_level, to_level)')
+
+            # Cleanup zombie sessions
+            conn.execute("""
+                UPDATE sessions SET end_time = start_time, status = 'ended'
+                WHERE status = 'live' AND start_time < (NOW() AT TIME ZONE 'Asia/Shanghai' - INTERVAL '12 hours')
+            """)
+
+            # Repair SERIAL sequences after data migration
+            for seq_table in [('sessions', 'id'), ('users', 'id'), ('contributions', 'id'),
+                              ('chat_logs', 'id'), ('gift_logs', 'id'), ('upgrade_logs', 'id'),
+                              ('daily_stats', 'id'), ('monthly_stats', 'id'), ('pk_rounds', 'id')]:
+                try:
+                    conn.execute(f"SELECT setval('{seq_table[0]}_id_seq', (SELECT MAX({seq_table[1]}) FROM {seq_table[0]}))")
+                except Exception:
+                    pass  # table might not exist yet
+
+            conn.commit()
+            _db_schema_inited = True
+            logger.info("[DB] PostgreSQL schema initialized")
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            _put_conn(conn)
     return True
 
 
+# Initialize database schema on module load
+init_db()
+
+
 def create_session(room_id, anchor_name=''):
-    conn = _get_conn()
-    # 结束同一房间下仍标记为"直播中"的旧场次，避免累积僵尸场次
-    old = conn.execute('SELECT id FROM sessions WHERE room_id = ? AND status = "live"', (room_id,)).fetchall()
-    for row in old:
-        conn.execute('UPDATE sessions SET end_time = datetime("now", "+8 hours"), status = "ended" WHERE id = ?', (row['id'],))
-        logger.info(f"[DB] 自动结束旧场次 #{row['id']} (新场次创建)")
-    cur = conn.execute('INSERT INTO sessions (room_id, anchor_name) VALUES (?, ?)', (room_id, anchor_name))
-    conn.commit()
-    sid = cur.lastrowid
-    logger.info(f"[DB] 新场次 #{sid}: {anchor_name} ({room_id})")
-    return sid
+    try:
+        conn = _get_conn()
+        # 结束同一房间下仍标记为"直播中"的旧场次，避免累积僵尸场次
+        old = conn.execute("SELECT id FROM sessions WHERE room_id = %s AND status = 'live'", (room_id,)).fetchall()
+        for row in old:
+            conn.execute("UPDATE sessions SET end_time = (NOW() AT TIME ZONE 'Asia/Shanghai'), status = 'ended' WHERE id = %s", (row['id'],))
+            logger.info(f"[DB] 自动结束旧场次 #{row['id']} (新场次创建)")
+        cur = conn.execute('INSERT INTO sessions (room_id, anchor_name) VALUES (%s, %s) RETURNING id', (room_id, anchor_name))
+        sid = cur.fetchone()['id']
+        conn.commit()
+        logger.info(f"[DB] 新场次 #{sid}: {anchor_name} ({room_id})")
+        return sid
+    except Exception as e:
+        logger.error(f"[DB] 创建场次失败: {e}")
+        raise
 
 
 def _db_write_with_retry(fn, max_retries=5, base_delay=0.1):
-    """执行数据库写操作，遇到 'database is locked' 时重试。
-
-    使用指数退避：0.1s, 0.2s, 0.4s, 0.8s, 1.6s → 总共约 3.1s。
-    如果 5 次重试后仍然锁住，抛出原始异常。
-    """
+    """保留接口兼容性 — PostgreSQL 不需要锁重试。"""
     import time as _time
     last_exc = None
     for attempt in range(max_retries):
         try:
             return fn()
-        except sqlite3.OperationalError as _e:
-            msg = str(_e)
-            if 'database is locked' in msg or 'database table is locked' in msg:
-                last_exc = _e
-                if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)
-                    logger.warning(f"[DB] 数据库锁住，{delay:.1f}s 后重试 ({attempt+1}/{max_retries})")
-                    _time.sleep(delay)
-                    continue
+        except Exception as _e:
+            last_exc = _e
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"[DB] 操作重试 ({attempt+1}/{max_retries})")
+                _time.sleep(delay)
+                continue
             raise
     raise last_exc
 
@@ -1973,7 +2011,7 @@ def _db_write_with_retry(fn, max_retries=5, base_delay=0.1):
 def end_session(session_id):
     def _do():
         conn = _get_conn()
-        conn.execute('UPDATE sessions SET end_time = datetime("now", "+8 hours"), status = "ended" WHERE id = ?', (session_id,))
+        conn.execute("UPDATE sessions SET end_time = (NOW() AT TIME ZONE 'Asia/Shanghai'), status = 'ended' WHERE id = %s", (session_id,))
         conn.commit()
     _db_write_with_retry(_do)
     logger.info(f"[DB] 场次 #{session_id} 已结束")
@@ -1991,14 +2029,14 @@ def delete_session(session_id):
     def _do():
         conn = _get_conn()
         # 统计各表删除数量
-        gift_count = conn.execute('SELECT COUNT(*) FROM gift_logs WHERE session_id = ?', (session_id,)).fetchone()[0]
-        chat_count = conn.execute('SELECT COUNT(*) FROM chat_logs WHERE session_id = ?', (session_id,)).fetchone()[0]
-        contrib_count = conn.execute('SELECT COUNT(*) FROM contributions WHERE session_id = ?', (session_id,)).fetchone()[0]
+        gift_count = conn.execute('SELECT COUNT(*) FROM gift_logs WHERE session_id = %s', (session_id,)).fetchone()['count']
+        chat_count = conn.execute('SELECT COUNT(*) FROM chat_logs WHERE session_id = %s', (session_id,)).fetchone()['count']
+        contrib_count = conn.execute('SELECT COUNT(*) FROM contributions WHERE session_id = %s', (session_id,)).fetchone()['count']
 
-        conn.execute('DELETE FROM gift_logs WHERE session_id = ?', (session_id,))
-        conn.execute('DELETE FROM chat_logs WHERE session_id = ?', (session_id,))
-        conn.execute('DELETE FROM contributions WHERE session_id = ?', (session_id,))
-        conn.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
+        conn.execute('DELETE FROM gift_logs WHERE session_id = %s', (session_id,))
+        conn.execute('DELETE FROM chat_logs WHERE session_id = %s', (session_id,))
+        conn.execute('DELETE FROM contributions WHERE session_id = %s', (session_id,))
+        conn.execute('DELETE FROM sessions WHERE id = %s', (session_id,))
         conn.commit()
         return (gift_count, chat_count, contrib_count)
     gift_count, chat_count, contrib_count = _db_write_with_retry(_do)
@@ -2078,7 +2116,7 @@ def flush_to_sqlite(session_id):
 
     rows = conn.execute('''
         SELECT user_id, user_name, SUM(diamond_total) as consume
-        FROM gift_logs WHERE session_id = ?
+        FROM gift_logs WHERE session_id = %s
         GROUP BY user_id
     ''', (session_id,)).fetchall()
 
@@ -2093,27 +2131,27 @@ def flush_to_sqlite(session_id):
 
             # 获取粉丝团和财富等级
             info = conn.execute(
-                "SELECT fans_club, grade FROM chat_logs WHERE user_id = ? AND (fans_club != '' OR grade != '') ORDER BY id DESC LIMIT 1",
+                "SELECT fans_club, grade FROM chat_logs WHERE user_id = %s AND (fans_club != '' OR grade != '') ORDER BY id DESC LIMIT 1",
                 (uid,)
             ).fetchone()
             fans_club = info['fans_club'] if info else ''
             grade = info['grade'] if info else ''
-    
+
             # 同步 users 表
-            conn.execute('''
+            conn.execute("""
                 INSERT INTO users (user_id, user_name, fans_club, grade, last_seen)
-                VALUES (?, ?, ?, ?, datetime("now", "+8 hours"))
+                VALUES (%s, %s, %s, %s, NOW() AT TIME ZONE 'Asia/Shanghai')
                 ON CONFLICT(user_id) DO UPDATE SET
-                    fans_club = CASE WHEN ? != '' THEN ? ELSE fans_club END,
-                    grade = CASE WHEN ? != '' THEN ? ELSE grade END,
-                    last_seen = datetime("now", "+8 hours")
-            ''', (uid, nick, fans_club, grade, fans_club, fans_club, grade, grade))
-    
+                    fans_club = CASE WHEN %s != '' THEN %s ELSE users.fans_club END,
+                    grade = CASE WHEN %s != '' THEN %s ELSE users.grade END,
+                    last_seen = NOW() AT TIME ZONE 'Asia/Shanghai'
+            """, (uid, nick, fans_club, grade, fans_club, fans_club, grade, grade))
+
             prev = conn.execute(
-                'SELECT qualified_1000, qualified_3000, qualified_10000, qualified_100000 FROM contributions WHERE session_id=? AND user_id=?',
+                'SELECT qualified_1000, qualified_3000, qualified_10000, qualified_100000 FROM contributions WHERE session_id=%s AND user_id=%s',
                 (session_id, uid)
             ).fetchone()
-    
+
             pq_1000 = prev['qualified_1000'] if prev else 0
             pq_3000 = prev['qualified_3000'] if prev else 0
             pq_10000 = prev['qualified_10000'] if prev else 0
@@ -2122,47 +2160,47 @@ def flush_to_sqlite(session_id):
             q_3000 = 1 if consume >= 3000 else 0
             q_10000 = 1 if consume >= 10000 else 0
             q_100000 = 1 if consume >= 100000 else 0
-    
-            conn.execute('''
+
+            conn.execute("""
                 INSERT INTO contributions
                     (session_id, user_id, user_name, consume, rank, fans_club, source,
                      qualified_1000, qualified_3000, qualified_10000, qualified_100000)
-                VALUES (?, ?, ?, ?, 0, ?, 'websocket', ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, 0, %s, 'websocket', %s, %s, %s, %s)
                 ON CONFLICT(session_id, user_id) DO UPDATE SET
                     consume = excluded.consume,
-                    qualified_1000 = MAX(qualified_1000, excluded.qualified_1000),
-                    qualified_3000 = MAX(qualified_3000, excluded.qualified_3000),
-                    qualified_10000 = MAX(qualified_10000, excluded.qualified_10000),
-                    qualified_100000 = MAX(qualified_100000, excluded.qualified_100000)
-            ''', (session_id, uid, nick, consume, fans_club,
+                    qualified_1000 = GREATEST(contributions.qualified_1000, excluded.qualified_1000),
+                    qualified_3000 = GREATEST(contributions.qualified_3000, excluded.qualified_3000),
+                    qualified_10000 = GREATEST(contributions.qualified_10000, excluded.qualified_10000),
+                    qualified_100000 = GREATEST(contributions.qualified_100000, excluded.qualified_100000)
+            """, (session_id, uid, nick, consume, fans_club,
                   q_1000, q_3000, q_10000, q_100000))
-    
+
             # 每日/每月达标次数（仅在首次达标时 +1）
             if q_1000 and not pq_1000:
-                conn.execute('INSERT INTO daily_stats (user_id, user_name, date, sessions_1000, total_consume) VALUES (?, ?, ?, 1, 0) ON CONFLICT(user_id, date) DO UPDATE SET sessions_1000 = sessions_1000 + 1', (uid, nick, today))
-                conn.execute('INSERT INTO monthly_stats (user_id, user_name, year_month, sessions_1000, total_consume) VALUES (?, ?, ?, 1, 0) ON CONFLICT(user_id, year_month) DO UPDATE SET sessions_1000 = sessions_1000 + 1', (uid, nick, month))
+                conn.execute("INSERT INTO daily_stats (user_id, user_name, date, sessions_1000, total_consume) VALUES (%s, %s, %s, 1, 0) ON CONFLICT(user_id, date) DO UPDATE SET sessions_1000 = daily_stats.sessions_1000 + 1", (uid, nick, today))
+                conn.execute("INSERT INTO monthly_stats (user_id, user_name, year_month, sessions_1000, total_consume) VALUES (%s, %s, %s, 1, 0) ON CONFLICT(user_id, year_month) DO UPDATE SET sessions_1000 = monthly_stats.sessions_1000 + 1", (uid, nick, month))
             if q_3000 and not pq_3000:
-                conn.execute('UPDATE daily_stats SET sessions_3000 = sessions_3000 + 1 WHERE user_id = ? AND date = ?', (uid, today))
-                conn.execute('UPDATE monthly_stats SET sessions_3000 = sessions_3000 + 1 WHERE user_id = ? AND year_month = ?', (uid, month))
+                conn.execute('UPDATE daily_stats SET sessions_3000 = sessions_3000 + 1 WHERE user_id = %s AND date = %s', (uid, today))
+                conn.execute('UPDATE monthly_stats SET sessions_3000 = sessions_3000 + 1 WHERE user_id = %s AND year_month = %s', (uid, month))
             if q_10000 and not pq_10000:
-                conn.execute('UPDATE daily_stats SET sessions_10000 = sessions_10000 + 1 WHERE user_id = ? AND date = ?', (uid, today))
-                conn.execute('UPDATE monthly_stats SET sessions_10000 = sessions_10000 + 1 WHERE user_id = ? AND year_month = ?', (uid, month))
+                conn.execute('UPDATE daily_stats SET sessions_10000 = sessions_10000 + 1 WHERE user_id = %s AND date = %s', (uid, today))
+                conn.execute('UPDATE monthly_stats SET sessions_10000 = sessions_10000 + 1 WHERE user_id = %s AND year_month = %s', (uid, month))
             if q_100000 and not pq_100000:
-                conn.execute('UPDATE daily_stats SET sessions_100000 = sessions_100000 + 1 WHERE user_id = ? AND date = ?', (uid, today))
-                conn.execute('UPDATE monthly_stats SET sessions_100000 = sessions_100000 + 1 WHERE user_id = ? AND year_month = ?', (uid, month))
-    
+                conn.execute('UPDATE daily_stats SET sessions_100000 = sessions_100000 + 1 WHERE user_id = %s AND date = %s', (uid, today))
+                conn.execute('UPDATE monthly_stats SET sessions_100000 = sessions_100000 + 1 WHERE user_id = %s AND year_month = %s', (uid, month))
+
             # 每日/每月总消费：从 contributions 重新计算（始终为实际总和）
             total_day = conn.execute(
-                "SELECT COALESCE(SUM(c.consume), 0) FROM contributions c JOIN sessions s ON c.session_id = s.id WHERE c.user_id = ? AND date(s.start_time) = ?",
+                "SELECT COALESCE(SUM(c.consume), 0) FROM contributions c JOIN sessions s ON c.session_id = s.id WHERE c.user_id = %s AND DATE(s.start_time) = %s",
                 (uid, today)
-            ).fetchone()[0]
+            ).fetchone()['coalesce']
             total_month = conn.execute(
-                "SELECT COALESCE(SUM(c.consume), 0) FROM contributions c JOIN sessions s ON c.session_id = s.id WHERE c.user_id = ? AND strftime('%Y-%m', s.start_time) = ?",
+                "SELECT COALESCE(SUM(c.consume), 0) FROM contributions c JOIN sessions s ON c.session_id = s.id WHERE c.user_id = %s AND TO_CHAR(s.start_time, 'YYYY-MM') = %s",
                 (uid, month)
-            ).fetchone()[0]
-            conn.execute('UPDATE daily_stats SET total_consume = ?, user_name = ? WHERE user_id = ? AND date = ?',
+            ).fetchone()['coalesce']
+            conn.execute('UPDATE daily_stats SET total_consume = %s, user_name = %s WHERE user_id = %s AND date = %s',
                          (total_day, nick, uid, today))
-            conn.execute('UPDATE monthly_stats SET total_consume = ?, user_name = ? WHERE user_id = ? AND year_month = ?',
+            conn.execute('UPDATE monthly_stats SET total_consume = %s, user_name = %s WHERE user_id = %s AND year_month = %s',
                          (total_month, nick, uid, month))
 
         conn.commit()
@@ -2213,37 +2251,41 @@ def _flush_write_batch(conn, batch):
         try:
             if op == 'chat':
                 _, sid, uid, uname, content, grade, club = item
-                conn.execute('INSERT OR IGNORE INTO chat_logs (session_id, user_id, user_name, content, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?)',
-                             (sid, uid, uname, content, grade, club))
+                conn.execute("""
+                    INSERT INTO chat_logs (session_id, user_id, user_name, content, grade, fans_club)
+                    VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING
+                """, (sid, uid, uname, content, grade, club))
             elif op == 'gift':
                 _, sid, uid, uname, gname, cnt, dia, grade, club = item
                 # 先删除同场次同用户同礼物的更低 count 记录（解决连击拆分重复计数）
                 if cnt > 1 and uid:
-                    conn.execute('DELETE FROM gift_logs WHERE session_id = ? AND user_id = ? AND gift_name = ? AND diamond_total = ? AND gift_count < ?',
+                    conn.execute('DELETE FROM gift_logs WHERE session_id = %s AND user_id = %s AND gift_name = %s AND diamond_total = %s AND gift_count < %s',
                                  (sid, uid, gname, dia, cnt))
-                conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                             (sid, uid, uname, gname, cnt, dia, grade, club))
+                conn.execute("""
+                    INSERT INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING
+                """, (sid, uid, uname, gname, cnt, dia, grade, club))
             elif op == 'upsert':
                 _, uid, uname, grade, club, sec, av = item
                 is_anon, anon_label = _detect_anonymous(uname)
                 # 合并粉丝团（保留最高等级）
                 if club:
-                    existing = conn.execute('SELECT fans_club FROM users WHERE user_id = ?', (uid,)).fetchone()
+                    existing = conn.execute('SELECT fans_club FROM users WHERE user_id = %s', (uid,)).fetchone()
                     if existing and existing['fans_club']:
                         club = _merge_fans_club_strings(existing['fans_club'], club)
-                conn.execute('''
+                conn.execute("""
                     INSERT INTO users (user_id, user_name, grade, fans_club, sec_uid, avatar_url, is_anonymous, anonymous_label, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime("now", "+8 hours"))
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW() AT TIME ZONE 'Asia/Shanghai')
                     ON CONFLICT(user_id) DO UPDATE SET
-                        user_name = CASE WHEN ? != '' THEN ? ELSE user_name END,
-                        grade = CASE WHEN ? != '' THEN ? ELSE grade END,
-                        fans_club = CASE WHEN ? != '' THEN ? ELSE fans_club END,
-                        sec_uid = CASE WHEN ? != '' THEN ? ELSE sec_uid END,
-                        avatar_url = CASE WHEN ? != '' THEN ? ELSE avatar_url END,
-                        is_anonymous = CASE WHEN ? = 1 THEN 1 ELSE is_anonymous END,
-                        anonymous_label = CASE WHEN ? != '' THEN ? ELSE anonymous_label END,
-                        last_seen = datetime("now", "+8 hours")
-                ''', (uid, uname, grade, club, sec, av, is_anon, anon_label,
+                        user_name = CASE WHEN %s != '' THEN %s ELSE users.user_name END,
+                        grade = CASE WHEN %s != '' THEN %s ELSE users.grade END,
+                        fans_club = CASE WHEN %s != '' THEN %s ELSE users.fans_club END,
+                        sec_uid = CASE WHEN %s != '' THEN %s ELSE users.sec_uid END,
+                        avatar_url = CASE WHEN %s != '' THEN %s ELSE users.avatar_url END,
+                        is_anonymous = CASE WHEN %s = 1 THEN 1 ELSE users.is_anonymous END,
+                        anonymous_label = CASE WHEN %s != '' THEN %s ELSE users.anonymous_label END,
+                        last_seen = NOW() AT TIME ZONE 'Asia/Shanghai'
+                """, (uid, uname, grade, club, sec, av, is_anon, anon_label,
                       uname, uname, grade, grade, club, club, sec, sec, av, av,
                       is_anon, anon_label, anon_label))
         except Exception as e:
@@ -2302,14 +2344,14 @@ _VALID_TIERS = {1000, 3000, 10000, 100000}
 
 
 def record_upgrade(session_id, user_id, user_name, upgrade_type, from_level, to_level, anchor_name=''):
-    """记录用户升级事件（财富等级/粉丝团），使用 INSERT OR IGNORE 防重复。
+    """记录用户升级事件（财富等级/粉丝团），使用 ON CONFLICT DO NOTHING 防重复。
     仅记录 from_level > 0 的真实升级（首次检测到的高等级不计为升级事件）。"""
     if not user_id or not upgrade_type or to_level <= 0 or from_level <= 0:
         return
     try:
         conn = _get_conn()
         conn.execute(
-            'INSERT OR IGNORE INTO upgrade_logs (session_id, user_id, user_name, upgrade_type, from_level, to_level, anchor_name) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            'INSERT INTO upgrade_logs (session_id, user_id, user_name, upgrade_type, from_level, to_level, anchor_name) VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING',
             (session_id or 0, user_id, user_name, upgrade_type, from_level, to_level, anchor_name)
         )
         conn.commit()
@@ -2323,27 +2365,27 @@ def query_upgrades(upgrade_type='', session_id=None, min_level=0, anchor_name=''
     where = []
     params = []
     if upgrade_type:
-        where.append('u.upgrade_type = ?')
+        where.append('u.upgrade_type = %s')
         params.append(upgrade_type)
     if session_id is not None:
-        where.append('u.session_id = ?')
+        where.append('u.session_id = %s')
         params.append(session_id)
     if min_level > 0:
-        where.append('u.to_level >= ?')
+        where.append('u.to_level >= %s')
         params.append(min_level)
     if anchor_name:
-        where.append('u.anchor_name = ?')
+        where.append('u.anchor_name = %s')
         params.append(anchor_name)
 
     w = ' AND '.join(where) if where else '1=1'
-    total = conn.execute(f'SELECT COUNT(*) FROM upgrade_logs u WHERE {w}', params).fetchone()[0]
+    total = conn.execute(f'SELECT COUNT(*) FROM upgrade_logs u WHERE {w}', params).fetchone()['count']
     offset = (page - 1) * size
     rows = conn.execute(f'''
         SELECT u.*, COALESCE(usr.avatar_url, '') as avatar_url
         FROM upgrade_logs u
         LEFT JOIN users usr ON usr.user_id = u.user_id
         WHERE {w}
-        ORDER BY u.id DESC LIMIT ? OFFSET ?
+        ORDER BY u.id DESC LIMIT %s OFFSET %s
     ''', params + [size, offset]).fetchall()
     return {'upgrades': [dict(r) for r in rows], 'total': total, 'page': page}
 
@@ -2365,22 +2407,22 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
     anchor_filter = ''
     anchor_params = ()
     if room_id and period != 'session':
-        anchor_filter = 'AND s.room_id = ?'
+        anchor_filter = 'AND s.room_id = %s'
         anchor_params = (room_id,)
     elif anchor_name and period != 'session':
-        anchor_filter = 'AND TRIM(s.anchor_name) = ?'
+        anchor_filter = 'AND TRIM(s.anchor_name) = %s'
         anchor_params = (anchor_name.strip(),)
 
     if period == 'session' and session_id:
         if tier is not None:
             col = f'qualified_{tier}'
             where_extra = f'AND c.{col} = 1'
-            total = conn.execute(f'SELECT COUNT(*) FROM contributions WHERE session_id = ? AND {col} = 1', (session_id,)).fetchone()[0]
+            total = conn.execute(f'SELECT COUNT(*) FROM contributions WHERE session_id = %s AND {col} = 1', (session_id,)).fetchone()['count']
         else:
             where_extra = ''
             if threshold > 0:
                 where_extra = f'AND c.consume >= {int(threshold)}'
-            total = conn.execute(f'SELECT COUNT(*) FROM contributions WHERE session_id = ? AND consume > 0', (session_id,)).fetchone()[0]
+            total = conn.execute(f'SELECT COUNT(*) FROM contributions WHERE session_id = %s AND consume > 0', (session_id,)).fetchone()['count']
         rows = conn.execute(f'''
             SELECT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name, c.consume,
                    COALESCE(NULLIF(u.fans_club, ''), CASE WHEN s.anchor_name != '' THEN '[粉丝团:' || s.anchor_name || ']' ELSE '' END) AS fans_club,
@@ -2395,8 +2437,8 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
             FROM contributions c
             LEFT JOIN users u ON u.user_id = c.user_id
             JOIN sessions s ON s.id = c.session_id
-            WHERE c.session_id = ? AND c.consume > 0 {where_extra}
-            ORDER BY c.consume DESC LIMIT ? OFFSET ?
+            WHERE c.session_id = %s AND c.consume > 0 {where_extra}
+            ORDER BY c.consume DESC LIMIT %s OFFSET %s
         ''', (session_id, size, offset)).fetchall()
         users_list = []
         for i, r in enumerate(rows):
@@ -2406,72 +2448,78 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
         return {'users': users_list, 'total': total, 'page': page}
     elif period == 'today':
         today = datetime.now().strftime('%Y-%m-%d')
-        having = 'HAVING SUM(c.consume) >= ?' if min_consume > 0 else ''
+        having = 'HAVING SUM(c.consume) >= %s' if min_consume > 0 else ''
         sessions_col_today = f'SUM(CASE WHEN c.consume >= {int(min_consume)} THEN 1 ELSE 0 END)' if min_consume > 0 else 'COUNT(DISTINCT c.session_id)'
         params_today = [today]
-        total_params = (today,)
+        total_params = [today]
         if anchor_params:
             params_today.extend(anchor_params)
-            total_params = total_params + anchor_params
+            total_params.extend(anchor_params)
         if min_consume > 0:
             params_today.append(min_consume)
-            total_params = total_params + (min_consume,)
+            total_params.append(min_consume)
         params_today.extend([size, offset])
         rows = conn.execute(f'''
-            SELECT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name, SUM(c.consume) AS consume,
-                   COALESCE(u.fans_club, '') AS fans_club,
-                   COALESCE(u.grade, '') AS grade,
-                   u.sec_uid, u.avatar_url, u.notes, u.tags,
+            SELECT c.user_id,
+                   MAX(COALESCE(NULLIF(u.user_name, ''), c.user_name)) AS user_name,
+                   SUM(c.consume) AS consume,
+                   MAX(COALESCE(u.fans_club, '')) AS fans_club,
+                   MAX(COALESCE(u.grade, '')) AS grade,
+                   MAX(u.sec_uid) AS sec_uid, MAX(u.avatar_url) AS avatar_url,
+                   MAX(u.notes) AS notes, MAX(u.tags) AS tags,
                    {sessions_col_today} AS sessions_count
             FROM contributions c
-            JOIN sessions s ON c.session_id = s.id AND date(s.start_time) = ?
+            JOIN sessions s ON c.session_id = s.id AND DATE(s.start_time) = %s
             LEFT JOIN users u ON u.user_id = c.user_id
             WHERE c.consume > 0 {anchor_filter}
             GROUP BY c.user_id {having}
-            ORDER BY consume DESC LIMIT ? OFFSET ?
+            ORDER BY consume DESC LIMIT %s OFFSET %s
         ''', params_today).fetchall()
         total = conn.execute(f'''
             SELECT COUNT(*) FROM (
                 SELECT c.user_id FROM contributions c
-                JOIN sessions s ON c.session_id = s.id AND date(s.start_time) = ?
+                JOIN sessions s ON c.session_id = s.id AND DATE(s.start_time) = %s
                 WHERE c.consume > 0 {anchor_filter}
                 GROUP BY c.user_id {having}
             )
-        ''', total_params).fetchone()[0]
+        ''', total_params).fetchone()['count']
     elif period == 'month':
         month = year_month or datetime.now().strftime('%Y-%m')
-        having = 'HAVING SUM(c.consume) >= ?' if min_consume > 0 else ''
+        having = 'HAVING SUM(c.consume) >= %s' if min_consume > 0 else ''
         sessions_col_month = f'SUM(CASE WHEN c.consume >= {int(min_consume)} THEN 1 ELSE 0 END)' if min_consume > 0 else 'COUNT(DISTINCT c.session_id)'
         params = [month]
-        total_params = (month,)
+        total_params = [month]
         if anchor_params:
             params.extend(anchor_params)
-            total_params = total_params + anchor_params
+            total_params.extend(anchor_params)
         if min_consume > 0:
             params.append(min_consume)
-            total_params = total_params + (min_consume,)
+            total_params.append(min_consume)
         params.extend([size, offset])
         rows = conn.execute(f'''
-            SELECT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name, SUM(c.consume) AS consume,
-                   COALESCE(u.fans_club, '') AS fans_club,
-                   COALESCE(u.grade, '') AS grade,
-                   u.sec_uid, u.avatar_url, u.notes, u.tags,
+            SELECT c.user_id,
+                   MAX(COALESCE(NULLIF(u.user_name, ''), c.user_name)) AS user_name,
+                   SUM(c.consume) AS consume,
+                   MAX(COALESCE(u.fans_club, '')) AS fans_club,
+                   MAX(COALESCE(u.grade, '')) AS grade,
+                   MAX(u.sec_uid) AS sec_uid, MAX(u.avatar_url) AS avatar_url,
+                   MAX(u.notes) AS notes, MAX(u.tags) AS tags,
                    {sessions_col_month} AS sessions_count
             FROM contributions c
-            JOIN sessions s ON c.session_id = s.id AND strftime('%Y-%m', s.start_time) = ?
+            JOIN sessions s ON c.session_id = s.id AND TO_CHAR(s.start_time, 'YYYY-MM') = %s
             LEFT JOIN users u ON u.user_id = c.user_id
             WHERE c.consume > 0 {anchor_filter}
             GROUP BY c.user_id {having}
-            ORDER BY consume DESC LIMIT ? OFFSET ?
+            ORDER BY consume DESC LIMIT %s OFFSET %s
         ''', params).fetchall()
         total = conn.execute(f'''
             SELECT COUNT(*) FROM (
                 SELECT c.user_id FROM contributions c
-                JOIN sessions s ON c.session_id = s.id AND strftime('%Y-%m', s.start_time) = ?
+                JOIN sessions s ON c.session_id = s.id AND TO_CHAR(s.start_time, 'YYYY-MM') = %s
                 WHERE c.consume > 0 {anchor_filter}
                 GROUP BY c.user_id {having}
             )
-        ''', total_params).fetchone()[0]
+        ''', total_params).fetchone()['count']
     elif period == '30d':
         # 滚动 30 天：从 contributions + sessions 按时间窗口聚合
         # 上榜次数：按最低消费计算符合条件的场次数
@@ -2488,47 +2536,50 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
             params_30.extend(anchor_params)
             total_params_30.extend(anchor_params)
         if min_consume > 0:
-            where_extra_30 = 'AND SUM(c.consume) >= ?'
-            total_extra_30 = 'HAVING SUM(c.consume) >= ?'
+            where_extra_30 = 'AND SUM(c.consume) >= %s'
+            total_extra_30 = 'HAVING SUM(c.consume) >= %s'
             params_30.append(min_consume)
             total_params_30.append(min_consume)
         params_30.extend([size, offset])
         rows = conn.execute(f'''
-            SELECT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name, SUM(c.consume) AS consume,
+            SELECT c.user_id,
+                   MAX(COALESCE(NULLIF(u.user_name, ''), c.user_name)) AS user_name,
+                   SUM(c.consume) AS consume,
                    COALESCE(
-                       NULLIF(u.fans_club, ''),
+                       MAX(NULLIF(u.fans_club, '')),
                        (SELECT fans_club FROM chat_logs WHERE user_id = c.user_id AND fans_club != '' ORDER BY id DESC LIMIT 1),
                        ''
                    ) AS fans_club,
                    COALESCE(
-                       u.grade,
+                       MAX(u.grade),
                        (SELECT grade FROM chat_logs WHERE user_id = c.user_id AND grade != '' ORDER BY id DESC LIMIT 1),
                        ''
                    ) AS grade,
-                   u.sec_uid, u.avatar_url, u.notes, u.tags,
+                   MAX(u.sec_uid) AS sec_uid, MAX(u.avatar_url) AS avatar_url,
+                   MAX(u.notes) AS notes, MAX(u.tags) AS tags,
                    {sessions_col} AS sessions_count
             FROM contributions c
             JOIN sessions s ON c.session_id = s.id
             LEFT JOIN users u ON u.user_id = c.user_id
-            WHERE s.start_time >= datetime('now', '-30 days')
+            WHERE s.start_time >= NOW() - INTERVAL '30 days'
               AND c.consume > 0 {anchor_filter}
             GROUP BY c.user_id
             HAVING SUM(c.consume) > 0 {where_extra_30}
-            ORDER BY consume DESC LIMIT ? OFFSET ?
+            ORDER BY consume DESC LIMIT %s OFFSET %s
         ''', params_30).fetchall()
         total = conn.execute(f'''
             SELECT COUNT(*) FROM (
                 SELECT c.user_id, SUM(c.consume) AS total_consume
                 FROM contributions c
                 JOIN sessions s ON c.session_id = s.id
-                WHERE s.start_time >= datetime('now', '-30 days') AND c.consume > 0 {anchor_filter}
+                WHERE s.start_time >= NOW() - INTERVAL '30 days' AND c.consume > 0 {anchor_filter}
                 GROUP BY c.user_id
                 {total_extra_30}
             )
-        ''', total_params_30).fetchone()[0]
+        ''', total_params_30).fetchone()['count']
     else:
         # 全部 / 指定月份：从 contributions 聚合
-        having = 'HAVING SUM(c.consume) >= ?' if min_consume > 0 else ''
+        having = 'HAVING SUM(c.consume) >= %s' if min_consume > 0 else ''
         month_filter = year_month if year_month else ''
         sessions_col_all = f'SUM(CASE WHEN c.consume >= {int(min_consume)} THEN 1 ELSE 0 END)' if min_consume > 0 else 'COUNT(DISTINCT c.session_id)'
 
@@ -2544,28 +2595,30 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
                 total_params_list.extend(anchor_params)
             if min_consume > 0:
                 total_params_list.append(min_consume)
-            total_params = tuple(total_params_list)
             rows = conn.execute(f'''
-                SELECT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name, SUM(c.consume) AS consume,
-                       COALESCE(u.fans_club, '') AS fans_club,
-                       COALESCE(u.grade, '') AS grade,
-                       u.sec_uid, u.avatar_url, u.notes, u.tags,
+                SELECT c.user_id,
+                       MAX(COALESCE(NULLIF(u.user_name, ''), c.user_name)) AS user_name,
+                       SUM(c.consume) AS consume,
+                       MAX(COALESCE(u.fans_club, '')) AS fans_club,
+                       MAX(COALESCE(u.grade, '')) AS grade,
+                       MAX(u.sec_uid) AS sec_uid, MAX(u.avatar_url) AS avatar_url,
+                       MAX(u.notes) AS notes, MAX(u.tags) AS tags,
                        {sessions_col_all} AS sessions_count
                 FROM contributions c
-                JOIN sessions s ON c.session_id = s.id AND strftime('%Y-%m', s.start_time) = ?
+                JOIN sessions s ON c.session_id = s.id AND TO_CHAR(s.start_time, 'YYYY-MM') = %s
                 LEFT JOIN users u ON u.user_id = c.user_id
                 WHERE c.consume > 0 {anchor_filter}
                 GROUP BY c.user_id {having}
-                ORDER BY consume DESC LIMIT ? OFFSET ?
+                ORDER BY consume DESC LIMIT %s OFFSET %s
             ''', params_all).fetchall()
             total = conn.execute(f'''
                 SELECT COUNT(*) FROM (
                     SELECT c.user_id FROM contributions c
-                    JOIN sessions s ON c.session_id = s.id AND strftime('%Y-%m', s.start_time) = ?
+                    JOIN sessions s ON c.session_id = s.id AND TO_CHAR(s.start_time, 'YYYY-MM') = %s
                     WHERE c.consume > 0 {anchor_filter}
                     GROUP BY c.user_id {having}
                 )
-            ''', total_params).fetchone()[0]
+            ''', total_params_list).fetchone()['count']
         else:
             params_all = []
             total_params_list = []
@@ -2576,20 +2629,22 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
                 params_all.append(min_consume)
                 total_params_list.append(min_consume)
             params_all.extend([size, offset])
-            total_params = tuple(total_params_list)
             sessions_join_all = 'JOIN sessions s ON c.session_id = s.id' if anchor_params else ''
             rows = conn.execute(f'''
-                SELECT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name, SUM(c.consume) AS consume,
-                       COALESCE(u.fans_club, '') AS fans_club,
-                       COALESCE(u.grade, '') AS grade,
-                       u.sec_uid, u.avatar_url, u.notes, u.tags,
+                SELECT c.user_id,
+                       MAX(COALESCE(NULLIF(u.user_name, ''), c.user_name)) AS user_name,
+                       SUM(c.consume) AS consume,
+                       MAX(COALESCE(u.fans_club, '')) AS fans_club,
+                       MAX(COALESCE(u.grade, '')) AS grade,
+                       MAX(u.sec_uid) AS sec_uid, MAX(u.avatar_url) AS avatar_url,
+                       MAX(u.notes) AS notes, MAX(u.tags) AS tags,
                        {sessions_col_all} AS sessions_count
                 FROM contributions c
                 {sessions_join_all}
                 LEFT JOIN users u ON u.user_id = c.user_id
                 WHERE c.consume > 0 {anchor_filter}
                 GROUP BY c.user_id {having}
-                ORDER BY consume DESC LIMIT ? OFFSET ?
+                ORDER BY consume DESC LIMIT %s OFFSET %s
             ''', params_all).fetchall()
             total = conn.execute(f'''
                 SELECT COUNT(*) FROM (
@@ -2598,7 +2653,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
                     WHERE c.consume > 0 {anchor_filter}
                     GROUP BY c.user_id {having}
                 )
-            ''', total_params).fetchone()[0]
+            ''', total_params_list).fetchone()['count']
 
     users_list = []
     for i, r in enumerate(rows):
@@ -2611,25 +2666,25 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
 
 def query_user(user_id):
     conn = _get_conn()
-    user = conn.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)).fetchone()
+    user = conn.execute('SELECT * FROM users WHERE user_id = %s', (user_id,)).fetchone()
     if not user:
-        user = conn.execute('SELECT user_id, user_name, fans_club, "" as grade FROM contributions WHERE user_id = ? LIMIT 1', (user_id,)).fetchone()
+        user = conn.execute('SELECT user_id, user_name, fans_club, "" as grade FROM contributions WHERE user_id = %s LIMIT 1', (user_id,)).fetchone()
     if not user:
-        user = conn.execute('SELECT DISTINCT user_id, user_name, grade, fans_club FROM chat_logs WHERE user_id = ? LIMIT 1', (user_id,)).fetchone()
+        user = conn.execute('SELECT DISTINCT user_id, user_name, grade, fans_club FROM chat_logs WHERE user_id = %s LIMIT 1', (user_id,)).fetchone()
     if not user:
         return None
 
     monthly = conn.execute('''
         SELECT year_month, total_consume, sessions_1000, sessions_3000, sessions_10000, sessions_100000, days_active
-        FROM monthly_stats WHERE user_id = ? ORDER BY year_month DESC
+        FROM monthly_stats WHERE user_id = %s ORDER BY year_month DESC
     ''', (user_id,)).fetchall()
 
-    total_consume = conn.execute('SELECT SUM(consume) FROM contributions WHERE user_id = ?', (user_id,)).fetchone()[0] or 0
-    sessions_all = conn.execute('SELECT COUNT(*) FROM contributions WHERE user_id = ? AND qualified_1000 = 1', (user_id,)).fetchone()[0]
+    total_consume = conn.execute('SELECT SUM(consume) FROM contributions WHERE user_id = %s', (user_id,)).fetchone()['sum'] or 0
+    sessions_all = conn.execute('SELECT COUNT(*) FROM contributions WHERE user_id = %s AND qualified_1000 = 1', (user_id,)).fetchone()['count']
 
     # 从最新弹幕中获取财富等级
     latest_chat = conn.execute(
-        'SELECT grade, fans_club FROM chat_logs WHERE user_id = ? AND (grade != "" OR fans_club != "") ORDER BY id DESC LIMIT 1',
+        "SELECT grade, fans_club FROM chat_logs WHERE user_id = %s AND (grade != '' OR fans_club != '') ORDER BY id DESC LIMIT 1",
         (user_id,)
     ).fetchone()
 
@@ -2649,33 +2704,33 @@ def query_user(user_id):
 def query_user_detail(user_id):
     """查询用户深度记录：按场次分组，含每场音浪/礼物/发言/时间线。"""
     conn = _get_conn()
-    user = conn.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)).fetchone()
+    user = conn.execute('SELECT * FROM users WHERE user_id = %s', (user_id,)).fetchone()
     if not user:
-        user = conn.execute('SELECT user_id, user_name, fans_club, "" as grade FROM contributions WHERE user_id = ? LIMIT 1', (user_id,)).fetchone()
+        user = conn.execute('SELECT user_id, user_name, fans_club, "" as grade FROM contributions WHERE user_id = %s LIMIT 1', (user_id,)).fetchone()
     if not user:
-        user = conn.execute('SELECT DISTINCT user_id, user_name, grade, fans_club FROM chat_logs WHERE user_id = ? LIMIT 1', (user_id,)).fetchone()
+        user = conn.execute('SELECT DISTINCT user_id, user_name, grade, fans_club FROM chat_logs WHERE user_id = %s LIMIT 1', (user_id,)).fetchone()
     if not user:
         return None
 
-    total_consume = conn.execute('SELECT SUM(consume) FROM contributions WHERE user_id = ?', (user_id,)).fetchone()[0] or 0
-    total_gifts = conn.execute('SELECT COUNT(*) FROM gift_logs WHERE user_id = ?', (user_id,)).fetchone()[0]
-    total_chats = conn.execute('SELECT COUNT(*) FROM chat_logs WHERE user_id = ?', (user_id,)).fetchone()[0]
+    total_consume = conn.execute('SELECT SUM(consume) FROM contributions WHERE user_id = %s', (user_id,)).fetchone()['sum'] or 0
+    total_gifts = conn.execute('SELECT COUNT(*) FROM gift_logs WHERE user_id = %s', (user_id,)).fetchone()['count']
+    total_chats = conn.execute('SELECT COUNT(*) FROM chat_logs WHERE user_id = %s', (user_id,)).fetchone()['count']
 
     # 从最新弹幕中获取财富等级和粉丝团信息
     latest_chat = conn.execute(
-        'SELECT grade, fans_club FROM chat_logs WHERE user_id = ? AND (grade != "" OR fans_club != "") ORDER BY id DESC LIMIT 1',
+        "SELECT grade, fans_club FROM chat_logs WHERE user_id = %s AND (grade != '' OR fans_club != '') ORDER BY id DESC LIMIT 1",
         (user_id,)
     ).fetchone()
 
     rows = conn.execute("""
         SELECT s.id, s.anchor_name, s.start_time, s.end_time,
                COALESCE(c.consume, 0) as consume,
-               (SELECT COUNT(*) FROM gift_logs WHERE session_id = s.id AND user_id = ?) as gift_count,
-               (SELECT COUNT(*) FROM chat_logs WHERE session_id = s.id AND user_id = ?) as chat_count
+               (SELECT COUNT(*) FROM gift_logs WHERE session_id = s.id AND user_id = %s) as gift_count,
+               (SELECT COUNT(*) FROM chat_logs WHERE session_id = s.id AND user_id = %s) as chat_count
         FROM sessions s
-        LEFT JOIN contributions c ON c.session_id = s.id AND c.user_id = ?
-        WHERE (SELECT COUNT(*) FROM gift_logs WHERE session_id = s.id AND user_id = ?) > 0
-           OR (SELECT COUNT(*) FROM chat_logs WHERE session_id = s.id AND user_id = ?) > 0
+        LEFT JOIN contributions c ON c.session_id = s.id AND c.user_id = %s
+        WHERE (SELECT COUNT(*) FROM gift_logs WHERE session_id = s.id AND user_id = %s) > 0
+           OR (SELECT COUNT(*) FROM chat_logs WHERE session_id = s.id AND user_id = %s) > 0
            OR (c.id IS NOT NULL)
         ORDER BY s.id DESC
     """, (user_id, user_id, user_id, user_id, user_id)).fetchall()
@@ -2697,7 +2752,7 @@ def query_user_detail(user_id):
         sd = dict(s)
         # 查询该场次的最后财富等级和粉丝团
         sess_info = conn.execute(
-            'SELECT grade, fans_club FROM chat_logs WHERE session_id = ? AND user_id = ? AND (grade != "" OR fans_club != "") ORDER BY id DESC LIMIT 1',
+            "SELECT grade, fans_club FROM chat_logs WHERE session_id = %s AND user_id = %s AND (grade != '' OR fans_club != '') ORDER BY id DESC LIMIT 1",
             (s['id'], user_id)
         ).fetchone()
         if sess_info and sess_info['grade']:
@@ -2706,16 +2761,16 @@ def query_user_detail(user_id):
             sd['fans_club'] = sess_info['fans_club']
         # 如果 chat_logs 没有，从 users 表获取
         if not sd.get('grade') or not sd.get('fans_club'):
-            u_info = conn.execute('SELECT grade, fans_club FROM users WHERE user_id = ?', (user_id,)).fetchone()
+            u_info = conn.execute('SELECT grade, fans_club FROM users WHERE user_id = %s', (user_id,)).fetchone()
             if u_info:
                 if not sd.get('grade') and u_info['grade']:
                     sd['grade'] = u_info['grade']
                 if not sd.get('fans_club') and u_info['fans_club']:
                     sd['fans_club'] = u_info['fans_club']
         tl = []
-        for row in conn.execute("SELECT created_at as time, 'chat' as type, content, '' as amount FROM chat_logs WHERE session_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 500", (s['id'], user_id)).fetchall():
+        for row in conn.execute("SELECT created_at as time, 'chat' as type, content, '' as amount FROM chat_logs WHERE session_id = %s AND user_id = %s ORDER BY created_at DESC LIMIT 500", (s['id'], user_id)).fetchall():
             tl.append(dict(row))
-        for row in conn.execute("SELECT created_at as time, 'gift' as type, gift_name || ' x ' || gift_count as content, diamond_total as amount FROM gift_logs WHERE session_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 500", (s['id'], user_id)).fetchall():
+        for row in conn.execute("SELECT created_at as time, 'gift' as type, gift_name || ' x ' || gift_count as content, diamond_total as amount FROM gift_logs WHERE session_id = %s AND user_id = %s ORDER BY created_at DESC LIMIT 500", (s['id'], user_id)).fetchall():
             tl.append(dict(row))
         tl.sort(key=lambda x: str(x.get('time', '')), reverse=True)
         sd['timeline'] = tl[:500]
@@ -2730,39 +2785,39 @@ def query_user_timeline(user_id, type_filter='all', keyword='', page=1, size=50)
     results = []
 
     if type_filter in ('all', 'chat'):
-        sql = '''SELECT c.created_at as time, "chat" as type, c.content, "" as amount, c.grade,
+        sql = """SELECT c.created_at as time, 'chat' as type, c.content, '' as amount, c.grade,
                         COALESCE(s.anchor_name, '') as anchor_name
                  FROM chat_logs c
                  LEFT JOIN sessions s ON s.id = c.session_id
-                 WHERE c.user_id = ?'''
+                 WHERE c.user_id = %s"""
         params = [user_id]
         if keyword:
-            sql += ' AND c.content LIKE ?'
+            sql += ' AND c.content LIKE %s'
             params.append(f'%{keyword}%')
-        sql += ' ORDER BY c.created_at DESC LIMIT ? OFFSET ?'
+        sql += ' ORDER BY c.created_at DESC LIMIT %s OFFSET %s'
         for row in conn.execute(sql, params + [size, offset]):
             results.append(dict(row))
 
     if type_filter in ('all', 'gift'):
-        sql = '''SELECT g.created_at as time, "gift" as type, g.gift_name || " x " || g.gift_count as content,
+        sql = """SELECT g.created_at as time, 'gift' as type, g.gift_name || ' x ' || g.gift_count as content,
                         g.diamond_total as amount,
                         COALESCE(s.anchor_name, '') as anchor_name
                  FROM gift_logs g
                  LEFT JOIN sessions s ON s.id = g.session_id
-                 WHERE g.user_id = ?'''
+                 WHERE g.user_id = %s"""
         params = [user_id]
         if keyword:
-            sql += ' AND (g.gift_name LIKE ?)'
+            sql += ' AND (g.gift_name LIKE %s)'
             params.append(f'%{keyword}%')
-        sql += ' ORDER BY g.created_at DESC LIMIT ? OFFSET ?'
+        sql += ' ORDER BY g.created_at DESC LIMIT %s OFFSET %s'
         for row in conn.execute(sql, params + [size, offset]):
             results.append(dict(row))
 
     results.sort(key=lambda x: str(x.get('time', '')), reverse=True)
     results = results[:size]
 
-    total = conn.execute('SELECT COUNT(*) FROM chat_logs WHERE user_id = ?', (user_id,)).fetchone()[0] + \
-            conn.execute('SELECT COUNT(*) FROM gift_logs WHERE user_id = ?', (user_id,)).fetchone()[0]
+    total = conn.execute('SELECT COUNT(*) FROM chat_logs WHERE user_id = %s', (user_id,)).fetchone()['count'] + \
+            conn.execute('SELECT COUNT(*) FROM gift_logs WHERE user_id = %s', (user_id,)).fetchone()['count']
     return {'timeline': results, 'total': total, 'page': page}
 
 
@@ -2772,19 +2827,19 @@ def query_chat(user_id='', keyword='', page=1, size=50):
     where = []
     params = []
     if user_id:
-        where.append('c.user_id = ?')
+        where.append('c.user_id = %s')
         params.append(user_id)
     if keyword:
-        where.append('c.content LIKE ?')
+        where.append('c.content LIKE %s')
         params.append(f'%{keyword}%')
     w = ' AND '.join(where) if where else '1=1'
-    total = conn.execute(f'SELECT COUNT(*) FROM chat_logs c WHERE {w}', params).fetchone()[0]
+    total = conn.execute(f'SELECT COUNT(*) FROM chat_logs c WHERE {w}', params).fetchone()['count']
     rows = conn.execute(f'''SELECT c.created_at as time, c.user_id, c.user_name, c.content, c.grade, c.fans_club,
                                    COALESCE(s.anchor_name, '') as anchor_name
                             FROM chat_logs c
                             LEFT JOIN sessions s ON s.id = c.session_id
                             WHERE {w}
-                            ORDER BY c.created_at DESC LIMIT ? OFFSET ?''',
+                            ORDER BY c.created_at DESC LIMIT %s OFFSET %s''',
                         params + [size, offset]).fetchall()
     return {'chats': [dict(r) for r in rows], 'total': total, 'page': page}
 
@@ -2795,9 +2850,9 @@ def query_anonymous(page=1, size=50, search=''):
     where = "COALESCE(u.anonymous_label, '') != '' AND COALESCE(u.anonymous_label, '') != 'fake'"
     params = []
     if search:
-        where += ' AND (u.user_name LIKE ? OR u.user_id LIKE ?)'
+        where += ' AND (u.user_name LIKE %s OR u.user_id LIKE %s)'
         params.extend([f'%{search}%', f'%{search}%'])
-    total = conn.execute(f'SELECT COUNT(*) FROM users u WHERE {where}', params).fetchone()[0]
+    total = conn.execute(f'SELECT COUNT(*) FROM users u WHERE {where}', params).fetchone()['count']
     rows = conn.execute(f'''
         SELECT u.user_id AS real_user_id, u.user_name,
                u.anonymous_label, u.grade, u.fans_club,
@@ -2805,7 +2860,7 @@ def query_anonymous(page=1, size=50, search=''):
                COUNT(c.id) AS sessions_count, MAX(c.recorded_at) AS last_seen
         FROM users u LEFT JOIN contributions c ON c.user_id = u.user_id
         WHERE {where}
-        GROUP BY u.user_id ORDER BY consume DESC LIMIT ? OFFSET ?
+        GROUP BY u.user_id, u.user_name, u.anonymous_label, u.grade, u.fans_club ORDER BY consume DESC LIMIT %s OFFSET %s
     ''', params + [size, offset]).fetchall()
     return {'users': [dict(r) for r in rows], 'total': total, 'page': page}
 
@@ -2822,10 +2877,10 @@ def query_million(year_month='', page=1, size=100):
                COALESCE(u.fans_club, '') as fans_club
         FROM monthly_stats m
         LEFT JOIN users u ON u.user_id = m.user_id
-        WHERE m.year_month = ? AND m.total_consume >= 1000000
-        ORDER BY m.total_consume DESC LIMIT ? OFFSET ?
+        WHERE m.year_month = %s AND m.total_consume >= 1000000
+        ORDER BY m.total_consume DESC LIMIT %s OFFSET %s
     ''', (year_month, size, offset)).fetchall()
-    total = conn.execute('SELECT COUNT(*) FROM monthly_stats WHERE year_month = ? AND total_consume >= 1000000', (year_month,)).fetchone()[0]
+    total = conn.execute('SELECT COUNT(*) FROM monthly_stats WHERE year_month = %s AND total_consume >= 1000000', (year_month,)).fetchone()['count']
     users = []
     for i, r in enumerate(rows):
         d = dict(r)
@@ -2843,7 +2898,7 @@ def query_sessions(limit=20, anchor=''):
                 (SELECT COALESCE(SUM(diamond_total), 0) FROM gift_logs WHERE session_id = s.id) as total_diamonds,
                 (SELECT COUNT(*) FROM gift_logs WHERE session_id = s.id) as total_gifts,
                 (SELECT COUNT(*) FROM chat_logs WHERE session_id = s.id) as total_chats
-            FROM sessions s WHERE s.anchor_name LIKE ? ORDER BY id DESC LIMIT ?
+            FROM sessions s WHERE s.anchor_name LIKE %s ORDER BY id DESC LIMIT %s
         ''', (f'%{anchor}%', limit)).fetchall()
     else:
         rows = conn.execute('''
@@ -2852,7 +2907,7 @@ def query_sessions(limit=20, anchor=''):
                 (SELECT COALESCE(SUM(diamond_total), 0) FROM gift_logs WHERE session_id = s.id) as total_diamonds,
                 (SELECT COUNT(*) FROM gift_logs WHERE session_id = s.id) as total_gifts,
                 (SELECT COUNT(*) FROM chat_logs WHERE session_id = s.id) as total_chats
-            FROM sessions s ORDER BY id DESC LIMIT ?
+            FROM sessions s ORDER BY id DESC LIMIT %s
         ''', (limit,)).fetchall()
     return [dict(r) for r in rows]
 
@@ -2860,7 +2915,7 @@ def query_sessions(limit=20, anchor=''):
 def query_session_detail(session_id, top_n=50):
     """查询单场次的详细信息：基础信息 + 贡献用户分层 + Top贡献用户 + 礼物/弹幕统计。"""
     conn = _get_conn()
-    session = conn.execute('SELECT * FROM sessions WHERE id = ?', (session_id,)).fetchone()
+    session = conn.execute('SELECT * FROM sessions WHERE id = %s', (session_id,)).fetchone()
     if not session:
         return None
     result = dict(session)
@@ -2869,14 +2924,14 @@ def query_session_detail(session_id, top_n=50):
     gift_stats = conn.execute('''
         SELECT COUNT(*) as total_gifts, COALESCE(SUM(diamond_total), 0) as total_diamonds,
                COUNT(DISTINCT user_id) as gift_users
-        FROM gift_logs WHERE session_id = ?
+        FROM gift_logs WHERE session_id = %s
     ''', (session_id,)).fetchone()
     result['gift_stats'] = dict(gift_stats) if gift_stats else {}
 
     # 弹幕统计
     chat_stats = conn.execute('''
         SELECT COUNT(*) as total_chats, COUNT(DISTINCT user_id) as chat_users
-        FROM chat_logs WHERE session_id = ?
+        FROM chat_logs WHERE session_id = %s
     ''', (session_id,)).fetchone()
     result['chat_stats'] = dict(chat_stats) if chat_stats else {}
 
@@ -2888,7 +2943,7 @@ def query_session_detail(session_id, top_n=50):
             SUM(CASE WHEN qualified_3000 = 1 THEN 1 ELSE 0 END) as tier_3000,
             SUM(CASE WHEN qualified_10000 = 1 THEN 1 ELSE 0 END) as tier_10000,
             SUM(CASE WHEN qualified_100000 = 1 THEN 1 ELSE 0 END) as tier_100000
-        FROM contributions WHERE session_id = ?
+        FROM contributions WHERE session_id = %s
     ''', (session_id,)).fetchone()
     result['tier_counts'] = dict(tier_counts) if tier_counts else {}
 
@@ -2908,16 +2963,16 @@ def query_session_detail(session_id, top_n=50):
         FROM contributions c
         LEFT JOIN users u ON u.user_id = c.user_id
         JOIN sessions s ON s.id = c.session_id
-        WHERE c.session_id = ? AND c.consume > 0
-        ORDER BY c.consume DESC LIMIT ?
+        WHERE c.session_id = %s AND c.consume > 0
+        ORDER BY c.consume DESC LIMIT %s
     ''', (session_id, top_n)).fetchall()
     result['top_users'] = [dict(r) for r in top]
 
     # 礼物类型分布 Top N
     gifts = conn.execute('''
         SELECT gift_name, COUNT(*) as times, SUM(gift_count) as total_count, SUM(diamond_total) as total_diamonds
-        FROM gift_logs WHERE session_id = ?
-        GROUP BY gift_name ORDER BY total_diamonds DESC LIMIT ?
+        FROM gift_logs WHERE session_id = %s
+        GROUP BY gift_name ORDER BY total_diamonds DESC LIMIT %s
     ''', (session_id, top_n)).fetchall()
     result['top_gifts'] = [dict(r) for r in gifts]
 
@@ -2928,27 +2983,33 @@ def query_search(q, page=1, size=20):
     conn = _get_conn()
     offset = (page - 1) * size
     rows = conn.execute('''
-        SELECT DISTINCT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name,
+        SELECT c.user_id,
+               COALESCE(NULLIF(u.user_name, ''), MAX(c.user_name)) AS user_name,
                COALESCE(m.total_consume, 0) as total_consume,
-               COALESCE(m.sessions_1000, 0) as sessions_1000, c.fans_club,
+               COALESCE(m.sessions_1000, 0) as sessions_1000,
+               MAX(c.fans_club) as fans_club,
                u.sec_uid, u.avatar_url
         FROM contributions c
-        LEFT JOIN monthly_stats m ON m.user_id = c.user_id AND m.year_month = strftime('%Y-%m', 'now')
+        LEFT JOIN monthly_stats m ON m.user_id = c.user_id AND m.year_month = TO_CHAR(NOW(), 'YYYY-MM')
         LEFT JOIN users u ON u.user_id = c.user_id
-        WHERE c.user_id = ?
-        ORDER BY c.consume DESC LIMIT ? OFFSET ?
+        WHERE c.user_id = %s
+        GROUP BY c.user_id, m.total_consume, m.sessions_1000, u.sec_uid, u.avatar_url, u.user_name
+        ORDER BY MAX(c.consume) DESC LIMIT %s OFFSET %s
     ''', (q, size, offset)).fetchall()
     if not rows:
         rows = conn.execute('''
-            SELECT DISTINCT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name,
+            SELECT c.user_id,
+                   COALESCE(NULLIF(u.user_name, ''), MAX(c.user_name)) AS user_name,
                    COALESCE(m.total_consume, 0) as total_consume,
-                   COALESCE(m.sessions_1000, 0) as sessions_1000, c.fans_club,
+                   COALESCE(m.sessions_1000, 0) as sessions_1000,
+                   MAX(c.fans_club) as fans_club,
                    u.sec_uid, u.avatar_url
             FROM contributions c
-            LEFT JOIN monthly_stats m ON m.user_id = c.user_id AND m.year_month = strftime('%Y-%m', 'now')
+            LEFT JOIN monthly_stats m ON m.user_id = c.user_id AND m.year_month = TO_CHAR(NOW(), 'YYYY-MM')
             LEFT JOIN users u ON u.user_id = c.user_id
-            WHERE c.user_name LIKE ?
-            ORDER BY c.consume DESC LIMIT ? OFFSET ?
+            WHERE c.user_name LIKE %s
+            GROUP BY c.user_id, m.total_consume, m.sessions_1000, u.sec_uid, u.avatar_url, u.user_name
+            ORDER BY MAX(c.consume) DESC LIMIT %s OFFSET %s
         ''', (f'%{q}%', size, offset)).fetchall()
     return {'users': [dict(r) for r in rows], 'total': len(rows), 'page': page}
 
@@ -2976,7 +3037,7 @@ def query_audit():
 
     # ── 3. 时间间隙检测（最近 10 场） ──
     recent = conn.execute(
-        'SELECT id FROM gift_logs GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT 10'
+        'SELECT session_id FROM gift_logs GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT 10'
     ).fetchall()
     all_gaps = []
     max_gap = 0
@@ -2984,8 +3045,8 @@ def query_audit():
     gap_details = []
     for row in recent:
         times = conn.execute(
-            'SELECT created_at FROM gift_logs WHERE session_id = ? ORDER BY created_at',
-            (row['id'],)
+            'SELECT created_at FROM gift_logs WHERE session_id = %s ORDER BY created_at',
+            (row['session_id'],)
         ).fetchall()
         for i in range(1, len(times)):
             try:
@@ -3049,13 +3110,13 @@ def query_audit():
     result['sessions'] = session_list
 
     # ── 5. 异常用户名检测 ──
-    bad = conn.execute('''
+    bad = conn.execute("""
         SELECT user_id, user_name FROM users
-        WHERE user_name LIKE '2@%'
-           OR instr(user_name, x'02') > 0
-           OR instr(user_name, x'03') > 0
+        WHERE user_name LIKE '2@%%'
+           OR POSITION(chr(2) IN user_name) > 0
+           OR POSITION(chr(3) IN user_name) > 0
         LIMIT 50
-    ''').fetchall()
+    """).fetchall()
     result['bad_usernames'] = [dict(r) for r in bad]
 
     # ── 6. 匿名用户解析率 ──
@@ -3092,7 +3153,7 @@ def query_audit():
             COUNT(DISTINCT g.user_id) AS user_cnt
         FROM gift_logs g
         JOIN sessions s ON s.id = g.session_id
-        GROUP BY g.session_id
+        GROUP BY g.session_id, s.anchor_name
         ORDER BY g.session_id DESC LIMIT 20
     ''').fetchall()
     dedup_list = []

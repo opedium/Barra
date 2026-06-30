@@ -181,12 +181,12 @@ class StreamerManager:
 
     def _ensure_table(self):
         conn = _get_conn()
-        conn.execute('''CREATE TABLE IF NOT EXISTS streamer_config (
+        conn.execute("""CREATE TABLE IF NOT EXISTS streamer_config (
             live_id TEXT PRIMARY KEY,
             anchor_name TEXT DEFAULT '',
             enabled INTEGER DEFAULT 0,
-            added_at DATETIME DEFAULT (datetime('now', '+8 hours'))
-        )''')
+            added_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai')
+        )""")
         conn.commit()
 
     # ── seed from rooms.txt ──────────────────────────────────
@@ -202,7 +202,7 @@ class StreamerManager:
         if not os.path.exists(rooms_file):
             return
         conn = _get_conn()
-        existing = set(r[0] for r in conn.execute(
+        existing = set(r['live_id'] for r in conn.execute(
             'SELECT live_id FROM streamer_config').fetchall())
         try:
             with open(rooms_file, 'r', encoding='utf-8') as f:
@@ -217,8 +217,8 @@ class StreamerManager:
                     name = parts[1].strip() if len(parts) > 1 else ''
                     if live_id and live_id not in existing:
                         conn.execute(
-                            'INSERT OR IGNORE INTO streamer_config '
-                            '(live_id, anchor_name, enabled) VALUES (?, ?, 0)',
+                            'INSERT INTO streamer_config '
+                            '(live_id, anchor_name, enabled) VALUES (%s, %s, 0) ON CONFLICT DO NOTHING',
                             (live_id, name))
             conn.commit()
         except Exception as e:
@@ -239,14 +239,14 @@ class StreamerManager:
 
         conn = _get_conn()
         row = conn.execute(
-            'SELECT anchor_name FROM streamer_config WHERE live_id = ?',
+            'SELECT anchor_name FROM streamer_config WHERE live_id = %s',
             (live_id,)).fetchone()
         anchor_name = row['anchor_name'] if row else ''
 
         def _on_room_info(rid, name):
             if name:
                 c = _get_conn()
-                c.execute('UPDATE streamer_config SET anchor_name = ? WHERE live_id = ?',
+                c.execute('UPDATE streamer_config SET anchor_name = %s WHERE live_id = %s',
                           (name, rid))
                 c.commit()
 
@@ -282,7 +282,7 @@ class StreamerManager:
             thread.start()
 
             conn = _get_conn()
-            conn.execute('UPDATE streamer_config SET enabled = 1 WHERE live_id = ?',
+            conn.execute('UPDATE streamer_config SET enabled = 1 WHERE live_id = %s',
                          (live_id,))
             conn.commit()
 
@@ -304,7 +304,7 @@ class StreamerManager:
                 pass
 
         conn = _get_conn()
-        conn.execute('UPDATE streamer_config SET enabled = 0 WHERE live_id = ?',
+        conn.execute('UPDATE streamer_config SET enabled = 0 WHERE live_id = %s',
                      (live_id,))
         conn.commit()
 
@@ -368,7 +368,7 @@ class StreamerManager:
         conn = _get_conn()
         try:
             conn.execute(
-                'INSERT INTO streamer_config (live_id, anchor_name) VALUES (?, ?)',
+                'INSERT INTO streamer_config (live_id, anchor_name) VALUES (%s, %s)',
                 (live_id, anchor_name))
             conn.commit()
             return True, 'Added'
@@ -378,7 +378,7 @@ class StreamerManager:
     def remove_streamer(self, live_id):
         self.stop_streamer(live_id)
         conn = _get_conn()
-        conn.execute('DELETE FROM streamer_config WHERE live_id = ?', (live_id,))
+        conn.execute('DELETE FROM streamer_config WHERE live_id = %s', (live_id,))
         conn.commit()
 
         # Also comment out the line in rooms.txt so it doesn't come back on restart
@@ -641,7 +641,7 @@ def index():
                 (SELECT COUNT(*) FROM gift_logs WHERE session_id=s.id) as total_gifts,
                 (SELECT COUNT(*) FROM chat_logs WHERE session_id=s.id) as total_chats,
                 (SELECT COUNT(*) FROM contributions WHERE session_id=s.id AND qualified_1000=1) as user_count
-            FROM sessions s WHERE s.id=?
+            FROM sessions s WHERE s.id=%s
         """, (sid,)).fetchone()
     else:
         live = conn.execute("""
@@ -652,12 +652,12 @@ def index():
             FROM sessions s WHERE status='live' ORDER BY s.id DESC LIMIT 1
         """).fetchone()
     live_sessions = conn.execute("SELECT id, anchor_name, room_id, start_time FROM sessions WHERE status='live' ORDER BY id DESC").fetchall()
-    total_gifts = conn.execute('SELECT COUNT(*) FROM gift_logs').fetchone()[0]
-    total_chats = conn.execute('SELECT COUNT(*) FROM chat_logs').fetchone()[0]
-    total_sessions = conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0]
-    today = conn.execute("SELECT COUNT(*) FROM gift_logs WHERE date(created_at)=date('now')").fetchone()[0]
-    today_chats = conn.execute("SELECT COUNT(*) FROM chat_logs WHERE date(created_at)=date('now')").fetchone()[0]
-    today_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM gift_logs WHERE date(created_at)=date('now')").fetchone()[0]
+    total_gifts = conn.execute('SELECT COUNT(*) FROM gift_logs').fetchone()['count']
+    total_chats = conn.execute('SELECT COUNT(*) FROM chat_logs').fetchone()['count']
+    total_sessions = conn.execute('SELECT COUNT(*) FROM sessions').fetchone()['count']
+    today = conn.execute("SELECT COUNT(*) FROM gift_logs WHERE DATE(created_at) = CURRENT_DATE").fetchone()['count']
+    today_chats = conn.execute("SELECT COUNT(*) FROM chat_logs WHERE DATE(created_at) = CURRENT_DATE").fetchone()['count']
+    today_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM gift_logs WHERE DATE(created_at) = CURRENT_DATE").fetchone()['count']
     recent = conn.execute('SELECT s.*, (SELECT COUNT(*) FROM gift_logs WHERE session_id=s.id) as total_gifts, (SELECT COUNT(*) FROM chat_logs WHERE session_id=s.id) as total_chats FROM sessions s ORDER BY s.id DESC LIMIT 10').fetchall()
     recent_chats = conn.execute('''
         SELECT cl.user_name, cl.user_id, cl.content, cl.created_at as time,
@@ -671,14 +671,14 @@ def index():
         anchor_name = live['anchor_name']
         top = conn.execute('''
             SELECT c.user_id, c.user_name, c.consume,
-                   CASE WHEN ? != '' THEN '[粉丝团:' || ? || ']' ELSE '' END AS fans_club,
+                   CASE WHEN %s != '' THEN '[粉丝团:' || %s || ']' ELSE '' END AS fans_club,
                    COALESCE(u.grade, (SELECT grade FROM chat_logs WHERE user_id=c.user_id AND grade!='' ORDER BY id DESC LIMIT 1), '') as grade,
                    u.sec_uid, u.avatar_url,
                    (SELECT COUNT(*) FROM gift_logs WHERE session_id=c.session_id AND user_id=c.user_id) as gift_count,
                    (SELECT COUNT(*) FROM chat_logs WHERE session_id=c.session_id AND user_id=c.user_id) as chat_count
             FROM contributions c
             LEFT JOIN users u ON u.user_id = c.user_id
-            WHERE c.session_id=? ORDER BY c.consume DESC LIMIT 10
+            WHERE c.session_id=%s ORDER BY c.consume DESC LIMIT 10
         ''', (anchor_name, anchor_name, live['id'],)).fetchall()
         top_users = [dict(r) for r in top]
 
@@ -686,20 +686,30 @@ def index():
     anchor_avatar = ''
     if live:
         anchor_row = conn.execute(
-            'SELECT avatar_url FROM users WHERE sec_uid != "" AND user_name = ? LIMIT 1',
+            "SELECT avatar_url FROM users WHERE sec_uid != '' AND user_name = %s LIMIT 1",
             (live['anchor_name'],)
         ).fetchone()
         if anchor_row and anchor_row['avatar_url']:
             anchor_avatar = anchor_row['avatar_url']
 
+    def _dt_to_str(d):
+        """Convert datetime objects to string before template rendering."""
+        if isinstance(d, dict):
+            return {k: _dt_to_str(v) for k, v in d.items()}
+        elif isinstance(d, list):
+            return [_dt_to_str(i) for i in d]
+        elif hasattr(d, 'strftime'):
+            return d.strftime('%Y-%m-%d %H:%M:%S')
+        return d
+
     return render_template('index.html',
-        session=dict(live) if live else None,
+        session=_dt_to_str(dict(live)) if live else None,
         anchor_avatar=anchor_avatar,
-        live_sessions=[dict(r) for r in live_sessions],
+        live_sessions=_dt_to_str([dict(r) for r in live_sessions]),
         stats={'total_gifts': total_gifts, 'total_chats': total_chats, 'total_sessions': total_sessions, 'today_gifts': today, 'today_chats': today_chats, 'today_users': today_users},
-        sessions=[dict(r) for r in recent],
-        recent_chats=[dict(r) for r in recent_chats],
-        top_users=top_users,
+        sessions=_dt_to_str([dict(r) for r in recent]),
+        recent_chats=_dt_to_str([dict(r) for r in recent_chats]),
+        top_users=_dt_to_str(top_users),
         db_path=DB_PATH,
         auto_refresh=_web_config['auto_refresh'],
         auth_enabled=bool(_web_config['password']))
@@ -806,22 +816,22 @@ def api_compare():
     conn = _get_conn()
     result = {'sessions': []}
     for sid in ids:
-        s = conn.execute('SELECT * FROM sessions WHERE id = ?', (sid,)).fetchone()
+        s = conn.execute('SELECT * FROM sessions WHERE id = %s', (sid,)).fetchone()
         if not s:
             continue
         session_data = dict(s)
         gifts = conn.execute(
             'SELECT COUNT(*) as total_gifts, COALESCE(SUM(diamond_total), 0) as total_diamonds '
-            'FROM gift_logs WHERE session_id = ?', (sid,)).fetchone()
+            'FROM gift_logs WHERE session_id = %s', (sid,)).fetchone()
         chats = conn.execute(
-            'SELECT COUNT(*) as total_chats FROM chat_logs WHERE session_id = ?',
+            'SELECT COUNT(*) as total_chats FROM chat_logs WHERE session_id = %s',
             (sid,)).fetchone()
         users = conn.execute(
             'SELECT COUNT(*) as total_users FROM contributions '
-            'WHERE session_id = ? AND qualified_1000 = 1', (sid,)).fetchone()
+            'WHERE session_id = %s AND qualified_1000 = 1', (sid,)).fetchone()
         top_gift = conn.execute(
             'SELECT gift_name, SUM(diamond_total) as total FROM gift_logs '
-            'WHERE session_id = ? GROUP BY gift_name ORDER BY total DESC LIMIT 1',
+            'WHERE session_id = %s GROUP BY gift_name ORDER BY total DESC LIMIT 1',
             (sid,)).fetchone()
         session_data['total_gifts'] = gifts['total_gifts'] if gifts else 0
         session_data['total_diamonds'] = gifts['total_diamonds'] if gifts else 0
@@ -888,7 +898,7 @@ def api_leaderboard():
         conn = _get_conn()
         s = conn.execute("SELECT id FROM sessions WHERE status='live' ORDER BY id DESC LIMIT 1").fetchone()
         if s:
-            session_id = s[0]
+            session_id = s['id']
         else:
             # No live session and no explicit session_id — return empty
             return jsonify({'users': [], 'total': 0, 'page': 1})
@@ -946,20 +956,20 @@ def api_user():
             params = []
             if need_avatar and fetched.get('avatar_url'):
                 data['avatar_url'] = fetched['avatar_url']
-                updates.append('avatar_url = ?')
+                updates.append('avatar_url = %s')
                 params.append(fetched['avatar_url'])
             if need_sec_uid and fetched.get('sec_uid'):
                 data['sec_uid'] = fetched['sec_uid']
-                updates.append('sec_uid = ?')
+                updates.append('sec_uid = %s')
                 params.append(fetched['sec_uid'])
             if fetched.get('nickname'):
                 data['user_name'] = fetched['nickname']
-                updates.append('user_name = ?')
+                updates.append('user_name = %s')
                 params.append(fetched['nickname'])
             if updates:
                 params.append(uid)
                 conn = _get_conn()
-                conn.execute(f'UPDATE users SET {", ".join(updates)} WHERE user_id = ?', params)
+                conn.execute(f'UPDATE users SET {", ".join(updates)} WHERE user_id = %s', params)
                 conn.commit()
 
     return jsonify(data)
@@ -984,7 +994,7 @@ def api_user_gifts(user_id):
                       COALESCE(s.anchor_name, '') as anchor_name
                FROM gift_logs g
                LEFT JOIN sessions s ON s.id = g.session_id
-               WHERE g.user_id=? AND g.session_id=?
+               WHERE g.user_id=%s AND g.session_id=%s
                ORDER BY g.created_at DESC LIMIT 5000''',
             (user_id, session_id)).fetchall()
     else:
@@ -993,7 +1003,7 @@ def api_user_gifts(user_id):
                       COALESCE(s.anchor_name, '') as anchor_name
                FROM gift_logs g
                LEFT JOIN sessions s ON s.id = g.session_id
-               WHERE g.user_id=?
+               WHERE g.user_id=%s
                ORDER BY g.created_at DESC LIMIT 5000''',
             (user_id,)).fetchall()
     return jsonify([dict(r) for r in rows])
@@ -1008,7 +1018,7 @@ def api_user_notes(user_id):
     conn = _get_conn()
     conn.execute('''
         INSERT INTO users (user_id, user_name, notes, tags)
-        VALUES (?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s)
         ON CONFLICT(user_id) DO UPDATE SET
             notes = excluded.notes,
             tags = excluded.tags
@@ -1051,7 +1061,7 @@ def api_user_avatar_lookup():
     # 传了 user_id：先从本地 DB 查
     conn = _get_conn()
     user = conn.execute(
-        'SELECT user_id, user_name, sec_uid, avatar_url, grade, fans_club FROM users WHERE user_id = ?',
+        'SELECT user_id, user_name, sec_uid, avatar_url, grade, fans_club FROM users WHERE user_id = %s',
         (user_id,)
     ).fetchone()
 
@@ -1079,15 +1089,15 @@ def api_user_avatar_lookup():
             updates = []
             params = []
             if info.get('avatar_url'):
-                updates.append('avatar_url = ?')
+                updates.append('avatar_url = %s')
                 params.append(info['avatar_url'])
             if info.get('nickname') and info['nickname'] != user['user_name']:
-                updates.append('user_name = ?')
+                updates.append('user_name = %s')
                 params.append(info['nickname'])
             if updates:
                 params.append(user_id)
                 conn.execute(
-                    f'UPDATE users SET {", ".join(updates)} WHERE user_id = ?',
+                    f'UPDATE users SET {", ".join(updates)} WHERE user_id = %s',
                     params
                 )
                 conn.commit()
@@ -1120,18 +1130,18 @@ def api_user_avatar_lookup():
         updates = []
         params = []
         if info.get('avatar_url'):
-            updates.append('avatar_url = ?')
+            updates.append('avatar_url = %s')
             params.append(info['avatar_url'])
         if info.get('sec_uid'):
-            updates.append('sec_uid = ?')
+            updates.append('sec_uid = %s')
             params.append(info['sec_uid'])
         if info.get('nickname'):
-            updates.append('user_name = ?')
+            updates.append('user_name = %s')
             params.append(info['nickname'])
         if updates:
             params.append(user_id)
             conn.execute(
-                f'UPDATE users SET {", ".join(updates)} WHERE user_id = ?',
+                f'UPDATE users SET {", ".join(updates)} WHERE user_id = %s',
                 params
             )
             conn.commit()
@@ -1205,21 +1215,21 @@ def api_anonymous_resolve():
                     sec = info.get('sec_uid', '')
                     avatar = info.get('avatar_url', '')
                     conn.execute(
-                        'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0 WHERE user_id = ?',
+                        "UPDATE users SET user_name = %s, sec_uid = CASE WHEN %s != '' THEN %s ELSE sec_uid END, avatar_url = CASE WHEN %s != '' THEN %s ELSE avatar_url END, is_anonymous = 0 WHERE user_id = %s",
                         (nick, sec, sec, avatar, avatar, uid)
                     )
                     if resolved_id and resolved_id != uid:
                         conn.execute(
-                            'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0 WHERE user_id = ?',
+                            "UPDATE users SET user_name = %s, sec_uid = CASE WHEN %s != '' THEN %s ELSE sec_uid END, avatar_url = CASE WHEN %s != '' THEN %s ELSE avatar_url END, is_anonymous = 0 WHERE user_id = %s",
                             (nick, sec, sec, avatar, avatar, resolved_id)
                         )
                     conn.commit()
                     resolved += 1
                     continue
             # API 返回空（用户不存在）+ 无贡献 → 假用户（如订阅垃圾ID），移出匿名统计
-            has_consume = conn.execute('SELECT COUNT(*) FROM contributions WHERE user_id = ?', (uid,)).fetchone()[0]
+            has_consume = conn.execute('SELECT COUNT(*) FROM contributions WHERE user_id = %s', (uid,)).fetchone()['count']
             if has_consume == 0:
-                conn.execute('UPDATE users SET is_anonymous = 0, anonymous_label = "fake" WHERE user_id = ?', (uid,))
+                conn.execute('UPDATE users SET is_anonymous = 0, anonymous_label = "fake" WHERE user_id = %s', (uid,))
                 conn.commit()
                 resolved += 1  # 算作"已处理"
                 continue
@@ -1269,10 +1279,10 @@ def api_session_hourly(session_id):
     """返回该场次按小时的礼物活跃度分布。"""
     conn = _get_conn()
     rows = conn.execute('''
-        SELECT CAST(strftime('%H', created_at) AS INTEGER) as hour,
+        SELECT CAST(TO_CHAR(created_at, 'HH24') AS INTEGER) as hour,
                COUNT(*) as count
         FROM gift_logs
-        WHERE session_id = ?
+        WHERE session_id = %s
         GROUP BY hour ORDER BY hour
     ''', (session_id,)).fetchall()
     return jsonify({'hours': [dict(r) for r in rows]})
@@ -1335,11 +1345,11 @@ def api_search():
 def api_stats():
     conn = _get_conn()
     return jsonify({
-        'total_users': conn.execute('SELECT COUNT(DISTINCT user_id) FROM contributions').fetchone()[0],
-        'total_gifts': conn.execute('SELECT COUNT(*) FROM gift_logs').fetchone()[0],
-        'total_chats': conn.execute('SELECT COUNT(*) FROM chat_logs').fetchone()[0],
-        'total_sessions': conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0],
-        'active_session': conn.execute("SELECT COUNT(*) FROM sessions WHERE status='live'").fetchone()[0] > 0,
+        'total_users': conn.execute('SELECT COUNT(DISTINCT user_id) FROM contributions').fetchone()['count'],
+        'total_gifts': conn.execute('SELECT COUNT(*) FROM gift_logs').fetchone()['count'],
+        'total_chats': conn.execute('SELECT COUNT(*) FROM chat_logs').fetchone()['count'],
+        'total_sessions': conn.execute('SELECT COUNT(*) FROM sessions').fetchone()['count'],
+        'active_session': conn.execute("SELECT COUNT(*) FROM sessions WHERE status='live'").fetchone()['count'] > 0,
     })
 
 
@@ -1555,7 +1565,7 @@ def api_leaderboard_csv():
         conn = _get_conn()
         s = conn.execute("SELECT id FROM sessions WHERE status='live' ORDER BY id DESC LIMIT 1").fetchone()
         if s:
-            session_id = s[0]
+            session_id = s['id']
         else:
             return _make_csv_response([], ['user_id', 'user_name', 'consume'], 'leaderboard.csv')
 
