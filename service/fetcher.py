@@ -1263,10 +1263,12 @@ class DouyinBarrage:
         """
         if not user_name or not real_uid:
             return
-        _get_conn().execute(
+        conn = _get_conn()
+        conn.execute(
             'UPDATE gift_logs SET user_id = ? WHERE user_id = \'\' AND user_name = ?',
             (real_uid, user_name)
         )
+        conn.commit()
 
     def _process_item(self, item):
         """å¤„ç†å•æ¡æ¶ˆæ¯ç»„ï¼ˆä¸€ä¸ª Response åŒ…ä¸­çš„æ‰€æœ‰å†…éƒ¨æ¶ˆæ¯ï¼‰ã€‚"""
