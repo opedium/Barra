@@ -69,6 +69,53 @@ _process_item (fetcher.py)
 ### 1. `_extract_douyin_id` 返回时间戳
 
 `base/parser.py` 的 `_extract_douyin_id()` 扫描 protobuf 中所有 `10^9 < val < 10^13` 的 varint。
+# 会员/星守护订阅数据问题修复
+
+## 问题
+
+抖音直播间的会员（月度/季度/年度）和星守护订阅，走的是 `WebcastRoomMessage` 消息类型，不是常规礼物的 `WebcastGiftMessage`。这两种消息的结构完全不同：
+
+| 字段 | GiftMessage（正常礼物） | RoomMessage（订阅事件） |
+|------|----------------------|----------------------|
+| `common.user` | ✅ 包含送礼者的完整信息 | ❌ 为空（或只有主播信息） |
+| 用户数字 ID | ✅ protobuf 直接解析 | ❌ 不存在 |
+| 礼物名称 | ✅ 有 | ❌ 无（只有事件模板） |
+
+订阅消息里**没有订阅者的数字 user_id**。这是问题的根源。
+
+## 现象
+
+修复前，订阅记录写到 `gift_logs` 的结果：
+
+```
+user_name = "WebcastRoomMessage"    ← protobuf 类名被当作用户名
+user_id   = "1717465000"            ← 实际上是 Common.create_time 时间戳
+diamond   = 980                      ← 订阅钻石，但记到了无效用户头上
+```
+
+这导致：
+1. 订阅钻石不计入任何用户的累计消费
+2. 贡献榜达标判定（1k/3k/1w）偏低
+3. 贡献榜排名与实际不符
+
+用户在贡献榜看到：
+
+```
+#155  WebcastRoomMessage    2881731180    -    [粉丝团:迅猛龙 特蕾莎]    980
+#156  WebcastRoomMessage    2823042277    -    [粉丝团:迅猛龙 特蕾莎]    980
+```
+
+用户名为 `WebcastRoomMessage`，UID 是时间戳或 room_id。
+
+## 根因
+
+### 1. 订阅消息不含 user_id
+
+订阅事件由 `RoomMessage` 承载。该消息的 `common.user` 字段在订阅场景中为空——订阅者的身份信息不在 protobuf 的标准字段里，而是藏在非标准位置。常规的 protobuf 解析拿不到 user_id。
+
+### 2. `_extract_douyin_id` 返回了时间戳
+
+`_extract_douyin_id()` 扫描 protobuf 中所有 `10^9 < val < 10^13` 的 varint。
 
 ```python
 # 修复前
@@ -131,3 +178,162 @@ known_words = {'webcast', 'room', ...}
 - `base/parser.py` — `_extract_subscribe()`, `_extract_douyin_id()`, `_extract_user_id()`, `parse_room_msg()`
 - `service/fetcher.py` — 订阅处理逻辑（~1440-1501 行）
 - `base/messages.py` — `RoomMessage` protobuf 定义
+    ids.append(val)  # ← Unix 时间戳 (1.7e9) 也在范围内
+```
+
+`Common.create_time`（~1,717,465,000）恰好在范围内且出现次数最多，被误认为 user_id。
+
+### 3. `_find_username` 选中了消息类型名
+
+`"WebcastRoomMessage"` 不在 `known_words` 列表中，评分拿到了 15 分。当 payload 中没有中文候选字符串时，这个英文字符串被选为"用户名"。
+
+### 4. 订阅处理被 `if uid:` 挡住
+
+```python
+if uid:  # uid 是空字符串 → 整个订阅处理被跳过
+    ...
+    elif rec_type == 'subscribe':
+        # 永远不会执行到这里
+        record_gift(...)   # ← 订阅钻石从未写入
+```
+
+`uid` 来自 `rec_data.get('user_id', '')`，订阅消息返回的一直是空字符串。
+
+## 解决方案
+
+### 核心思路
+
+订阅消息不含 user_id → **无法用 user_id 归因**。只能用订阅消息中提取的**用户名**在已有用户数据中查询匹配。
+
+```
+订阅消息 → 提取用户名（_find_username 过滤消息类型名后）
+         → users 表查 user_id
+         ├── 找到 → 用该 user_id 记录订阅钻石
+         └── 没找到 → 以空 user_id 记录（等待用户身份）
+                      ↓ 用户后续发消息/送礼时
+                      _fill_subscription_uid() 自动补填 user_id
+```
+
+### 具体修复
+
+#### 修复 1：`_extract_douyin_id` 排除时间戳范围
+
+```python
+if val > 10**8:
+    if 1500000000 < val < 2000000000:
+        continue  # 排除 Unix 时间戳
+    if 1500000000000 < val < 2000000000000:
+        continue  # 排除毫秒时间戳
+    ids.append(val)
+```
+
+同时扩宽扫描范围，从 `10^9—10^13` 改为 `>10^8`，覆盖 9—19 位的 user_id。
+
+#### 修复 2：`_find_username` 过滤 protobuf 消息类型名
+
+```python
+# 新增过滤：任何 protobuf 消息类型名都不应被当作用户名
+if re.match(r'^(Webcast|Common|Response|PushFrame|RoomMessage)', s) or s.endswith('Message'):
+    continue
+```
+
+#### 修复 3：订阅处理不再依赖 uid，改用用户名查 DB
+
+```python
+# 修复前：依赖 uid（永远为空）
+if uid:
+    ...
+    elif rec_type == 'subscribe':
+        ...
+
+# 修复后：直接通过用户名查 DB
+if sub_uname:
+    found = _get_conn().execute(
+        'SELECT user_id FROM users WHERE user_name = ? LIMIT 1',
+        (sub_uname,)
+    ).fetchone()
+    if found:
+        final_uid = found['user_id']
+        record_gift(self._session_id, final_uid, sub_uname, ...)
+    else:
+        # 以空 user_id 记录，等待后续补填
+        record_gift(self._session_id, '', sub_uname, ...)
+```
+
+#### 修复 4：等待用户身份补填
+
+新增 `_fill_subscription_uid()` 方法，在每次用户互动（发消息/送礼）后自动执行：
+
+```python
+def _fill_subscription_uid(self, user_name, real_uid):
+    """用户身份确认后，补填等待中的订阅记录 user_id"""
+    _get_conn().execute(
+        'UPDATE gift_logs SET user_id = ? WHERE user_id = \'\' AND user_name = ?',
+        (real_uid, user_name)
+    )
+```
+
+在 `_process_item` 的每次 `upsert_user` 后调用：
+
+```python
+upsert_user(uid, uname, ugrade, uclub, usec_uid, uavatar)
+if uid:
+    self._fill_subscription_uid(uname, uid)
+```
+
+### 完整数据流
+
+```
+订阅消息到达（WebcastRoomMessage）
+  →
+  _extract_subscribe()
+    ├─ _extract_douyin_id()   → 排除时间戳，返回真实 user_id（如有）
+    ├─ _find_username()        → 过滤 "WebcastRoomMessage"，提取真实用户名
+    └─ 返回 {user_name: "在立夏吃瓜", douyin_id: ""}
+  →
+  _process_item()
+    ├─ 通过 "在立夏吃瓜" 查 users 表
+    │   ├─ 找到 user_id=100863227288 → record_gift(sid, uid, ...)
+    │   └─ 没找到                    → record_gift(sid, '', "在立夏吃瓜", ...)
+    │
+    └─ 用户后续发消息（uid=123456789, name="在立夏吃瓜"）
+       → upsert_user(123456789, "在立夏吃瓜", ...)
+       → _fill_subscription_uid("在立夏吃瓜", "123456789")
+       → UPDATE gift_logs SET user_id='123456789'
+         WHERE user_id='' AND user_name='在立夏吃瓜'
+```
+
+## 实施状态（2026-06-30）
+
+以下修复已针对 `base/parser.py` 和 `service/fetcher.py` 实施：
+
+| # | 修复 | 文件 | 状态 |
+|---|------|------|------|
+| 1 | `_extract_douyin_id` 排除 Unix/毫秒时间戳范围 | `base/parser.py:910-914` | ✅ |
+| 2 | `_find_username` 正则过滤 protobuf 消息类型名 | `base/parser.py:974-976` | ✅ |
+| 3 | 订阅去重 key 使用 `_is_valid_sub_id` 验证，无效时回退到用户名 | `service/fetcher.py:1480-1495` | ✅ |
+| 4 | `final_uid` 为空时通过用户名或候选 ID 查 users 表 | `service/fetcher.py:1504-1519` | ✅ |
+| 5 | `_fill_subscription_uid()` 方法在用户互动后补填空 user_id | `service/fetcher.py:1243-1254` | ✅ |
+
+## 遗留问题
+
+### 历史脏数据
+修复前已记录的约 8 条 `WebcastRoomMessage` 记录，user_id 已清空设为待定，但 user_name 无法恢复（不知道真实用户名）。
+
+### 全新用户的首次订阅
+从未在采集系统出现过的新用户首次订阅时，users 表中查不到该用户名。只能以空 user_id 等待，直到该用户下次发消息或送礼时才能补填（通过 `_fill_subscription_uid` 自动完成）。
+
+## 验证结果
+
+```
+修复前：
+WebcastRoomMessage    2881731180    980     ← 错误记录
+WebcastRoomMessage    2823042277    1280    ← 错误记录
+
+修复后：
+在立夏吃瓜            100863227288  980     ← 正确记录（用户已存在 DB）
+微雨ooo🌻             1085545245514 980     ← 正确记录
+神秘人097410          （等待补填）    1280    ← 待定记录
+```
+
+审计页面不再出现 `WebcastRoomMessage` 作为用户名。

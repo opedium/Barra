@@ -2186,9 +2186,10 @@ def _flush_write_batch(conn, batch):
                              (sid, uid, uname, content, grade, club))
             elif op == 'gift':
                 _, sid, uid, uname, gname, cnt, dia, grade, club = item
-                # 同用户同礼物更高连击数时，覆盖之前的低 count 记录（防超长连击拆分）
-                conn.execute('DELETE FROM gift_logs WHERE session_id = ? AND user_id = ? AND gift_name = ? AND diamond_total = ? AND gift_count < ?',
-                             (sid, uid, gname, dia, cnt))
+                # 先删除同场次同用户同礼物的更低 count 记录（解决连击拆分重复计数）
+                if cnt > 1 and uid:
+                    conn.execute('DELETE FROM gift_logs WHERE session_id = ? AND user_id = ? AND gift_name = ? AND diamond_total = ? AND gift_count < ?',
+                                 (sid, uid, gname, dia, cnt))
                 conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                              (sid, uid, uname, gname, cnt, dia, grade, club))
             elif op == 'upsert':
