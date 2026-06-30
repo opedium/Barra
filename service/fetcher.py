@@ -613,13 +613,7 @@ class DouyinBarrage:
 
         self._stop_processor()
 
-        # æ³¨é”€å›žè°ƒï¼Œé¿å…å½±å“å…¶ä»–æˆ¿é—´
-        try:
-            remove_gift_finalize_callback(self._gift_callback_anchor)
-        except Exception:
-            pass
-
-        # å¼ºåˆ¶ commit å‰©ä½™æ‰¹é‡ + æ¸…ç©ºæ‰€æœ‰ç¼“å†²åŒº
+        # force flush write queue + combo buffers first
         try:
             flush_writes()
         except Exception:
@@ -629,7 +623,30 @@ class DouyinBarrage:
         except Exception:
             pass
 
-        # ç»“æŸ SQLite åœºæ¬¡ï¼ˆç©ºåœºæ¬¡è‡ªåŠ¨åˆ é™¤ï¼‰
+        # flush pending combo writes to DB
+        try:
+            if hasattr(self, "_combo_pending") and self._combo_pending:
+                pending = self._combo_pending[:]
+                self._combo_pending.clear()
+                for data in pending:
+                    uid = data.get("user_id", "")
+                    if uid:
+                        record_gift(self._session_id, uid,
+                            data.get("user_name", ""),
+                            data.get("gift_name", ""),
+                            data.get("gift_count", 0),
+                            data.get("diamond_total", 0),
+                            data.get("grade", ""),
+                            data.get("fans_club", ""))
+                flush_writes()
+        except Exception:
+            pass
+
+        # unregister callback
+        try:
+            remove_gift_finalize_callback(self._gift_callback_anchor)
+        except Exception:
+            pass
         if self._session_id:
             try:
                 from base.parser import _get_conn as _gc, delete_session as _ds
