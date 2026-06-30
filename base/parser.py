@@ -1770,7 +1770,9 @@ def _get_conn():
             _conn_registry.add(_local.conn)
         _local.conn.execute('PRAGMA journal_mode=WAL')
         _local.conn.execute('PRAGMA synchronous=NORMAL')
-        _local.conn.execute('PRAGMA busy_timeout=30000')
+        _local.conn.execute('PRAGMA busy_timeout=60000')
+        _local.conn.execute('PRAGMA wal_autocheckpoint=4000')
+        _local.conn.execute('PRAGMA journal_size_limit=134217728')
         _local.conn.execute('PRAGMA cache_size=-16000')
         _local.conn.execute('PRAGMA mmap_size=268435456')
         _local.conn.execute('PRAGMA temp_store=MEMORY')
@@ -1944,10 +1946,36 @@ def create_session(room_id, anchor_name=''):
     return sid
 
 
+def _db_write_with_retry(fn, max_retries=5, base_delay=0.1):
+    """执行数据库写操作，遇到 'database is locked' 时重试。
+
+    使用指数退避：0.1s, 0.2s, 0.4s, 0.8s, 1.6s → 总共约 3.1s。
+    如果 5 次重试后仍然锁住，抛出原始异常。
+    """
+    import time as _time
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as _e:
+            msg = str(_e)
+            if 'database is locked' in msg or 'database table is locked' in msg:
+                last_exc = _e
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"[DB] 数据库锁住，{delay:.1f}s 后重试 ({attempt+1}/{max_retries})")
+                    _time.sleep(delay)
+                    continue
+            raise
+    raise last_exc
+
+
 def end_session(session_id):
-    conn = _get_conn()
-    conn.execute('UPDATE sessions SET end_time = datetime("now", "+8 hours"), status = "ended" WHERE id = ?', (session_id,))
-    conn.commit()
+    def _do():
+        conn = _get_conn()
+        conn.execute('UPDATE sessions SET end_time = datetime("now", "+8 hours"), status = "ended" WHERE id = ?', (session_id,))
+        conn.commit()
+    _db_write_with_retry(_do)
     logger.info(f"[DB] 场次 #{session_id} 已结束")
 
 
@@ -1960,17 +1988,20 @@ def delete_session(session_id):
     Returns:
         dict: {'deleted': True, 'gifts': N, 'chats': N, 'contributions': N}
     """
-    conn = _get_conn()
-    # 统计各表删除数量
-    gift_count = conn.execute('SELECT COUNT(*) FROM gift_logs WHERE session_id = ?', (session_id,)).fetchone()[0]
-    chat_count = conn.execute('SELECT COUNT(*) FROM chat_logs WHERE session_id = ?', (session_id,)).fetchone()[0]
-    contrib_count = conn.execute('SELECT COUNT(*) FROM contributions WHERE session_id = ?', (session_id,)).fetchone()[0]
+    def _do():
+        conn = _get_conn()
+        # 统计各表删除数量
+        gift_count = conn.execute('SELECT COUNT(*) FROM gift_logs WHERE session_id = ?', (session_id,)).fetchone()[0]
+        chat_count = conn.execute('SELECT COUNT(*) FROM chat_logs WHERE session_id = ?', (session_id,)).fetchone()[0]
+        contrib_count = conn.execute('SELECT COUNT(*) FROM contributions WHERE session_id = ?', (session_id,)).fetchone()[0]
 
-    conn.execute('DELETE FROM gift_logs WHERE session_id = ?', (session_id,))
-    conn.execute('DELETE FROM chat_logs WHERE session_id = ?', (session_id,))
-    conn.execute('DELETE FROM contributions WHERE session_id = ?', (session_id,))
-    conn.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
-    conn.commit()
+        conn.execute('DELETE FROM gift_logs WHERE session_id = ?', (session_id,))
+        conn.execute('DELETE FROM chat_logs WHERE session_id = ?', (session_id,))
+        conn.execute('DELETE FROM contributions WHERE session_id = ?', (session_id,))
+        conn.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
+        conn.commit()
+        return (gift_count, chat_count, contrib_count)
+    gift_count, chat_count, contrib_count = _db_write_with_retry(_do)
 
     logger.info(f"[DB] 场次 #{session_id} 已删除（礼物:{gift_count} 弹幕:{chat_count} 贡献:{contrib_count}）")
     return {'deleted': True, 'gifts': gift_count, 'chats': chat_count, 'contributions': contrib_count}
