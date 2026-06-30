@@ -46,7 +46,7 @@ from base.utils import (
     rotate_ua, set_current_anchor, set_anchor_name,
 )
 from base.output import setup_logger, ThroughputCounter, BARRAGE, RoomLogFilter, display_width, is_ci_environment
-from base.parser import get_dedup_stats, init_db, create_session, end_session, flush_to_sqlite, flush_writes, record_chat, record_gift, upsert_user, _get_conn, flush_all_buffers, flush_combo_buffer, set_gift_finalize_callback, remove_gift_finalize_callback
+from base.parser import get_dedup_stats, get_flow_counters, get_combo_buffer_size, init_db, create_session, end_session, flush_to_sqlite, flush_writes, record_chat, record_gift, request_backfill_uid, upsert_user, _get_conn, flush_all_buffers, flush_combo_buffer, set_gift_finalize_callback, remove_gift_finalize_callback
 from service.network import (
     fetch_ttwid, enter_room_api, download_image,
     fetch_user_info,
@@ -79,7 +79,7 @@ class DouyinBarrage:
         'network': {
             'http_timeout': 15, 'ws_connect_timeout': 30, 'silence_timeout': 60,
             'user_msg_timeout': 120,
-            'heartbeat_interval': 10, 'rcvbuf_kb': 2048, 'proxy': None,
+            'heartbeat_interval': 10, 'rcvbuf_kb': 16384, 'proxy': None,
         },
         'max_reconnects': 0,
         'reconnect_base_delay': 2,
@@ -236,7 +236,7 @@ class DouyinBarrage:
         self._executor = ThreadPoolExecutor(max_workers=2)
 
         # â”€â”€ æ¶ˆæ¯å¤„ç†é˜Ÿåˆ—ï¼ˆæ”¶/ç®—åˆ†ç¦»ï¼Œé˜²é«˜å³°æ‹¥å¡žï¼‰â”€â”€
-        self._msg_queue = queue.Queue(maxsize=20000)
+        self._msg_queue = queue.Queue(maxsize=50000)
         self._process_thread = None
         self._pending_signal = None  # å¤„ç†çº¿ç¨‹æ£€æµ‹åˆ°çš„æŽ§åˆ¶ä¿¡å·
 
@@ -720,6 +720,9 @@ class DouyinBarrage:
         self._output_dir = None
         self._resolving_anon.clear()
         self._subscribe_dedup.clear()
+        self._backfilled_users.clear()
+        self._sub_seen = 0
+        self._sub_deduped = 0
 
     def _start_monitor_loop(self):
         if self._monitor_stop is not None:
@@ -1261,7 +1264,8 @@ class DouyinBarrage:
                             sec_uid=data.get('sec_uid',''), avatar_url=data.get('avatar_url',''))
                     record_gift(self._session_id, uid, uname,
                         data.get('gift_name',''), data.get('gift_count',0),
-                        data.get('diamond_total',0), data.get('grade',''), data.get('fans_club',''))
+                        data.get('diamond_total',0), data.get('grade',''), data.get('fans_club',''),
+                        group_id=data.get('group_id',''))
                 except Exception as e:
                     logger.error(f"[DB] combo finalize write failed: {e}")
 
@@ -1295,11 +1299,22 @@ class DouyinBarrage:
                     if now - self._panel_last >= 3.0:
                         self._panel_last = now
                         elapsed = now - self._counter._start
+                        flow = get_flow_counters(self._session_id)
+                        bt = self._counter._by_type
+                        cbuf = get_combo_buffer_size()
                         self._queue_handler.set_room_status(
                             self.live_id, 'collecting',
                             anchor=self.display_name,
                             msg_count=self._counter._count,
                             elapsed=elapsed,
+                            flow=flow,
+                            parsed_chat=bt.get('chat', 0),
+                            parsed_gift=bt.get('gift', 0),
+                            combo_buf=cbuf,
+                            sub_seen=self._sub_seen,
+                            sub_deduped=self._sub_deduped,
+                            frame_total=self._frame_total,
+                            frame_gaps=self._frame_gaps,
                         )
 
                     for r in results:
@@ -1356,6 +1371,8 @@ class DouyinBarrage:
                                         _old_lv_saved = 0
                                         _old_fc_saved = 0
                                     upsert_user(uid, uname, ugrade, uclub, usec_uid, uavatar)
+                                    if uid:
+                                        self._fill_subscription_uid(uname, uid)
                                     # åŒ¿åç”¨æˆ·ï¼ˆç¥žç§˜äºº/douå‰ç¼€ï¼‰è‡ªåŠ¨è§£æžçœŸå®žæ˜µç§°
                                     _is_anon = uname and (uname.startswith('ç¥žç§˜äºº') or re.match(r'dou\d+$', uname, re.IGNORECASE))
                                     if _is_anon:
@@ -1409,7 +1426,8 @@ class DouyinBarrage:
                                         rec_data.get('gift_name', ''),
                                         rec_data.get('gift_count', 0),
                                         rec_data.get('diamond_total', 0),
-                                        ugrade, uclub)
+                                        ugrade, uclub,
+                                        group_id=rec_data.get('group_id', ''))
                                 # â”€â”€ å‡çº§æ£€æµ‹ â”€â”€
                                 if uid and rec_type in ('gift', 'chat', 'fansclub'):
                                     try:
@@ -1438,48 +1456,52 @@ class DouyinBarrage:
                                     except Exception as _upgrade_err:
                                         logger.error(f"[升级] 检测异常: {_upgrade_err}")
                                 elif rec_type == 'subscribe' and rec_data.get('diamond'):
-                                    # ä¼šå‘˜/æ˜Ÿå®ˆæŠ¤è®¢é˜…ï¼šä¼˜å…ˆç”¨ protobuf User å¯¹è±¡çš„çœŸå®žä¿¡æ¯
+                                    self._sub_seen += 1
                                     sub_name = rec_data.get('event', '') + rec_data.get('sub_type', '')
-                                    sub_douyin_id = rec_data.get('douyin_id', '')
                                     sub_uname = rec_data.get('user_name', '')
-                                    sub_uid = sub_douyin_id or uid
-                                    sub_grade = rec_data.get('grade', '')
-                                    sub_club = rec_data.get('fans_club', '')
-                                    sub_sec_uid = rec_data.get('sec_uid', '')
-                                    sub_avatar = rec_data.get('avatar_url', '')
-                                    # å¦‚æžœ protobuf è§£æžåˆ°äº†çœŸå®ž user_idï¼Œç”¨å®ƒè¦†ç›–å­—èŠ‚æ‰«æçš„ douyin_id
-                                    proto_uid = rec_data.get('user_id', '')
-                                    if proto_uid and re.match(r'^\d+$', str(proto_uid)):
-                                        sub_uid = proto_uid
-                                        if sub_douyin_id != proto_uid:
-                                            logger.debug(f"[è®¢é˜…] protobuf è§£æžåˆ°çœŸå®ž user_id={proto_uid}ï¼Œè¦†ç›–å­—èŠ‚æ‰«æ douyin_id={sub_douyin_id}")
-                                            sub_douyin_id = proto_uid
-                                    # éªŒè¯ç”¨æˆ·åæ˜¯å¦åˆæ³•
                                     def _is_valid_name(n):
                                         return n and len(n) >= 2 and any(c.isalpha() or ord(c) > 127 for c in n)
                                     if not _is_valid_name(sub_uname):
-                                        logger.warning(f"[è®¢é˜…] æ— æ³•è¯†åˆ«è®¢é˜…ç”¨æˆ· (id={sub_douyin_id})ï¼Œè·³è¿‡è®°å½•")
-                                        sub_uname = ''
-                                    # è®¢é˜…åŽ»é‡ + ä¿å­˜ï¼ˆå¼‚å¸¸ç”¨æˆ·è·³è¿‡ï¼Œå› ä¸ºæ— æ³•å½’å› ï¼‰
-                                    if sub_uname:
-                                        now_ts = time.time()
-                                        sub_key = (str(sub_douyin_id), str(sub_name))
-                                        if sub_key in self._subscribe_dedup and now_ts - self._subscribe_dedup[sub_key] < 120:
-                                            logger.debug(f"[è®¢é˜…] åŽ»é‡è·³è¿‡ {sub_key}")
+                                        logger.debug(f"[订阅] 无效用户名，跳过: user_name={sub_uname}")
+                                        continue
+                                    now_ts = time.time()
+                                    sub_key = (sub_uname, str(sub_name))
+                                    if sub_key in self._subscribe_dedup and now_ts - self._subscribe_dedup[sub_key] < 120:
+                                        logger.debug(f"[订阅] 去重跳过 {sub_key}")
+                                        self._sub_deduped += 1
+                                        continue
+                                    self._subscribe_dedup[sub_key] = now_ts
+                                    stale = [k for k, t in list(self._subscribe_dedup.items()) if now_ts - t > 180]
+                                    for k in stale:
+                                        del self._subscribe_dedup[k]
+                                    final_uid = ''
+                                    final_grade = ''
+                                    final_club = ''
+                                    final_sec_uid = ''
+                                    final_avatar = ''
+                                    try:
+                                        found = _get_conn().execute(
+                                            'SELECT user_id, grade, fans_club, sec_uid, avatar_url FROM users WHERE user_name = ? LIMIT 1',
+                                            (sub_uname,)
+                                        ).fetchone()
+                                        if found:
+                                            final_uid = found['user_id']
+                                            final_grade = found['grade'] or ''
+                                            final_club = found['fans_club'] or ''
+                                            final_sec_uid = found['sec_uid'] or ''
+                                            final_avatar = found['avatar_url'] or ''
+                                            logger.info(f"[订阅] 用户名 '{sub_uname}' -> user_id={final_uid}")
                                         else:
-                                            self._subscribe_dedup[sub_key] = now_ts
-                                            stale = [k for k, t in list(self._subscribe_dedup.items()) if now_ts - t > 180]
-                                            for k in stale: del self._subscribe_dedup[k]
-                                            final_uid = sub_uid if re.match(r'^\d+$', str(sub_uid)) else sub_douyin_id
-                                            final_name = sub_uname or ('ç”¨æˆ·' + str(sub_douyin_id)[-6:])
-                                            if sub_sec_uid or sub_avatar:
-                                                upsert_user(final_uid, final_name, sub_grade, sub_club, sub_sec_uid, sub_avatar)
-                                            elif sub_douyin_id and sub_uname:
-                                                upsert_user(final_uid, final_name, sub_grade, sub_club, '', '')
-                                            else:
-                                                upsert_user(final_uid, 'ç”¨æˆ·' + str(sub_douyin_id)[-6:], '', '', '', '')
-                                            record_gift(self._session_id, final_uid, final_name, sub_name or 'è®¢é˜…',
-                                                1, rec_data.get('diamond', 0), sub_grade, sub_club)
+                                            logger.info(f"[订阅] 用户名 '{sub_uname}' 未在 DB 中找到，留空 uid 等待补填")
+                                    except Exception as e:
+                                        logger.debug(f"[订阅] DB 查询失败: {e}")
+                                    if final_uid:
+                                        upsert_user(final_uid, sub_uname, final_grade, final_club, final_sec_uid, final_avatar)
+                                        record_gift(self._session_id, final_uid, sub_uname, sub_name or '订阅',
+                                                    1, rec_data.get('diamond', 0), final_grade, final_club)
+                                        logger.info(f"[订阅] {sub_uname} {sub_name} ({rec_data.get('diamond',0)}钻石) uid={final_uid}")
+                                    else:
+                                        logger.info(f"[订阅] {sub_uname} {sub_name} ({rec_data.get('diamond',0)}钻石) uid=待定（等待补填）")
                             except Exception as e:
                                 logger.error(f"[DB] SQLite write failed in _process_item: {e} | type={rec_type} user={uid}")
 
@@ -1514,6 +1536,16 @@ class DouyinBarrage:
                 pass
 
     # â”€â”€ æ¶ˆæ¯å¤„ç† â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+    def _fill_subscription_uid(self, user_name, real_uid):
+        if not user_name or not real_uid or not self._session_id:
+            return
+        bak_key = (self._session_id, user_name)
+        if bak_key in self._backfilled_users:
+            return
+        self._backfilled_users.add(bak_key)
+        request_backfill_uid(self._session_id, user_name, real_uid)
 
     async def _handle_message(self, message):
         """å¤„ç†å•æ¡ WebSocket æ¶ˆæ¯ã€‚"""

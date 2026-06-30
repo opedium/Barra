@@ -18,6 +18,7 @@ import sqlite3
 import threading
 import queue
 import time
+from collections import Counter
 from datetime import datetime
 
 from base.messages import (
@@ -180,6 +181,8 @@ _GIFT_PRICE_OVERRIDE = {
     '御风飞机': 9000,
     '凌霄战机': 18000,
     '星际战舰': 36000,
+    '闪烁星河': 99,
+    '点点星光': 9,
 }
 
 # ── 礼物 ID → 钻石价格/名称反向索引 ──────────────────
@@ -210,6 +213,14 @@ _dedup_diag = {
     'counter_reset': 0, 'delta_zero': 0, 'out_of_order': 0,
     'rc1_dup': 0, 'bulk_dup': 0,
 }
+
+# ── 消息流计数器（debug 用） ──────────────────────
+# 追踪消息从 enqueue → DB written 的全流程
+_chat_enqueued = {}     # session_id -> record_chat 调用次数
+_gift_enqueued = {}     # session_id -> record_gift 调用次数
+_chat_written = {}      # session_id -> _flush_write_batch 实际写入 chat_logs 行数
+_gift_written = {}      # session_id -> _flush_write_batch 实际写入 gift_logs 行数
+_combo_progress_count = 0  # 连击进度消息数（不计入 enq，被 buffer 吸收）
 
 
 def get_dedup_stats():
@@ -347,6 +358,7 @@ def _combo_finalize(key):
             'sec_uid': buf.get('sec_uid', ''),
             'avatar_url': buf.get('avatar_url', ''),
             'anchor_name': anchor,
+            'group_id': buf.get('group_id', ''),
         }
         cb = _gift_finalize_callbacks.get(anchor)
         if cb:
@@ -362,6 +374,11 @@ def _combo_finalize(key):
     diamond_info = f" ({total_value}钻石)" if total_value > 0 else ""
     msg = f"[礼物] {buf['user_name']}[{buf['user_id']}] 礼物:{display_name} x{cnt}{diamond_info}"
     logger.log(15, msg)
+
+def get_combo_buffer_size():
+    """返回当前组合礼物缓冲中的待定连击数量（group_id, gift_id, user_id 三元组去重）。"""
+    with _gift_combo_lock:
+        return len(_gift_combo_buffer)
 
 def flush_combo_buffer():
     with _gift_combo_lock:
@@ -528,6 +545,7 @@ def parse_gift_msg(payload, enable_outputs=None):
             diamond_info = f" ({total_value}钻石)" if total_value > 0 else ""
             return [{'type': 'gift', 'msg': f"[礼物] {uname}[{uid}] 礼物:{display_name} x{cnt_final}{diamond_info}", 'data': {'_combo_progress': True}}]
         else:
+            global _combo_progress_count; _combo_progress_count += 1
             _dedup_diag['passed'] += 1
             def _on_timeout(k=key): return _combo_finalize(k)
             timer = threading.Timer(_gift_combo_timeout, _on_timeout); timer.daemon = True; timer.start()
@@ -908,6 +926,11 @@ def _extract_douyin_id(payload):
                     val |= (b & 0x7f) << shift; shift += 7
                     if not (b & 0x80): break
                 if 10**9 < val < 10**13:
+                    # 排除 Unix 时间戳（秒 1.5e9-2e9，毫秒 1.5e12-2e12）
+                    if 1500000000 < val < 2000000000:
+                        continue
+                    if 1500000000000 < val < 2000000000000:
+                        continue
                     ids.append(val)
             elif wt == 2:
                 length = 0; shift = 0
@@ -930,6 +953,62 @@ def _extract_douyin_id(payload):
     return ''
 
 
+def _extract_user_id(payload):
+    """从 RoomMessage 原始 payload 扫描 17-19 位 protobuf varint 提取 user_id。
+    优先 field number = 1 的候选值（常见于 User 对象）。
+
+    Returns:
+        str 或空字符串。
+    """
+    ids = []
+    stack = [(payload, 0)]
+    while stack:
+        data, depth = stack.pop()
+        if depth > 6:
+            continue
+        j = 0
+        while j < len(data):
+            tag = 0; shift = 0
+            while j < len(data):
+                b = data[j]; j += 1
+                tag |= (b & 0x7f) << shift; shift += 7
+                if not (b & 0x80): break
+            fn = tag >> 3; wt = tag & 0x7
+            if wt == 0:
+                val = 0; shift = 0
+                while j < len(data):
+                    b = data[j]; j += 1
+                    val |= (b & 0x7f) << shift; shift += 7
+                    if not (b & 0x80): break
+                # 17-19 位数字 = Douyin user_id
+                if 10**16 < val < 10**19:
+                    ids.append((val, fn))
+            elif wt == 2:
+                length = 0; shift = 0
+                while j < len(data):
+                    b = data[j]; j += 1
+                    length |= (b & 0x7f) << shift; shift += 7
+                    if not (b & 0x80): break
+                stack.append((data[j:j+length], depth + 1))
+                j += length
+            elif wt == 5:
+                j += 4
+            else:
+                break
+
+    if not ids:
+        return ''
+
+    # 优先选 field number = 1 的值
+    fn1 = [v for v, fn in ids if fn == 1]
+    if fn1:
+        return str(fn1[0])
+
+    # 否则取最常见的
+    counts = Counter(v for v, _ in ids)
+    return str(counts.most_common(1)[0][0])
+
+
 def _extract_subscribe(payload):
     """从 RoomMessage 原始 payload 提取会员/星守护订阅信息。
     返回 dict 或 None。"""
@@ -946,8 +1025,9 @@ def _extract_subscribe(payload):
                if not any(p in s for p in noise_keywords)
                and s not in ('', '小葵花', '送{0}')]
 
-    # 提取 douyin_id
+    # 提取 douyin_id 和 user_id
     douyin_id = _extract_douyin_id(payload)
+    user_id = _extract_user_id(payload)
 
     # ── 辅助：从字符串列表中找用户名 ──
     def _find_username(candidates):
@@ -967,6 +1047,9 @@ def _extract_subscribe(payload):
             if s.isdigit():
                 continue
             if s in known_words:
+                continue
+            # 过滤 protobuf 消息类型名（如 WebcastRoomMessage、Common、Response、PushFrame）
+            if _re.match(r'^(Webcast|Common|Response|PushFrame)', s):
                 continue
             clean = s.lstrip('"').rstrip('" ').strip()
             if not clean or len(clean) > 50:
@@ -1010,7 +1093,7 @@ def _extract_subscribe(payload):
                     except Exception:
                         pass
             return {'event': '会员', 'action': action, 'type': sub_type,
-                    'user': user, 'douyin_id': douyin_id}
+                    'user': user, 'douyin_id': douyin_id, 'user_id': user_id}
 
     # ── 星守护 ──
     has_star_template = any('星守护' in s for s in all_strings)
@@ -1026,7 +1109,7 @@ def _extract_subscribe(payload):
                     pass
         if user or douyin_id:
             return {'event': '星守护', 'action': '开通', 'type': '月度',
-                    'user': user, 'douyin_id': douyin_id}
+                    'user': user, 'douyin_id': douyin_id, 'user_id': user_id}
 
     return None
 
@@ -1091,6 +1174,18 @@ def parse_room_msg(payload, enable_outputs=None):
                     real_grade = fmt_grade(u)
                     real_fans_club = fmt_fans_club(u)
             # 调试日志：记录解析结果和字节扫描结果的对比
+            if not has_user:
+                # protobuf 没有 user → 回退到字节扫描的 user_id
+                bytescan_uid = sub_info.get('user_id', '')
+                if bytescan_uid:
+                    # 排除被误识别为 user_id 的 room_id
+                    room_id_from_proto = str(room_msg.common.room_id) if room_msg.common and room_msg.common.room_id else ''
+                    if room_id_from_proto and bytescan_uid == room_id_from_proto:
+                        logger.info(f"[订阅调试] 字节扫描 user_id={bytescan_uid} 与 room_id 相同，已忽略")
+                        real_uid = ''
+                    else:
+                        real_uid = bytescan_uid
+                        logger.info(f"[订阅调试] protobuf 无 user，回退字节扫描 user_id={bytescan_uid}")
             if sub_info.get('douyin_id') != user_id_from_proto or sub_info.get('user') != user_name_from_proto:
                 logger.info(f"[订阅调试] bytescan_id={sub_info.get('douyin_id','')} proto_id={user_id_from_proto} "
                            f"bytescan_name={sub_info.get('user','')} proto_name={user_name_from_proto} "
@@ -1711,6 +1806,11 @@ try:
     except sqlite3.OperationalError:
         pass
     try:
+        _migrate_conn.execute('ALTER TABLE gift_logs ADD COLUMN group_id TEXT DEFAULT ""')
+        _migrate_conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
         _migrate_conn.execute('ALTER TABLE users ADD COLUMN sec_uid TEXT DEFAULT ""')
         _migrate_conn.commit()
     except sqlite3.OperationalError:
@@ -1846,6 +1946,7 @@ def init_db():
             gift_name TEXT NOT NULL,
             gift_count INTEGER DEFAULT 1,
             diamond_total INTEGER DEFAULT 0,
+            group_id TEXT DEFAULT '',
             created_at DATETIME DEFAULT (datetime('now', '+8 hours'))
         );
         CREATE TABLE IF NOT EXISTS daily_stats (
@@ -2129,7 +2230,7 @@ def flush_to_sqlite(session_id):
 
 
 # ── 单写者线程队列（所有线程推送写入操作，写者单线程处理，消除多线程锁争抢）──
-_write_queue = queue.Queue(maxsize=20000)
+_write_queue = queue.Queue(maxsize=50000)
 _WRITER_BATCH_SIZE = 50
 _WRITER_FLUSH_INTERVAL = 0.5
 _flush_lock = threading.Lock()  # 用于 flush_to_sqlite 等直接写操作
@@ -2162,23 +2263,31 @@ def _writer_loop():
                     _write_queue.task_done()
                 buf = []
                 last_flush = time.time()
-        except Exception:
-            pass
+        except Exception as _we:
+            logger.error(f"[DB] 写者线程异常: {_we}")
 
 
 def _flush_write_batch(conn, batch):
     """执行一批写入操作。"""
+    global _chat_written, _gift_written
     for item in batch:
         op = item[0]
         try:
             if op == 'chat':
                 _, sid, uid, uname, content, grade, club = item
-                conn.execute('INSERT OR IGNORE INTO chat_logs (session_id, user_id, user_name, content, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?)',
-                             (sid, uid, uname, content, grade, club))
+                r = conn.execute('INSERT OR IGNORE INTO chat_logs (session_id, user_id, user_name, content, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?)',
+                                 (sid, uid, uname, content, grade, club))
+                _chat_written[sid] = _chat_written.get(sid, 0) + r.rowcount
             elif op == 'gift':
-                _, sid, uid, uname, gname, cnt, dia, grade, club = item
-                conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                             (sid, uid, uname, gname, cnt, dia, grade, club))
+                if len(item) >= 10:
+                    _, sid, uid, uname, gname, cnt, dia, grade, club, gid = item
+                    r = conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club, group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                                     (sid, uid, uname, gname, cnt, dia, grade, club, gid))
+                else:
+                    _, sid, uid, uname, gname, cnt, dia, grade, club = item
+                    r = conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                                     (sid, uid, uname, gname, cnt, dia, grade, club))
+                _gift_written[sid] = _gift_written.get(sid, 0) + r.rowcount
             elif op == 'upsert':
                 _, uid, uname, grade, club, sec, av = item
                 is_anon, anon_label = _detect_anonymous(uname)
@@ -2202,8 +2311,16 @@ def _flush_write_batch(conn, batch):
                 ''', (uid, uname, grade, club, sec, av, is_anon, anon_label,
                       uname, uname, grade, grade, club, club, sec, sec, av, av,
                       is_anon, anon_label, anon_label))
+            elif op == 'backfill_uid':
+                _, sid, uname, ruid = item
+                r = conn.execute(
+                    "UPDATE gift_logs SET user_id = ? WHERE session_id = ? AND (user_id = '' OR user_id IS NULL) AND user_name = ?",
+                    (ruid, sid, uname)
+                )
+                if r.rowcount:
+                    logger.info(f"[DB] 补填 {r.rowcount} 条订阅记录: {uname} -> {ruid}")
         except Exception as e:
-            logger.debug(f"[DB] writer batch op failed: {op} {e}")
+            logger.warning(f"[DB] writer batch op failed: {op} {e}")
     conn.commit()
 
 
@@ -2220,15 +2337,46 @@ def flush_writes():
         pass
 
 
+def get_flow_counters(session_id=None):
+    """返回消息流计数器快照（可按 session_id 过滤）。
+    Returns:
+        dict: {chat_enqueued, gift_enqueued, chat_written, gift_written, combo_progress}
+    """
+    def _sid(d):
+        """按 session_id 取值，无 session_id 时返回总和。"""
+        if session_id is None:
+            return sum(d.values()) if d else 0
+        return d.get(session_id, 0)
+    return {
+        'chat_enqueued': _sid(_chat_enqueued),
+        'gift_enqueued': _sid(_gift_enqueued),
+        'chat_written': _sid(_chat_written),
+        'gift_written': _sid(_gift_written),
+        'combo_progress': _combo_progress_count,
+    }
+
+
 def record_chat(session_id, user_id, user_name, content, grade='', fans_club=''):
+    global _chat_enqueued
+    _chat_enqueued[session_id] = _chat_enqueued.get(session_id, 0) + 1
     try:
         _write_queue.put_nowait(('chat', session_id, user_id, user_name, content, grade, fans_club))
     except queue.Full:
         logger.warning(f"[DB] 写入队列已满，丢弃聊天: uid={user_id}")
 
 
-_gift_dedup_cache = {}  # (user_id, gift_name, diamond_total) → timestamp
-_GIFT_DEDUP_WINDOW = 3.0
+def request_backfill_uid(session_id, user_name, real_uid):
+    """通过写者队列补填订阅记录的 user_id，避免跨线程写冲突。"""
+    if not session_id or not user_name or not real_uid:
+        return
+    try:
+        _write_queue.put_nowait(('backfill_uid', session_id, user_name, real_uid))
+    except queue.Full:
+        logger.warning(f"[DB] 写入队列已满，丢弃 backfill: {user_name} -> {real_uid}")
+
+
+_gift_dedup_cache = {}  # (user_id, gift_name) → timestamp
+_GIFT_DEDUP_WINDOW = 10.0  # same user+gift within 10s = dedup (catches timer race + single dupes)
 
 
 def _prune_gift_dedup_cache():
@@ -2238,10 +2386,15 @@ def _prune_gift_dedup_cache():
         _gift_dedup_cache.pop(k, None)
 
 
-def record_gift(session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade='', fans_club=''):
-    """记录礼物（内存时间窗 + 写者队列双重去重）。"""
+def record_gift(session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade='', fans_club='', group_id=''):
+    """记录礼物（内存时间窗 + 写者队列双重去重）。
+
+    去重 key 使用 (user_id, gift_name, group_id) 三元组。
+    group_id 为空时回退到 (user_id, gift_name) 二元组。
+    窗口 10s，同一 group_id 的 timer 竞态会被捕获。
+    """
     if user_id and gift_name:
-        dk = (user_id, gift_name, diamond_total)
+        dk = (user_id, gift_name, group_id) if group_id else (user_id, gift_name)
         now = time.time()
         last_ts = _gift_dedup_cache.get(dk)
         if last_ts and now - last_ts < _GIFT_DEDUP_WINDOW:
@@ -2251,7 +2404,8 @@ def record_gift(session_id, user_id, user_name, gift_name, gift_count, diamond_t
         if len(_gift_dedup_cache) > 5000:
             _prune_gift_dedup_cache()
     try:
-        _write_queue.put_nowait(('gift', session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club))
+        global _gift_enqueued; _gift_enqueued[session_id] = _gift_enqueued.get(session_id, 0) + 1
+        _write_queue.put_nowait(('gift', session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club, group_id))
     except queue.Full:
         logger.warning(f"[DB] 写入队列已满，丢弃礼物: {gift_name} uid={user_id}")
 _VALID_TIERS = {1000, 3000, 10000, 100000}
