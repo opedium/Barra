@@ -2114,11 +2114,11 @@ def flush_to_sqlite(session_id):
     today = datetime.now().strftime('%Y-%m-%d')
     month = datetime.now().strftime('%Y-%m')
 
-    rows = conn.execute('''
-        SELECT user_id, user_name, SUM(diamond_total) as consume
+    rows = conn.execute("""
+        SELECT user_id, MAX(user_name) as user_name, SUM(diamond_total) as consume
         FROM gift_logs WHERE session_id = %s
         GROUP BY user_id
-    ''', (session_id,)).fetchall()
+    """, (session_id,)).fetchall()
 
     if not rows:
         return
@@ -2240,8 +2240,18 @@ def _writer_loop():
                     _write_queue.task_done()
                 buf = []
                 last_flush = time.time()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"[DB] 写入线程异常: {e}", exc_info=True)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            # 批次数据无法恢复，丢弃以免阻塞队列
+            if buf:
+                logger.warning(f"[DB] 丢弃 {len(buf)} 条写入 (写入线程异常)")
+                for _ in buf:
+                    _write_queue.task_done()
+                buf = []
 
 
 def _flush_write_batch(conn, batch):
