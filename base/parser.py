@@ -412,9 +412,9 @@ def parse_chat_msg(payload, enable_outputs=None):
         _sse_callback('chat', {**common, 'content': msg.content})
 
     if msg.chat_by == 9:  # 福袋口令
-        if enable_outputs.get('lucky_bag', True):
+        if enable_outputs.get('chat', True):
             results.append({
-                'type': 'lucky_bag',
+                'type': 'chat',
                 'msg': f"[福袋口令] {uname}[{uid}] 内容:{msg.content}",
                 'data': {**common, 'content': msg.content},
             })
@@ -2105,6 +2105,9 @@ def upsert_user(user_id, user_name, grade='', fans_club='', sec_uid='', avatar_u
         return
     try:
         _write_queue.put_nowait(('upsert', user_id, user_name, grade, fans_club, sec_uid, avatar_url))
+        with _enqueue_counter_lock:
+            _enqueue_counters['upsert'] += 1
+            _enqueue_counters['total'] += 1
     except queue.Full:
         logger.warning(f"[DB] upsert queue full: uid={user_id}")
 
@@ -2215,7 +2218,14 @@ _flush_lock = threading.Lock()  # 用于 flush_to_sqlite 等直接写操作
 
 def _writer_loop():
     """后台写者线程：从队列消费写入操作，批量提交。"""
-    conn = _get_conn()
+    logger.info("[DB] 写者线程已启动")
+    while True:
+        try:
+            conn = _get_conn()
+            break
+        except Exception as e:
+            logger.error(f"[DB] 写者线程获取连接失败，5秒后重试: {e}")
+            time.sleep(5)
     buf = []
     last_flush = time.time()
     while True:
@@ -2246,16 +2256,57 @@ def _writer_loop():
                 conn.rollback()
             except Exception:
                 pass
-            # 批次数据无法恢复，丢弃以免阻塞队列
+            try:
+                _pool.putconn(conn._conn)
+            except Exception:
+                pass
+            # 丢弃失败批次，重建连接
             if buf:
                 logger.warning(f"[DB] 丢弃 {len(buf)} 条写入 (写入线程异常)")
                 for _ in buf:
                     _write_queue.task_done()
                 buf = []
+            # 重新获取连接（可能已断开）
+            for _ in range(30):
+                try:
+                    conn = _get_conn()
+                    logger.info("[DB] 写者线程已重连")
+                    break
+                except Exception:
+                    time.sleep(2)
+            else:
+                logger.critical("[DB] 写者线程无法重连，退出")
+                raise
+
+
+_write_counters = {'chat': 0, 'gift': 0, 'upsert': 0, 'total': 0}
+_write_counter_lock = threading.Lock()
+
+# ── enqueue-side counters (monitored in the stats log) ──
+_enqueue_counters = {'chat': 0, 'gift': 0, 'upsert': 0, 'total': 0}
+_enqueue_counter_lock = threading.Lock()
+
+
+def _log_write_summary():
+    """Log write throughput summary (immediate on every batch)."""
+    with _write_counter_lock:
+        wc = dict(_write_counters)
+        _write_counters['chat'] = 0; _write_counters['gift'] = 0
+        _write_counters['upsert'] = 0; _write_counters['total'] = 0
+    with _enqueue_counter_lock:
+        eq = dict(_enqueue_counters)
+        _enqueue_counters['chat'] = 0; _enqueue_counters['gift'] = 0
+        _enqueue_counters['upsert'] = 0; _enqueue_counters['total'] = 0
+    if eq['total'] > 0 or wc['total'] > 0:
+        qsize = _write_queue.qsize()
+        logger.info(f"[DB] 入队={eq['chat']}ch+{eq['gift']}g+{eq['upsert']}u={eq['total']} "
+                    f"| 写入={wc['chat']}ch+{wc['gift']}g+{wc['upsert']}u={wc['total']}"
+                    f"{f' | 队列堆积={qsize}' if qsize > 10 else ''}")
 
 
 def _flush_write_batch(conn, batch):
     """执行一批写入操作。"""
+    chat_n = gift_n = upsert_n = 0
     for item in batch:
         op = item[0]
         try:
@@ -2265,6 +2316,7 @@ def _flush_write_batch(conn, batch):
                     INSERT INTO chat_logs (session_id, user_id, user_name, content, grade, fans_club)
                     VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING
                 """, (sid, uid, uname, content, grade, club))
+                chat_n += 1
             elif op == 'gift':
                 _, sid, uid, uname, gname, cnt, dia, grade, club = item
                 # 先删除同场次同用户同礼物的更低 count 记录（解决连击拆分重复计数）
@@ -2275,9 +2327,11 @@ def _flush_write_batch(conn, batch):
                     INSERT INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING
                 """, (sid, uid, uname, gname, cnt, dia, grade, club))
+                gift_n += 1
             elif op == 'upsert':
                 _, uid, uname, grade, club, sec, av = item
-                is_anon, anon_label = _detect_anonymous(uname)
+                is_anon_bool, anon_label = _detect_anonymous(uname)
+                is_anon = 1 if is_anon_bool else 0
                 # 合并粉丝团（保留最高等级）
                 if club:
                     existing = conn.execute('SELECT fans_club FROM users WHERE user_id = %s', (uid,)).fetchone()
@@ -2298,9 +2352,16 @@ def _flush_write_batch(conn, batch):
                 """, (uid, uname, grade, club, sec, av, is_anon, anon_label,
                       uname, uname, grade, grade, club, club, sec, sec, av, av,
                       is_anon, anon_label, anon_label))
+                upsert_n += 1
         except Exception as e:
             logger.debug(f"[DB] writer batch op failed: {op} {e}")
     conn.commit()
+    with _write_counter_lock:
+        _write_counters['chat'] += chat_n
+        _write_counters['gift'] += gift_n
+        _write_counters['upsert'] += upsert_n
+        _write_counters['total'] += chat_n + gift_n + upsert_n
+    _log_write_summary()
 
 
 # 启动写者线程（模块导入时自动启动）
@@ -2319,6 +2380,9 @@ def flush_writes():
 def record_chat(session_id, user_id, user_name, content, grade='', fans_club=''):
     try:
         _write_queue.put_nowait(('chat', session_id, user_id, user_name, content, grade, fans_club))
+        with _enqueue_counter_lock:
+            _enqueue_counters['chat'] += 1
+            _enqueue_counters['total'] += 1
     except queue.Full:
         logger.warning(f"[DB] 写入队列已满，丢弃聊天: uid={user_id}")
 
@@ -2348,6 +2412,9 @@ def record_gift(session_id, user_id, user_name, gift_name, gift_count, diamond_t
             _prune_gift_dedup_cache()
     try:
         _write_queue.put_nowait(('gift', session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club))
+        with _enqueue_counter_lock:
+            _enqueue_counters['gift'] += 1
+            _enqueue_counters['total'] += 1
     except queue.Full:
         logger.warning(f"[DB] 写入队列已满，丢弃礼物: {gift_name} uid={user_id}")
 _VALID_TIERS = {1000, 3000, 10000, 100000}

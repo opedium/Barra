@@ -650,7 +650,7 @@ class DouyinBarrage:
         if self._session_id:
             try:
                 from base.parser import _get_conn as _gc, delete_session as _ds
-                cnt = _gc().execute('SELECT COUNT(*) FROM gift_logs WHERE session_id = ?', (self._session_id,)).fetchone()[0]
+                cnt = _gc().execute('SELECT COUNT(*) FROM gift_logs WHERE session_id = %s', (self._session_id,)).fetchone()['count']
                 if cnt == 0:
                     _ds(self._session_id)
                     logger.info(f"[DB] ç©ºåœºæ¬¡ #{self._session_id} å·²åˆ é™¤")
@@ -974,7 +974,7 @@ class DouyinBarrage:
                 else:
                     # å¦‚æžœå·²æœ‰åœºæ¬¡ä½†å·²ç»“æŸï¼Œå»ºæ–°åœºæ¬¡ï¼ˆæ­£å¸¸æµç¨‹ï¼šç›´æ’­ç»“æŸâ†’é‡å¼€æ’­ï¼‰
                     try:
-                        cur = _get_conn().execute('SELECT status FROM sessions WHERE id = ?', (self._session_id,))
+                        cur = _get_conn().execute('SELECT status FROM sessions WHERE id = %s', (self._session_id,))
                         row = cur.fetchone()
                         if row and row['status'] == 'ended':
                             # æ£€æŸ¥ä¸Šä¸€åœºæ¬¡æ˜¯å¦ä¸ºè™šæµ®åœºæ¬¡ï¼ˆæžå°‘æ•°æ® -> ç›´æ’­å·²ç»“æŸï¼ŒAPI æœªåŠæ—¶æ›´æ–°ï¼‰
@@ -995,11 +995,12 @@ class DouyinBarrage:
                 # combo æœ€ç»ˆåŒ–å›žè°ƒï¼šåªæŽ¨å…¥é˜Ÿåˆ—ï¼Œä¸ç›´æŽ¥å†™DB (ç”± _process_thread çº¿ç¨‹ç»Ÿä¸€å†™å…¥ï¼Œé¿å…çº¿ç¨‹ç´¢)
                 if not hasattr(self, '_combo_pending'):
                     self._combo_pending = []
+                self._gift_callback_anchor = self.anchor_name or self.live_id
+                # re-register on reconnect (stop removes it)
                 def _on_gift_finalize(data):
                     if data:
                         self._combo_pending.append(dict(data))
-                set_gift_finalize_callback(self.anchor_name or self.live_id, _on_gift_finalize)
-                self._gift_callback_anchor = self.anchor_name or self.live_id
+                set_gift_finalize_callback(self._gift_callback_anchor, _on_gift_finalize)
 
                 # å°†ä¸»æ’­ä¿¡æ¯å†™å…¥ users è¡¨ï¼ˆsec_uidã€å¤´åƒï¼‰ï¼Œç¡®ä¿ä¸»æ’­åœ¨æ¦œå•/ç”¨æˆ·é¡µå¯è§
                 if self._room_info:
@@ -1281,11 +1282,17 @@ class DouyinBarrage:
         if not user_name or not real_uid:
             return
         conn = _get_conn()
-        conn.execute(
-            'UPDATE gift_logs SET user_id = ? WHERE user_id = \'\' AND user_name = ?',
-            (real_uid, user_name)
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                'UPDATE gift_logs SET user_id = %s WHERE user_id = \'\' AND user_name = %s',
+                (real_uid, user_name)
+            )
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
 
     def _process_item(self, item):
         """å¤„ç†å•æ¡æ¶ˆæ¯ç»„ï¼ˆä¸€ä¸ª Response åŒ…ä¸­çš„æ‰€æœ‰å†…éƒ¨æ¶ˆæ¯ï¼‰ã€‚"""
@@ -1391,7 +1398,7 @@ class DouyinBarrage:
                                     _old_lv_saved = 0
                                     _old_fc_saved = 0
                                     try:
-                                        _row = _get_conn().execute("SELECT grade, fans_club FROM users WHERE user_id = ?", (uid,)).fetchone()
+                                        _row = _get_conn().execute("SELECT grade, fans_club FROM users WHERE user_id = %s", (uid,)).fetchone()
                                         if _row:
                                             _m = re.search(r"(\d+)", _row["grade"] or "")
                                             if _m:
@@ -1411,7 +1418,7 @@ class DouyinBarrage:
                                     if _is_anon:
                                         # å…ˆæŸ¥ DBï¼šå¦‚æžœå·²ç»è§£æžè¿‡äº†ï¼ˆåå­—ä¸å†åŒ¿åï¼‰ï¼Œè·³è¿‡
                                         try:
-                                            cur = _get_conn().execute('SELECT user_name FROM users WHERE user_id = ?', (uid,))
+                                            cur = _get_conn().execute('SELECT user_name FROM users WHERE user_id = %s', (uid,))
                                             db_name = (cur.fetchone() or {}).get('user_name', '')
                                             if db_name and not (db_name.startswith('ç¥žç§˜äºº') or re.match(r'dou\d+$', db_name, re.IGNORECASE)):
                                                 _is_anon = False
@@ -1448,7 +1455,7 @@ class DouyinBarrage:
                                                     logger.info(f"[åŒ¿å] å·²è§£æž {uid}: {uname} â†’ {resolved}")
                                             except Exception:
                                                 logger.debug(f"[åŒ¿å] è§£æž {uid} å¤±è´¥ï¼Œä¿ç•™åŽŸåç§°")
-                                if rec_type == 'chat' and rec_data.get('content'):
+                                if rec_type in ('chat', 'lucky_bag') and rec_data.get('content'):
                                     record_chat(self._session_id,
                                         uid, uname,
                                         rec_data.get('content', ''),
@@ -1542,7 +1549,7 @@ class DouyinBarrage:
                                             if not final_uid or final_uid == '0':
                                                 if sub_uname:
                                                     found = _get_conn().execute(
-                                                        'SELECT user_id FROM users WHERE user_name = ? LIMIT 1',
+                                                        'SELECT user_id FROM users WHERE user_name = %s LIMIT 1',
                                                         (sub_uname,)
                                                     ).fetchone()
                                                     if found:
@@ -1568,11 +1575,11 @@ class DouyinBarrage:
                                                     if cid and re.match(r'^\d+$', str(cid)) and str(cid) not in candidate_ids:
                                                         candidate_ids.append(str(cid))
                                                 if candidate_ids:
-                                                    placeholders = ' OR user_id = '.join(['?'] * len(candidate_ids))
-                                                    query = f'SELECT user_id FROM users WHERE user_name = ? OR user_id = {placeholders} LIMIT 1'
+                                                    placeholders = ' OR user_id = '.join(['%s'] * len(candidate_ids))
+                                                    query = f'SELECT user_id FROM users WHERE user_name = %s OR user_id = {placeholders} LIMIT 1'
                                                     params = [sub_uname] + candidate_ids
                                                 else:
-                                                    query = 'SELECT user_id FROM users WHERE user_name = ? LIMIT 1'
+                                                    query = 'SELECT user_id FROM users WHERE user_name = %s LIMIT 1'
                                                     params = [sub_uname]
                                                 found = _get_conn().execute(query, params).fetchone()
                                                 if found:
@@ -1902,12 +1909,12 @@ class DouyinBarrage:
                             sec = info.get('sec_uid', '')
                             avatar = info.get('avatar_url', '')
                             conn.execute(
-                                'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0 WHERE user_id = ?',
+                                'UPDATE users SET user_name = %s, sec_uid = CASE WHEN %s != \'\' THEN %s ELSE sec_uid END, avatar_url = CASE WHEN %s != \'\' THEN %s ELSE avatar_url END, is_anonymous = 0 WHERE user_id = %s',
                                 (nick, sec, sec, avatar, avatar, uid)
                             )
                             if rid and rid != uid:
                                 conn.execute(
-                                    'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0 WHERE user_id = ?',
+                                    'UPDATE users SET user_name = %s, sec_uid = CASE WHEN %s != \'\' THEN %s ELSE sec_uid END, avatar_url = CASE WHEN %s != \'\' THEN %s ELSE avatar_url END, is_anonymous = 0 WHERE user_id = %s',
                                     (nick, sec, sec, avatar, avatar, rid)
                                 )
                             conn.commit()
@@ -1916,9 +1923,9 @@ class DouyinBarrage:
                             time.sleep(2.5)
                             continue
                     # API è¿”å›žç©º + æ— è´¡çŒ® â†’ å‡ç”¨æˆ·ï¼Œç§»å‡ºåŒ¿åç»Ÿè®¡
-                    has_c = conn.execute('SELECT COUNT(*) FROM contributions WHERE user_id = ?', (uid,)).fetchone()[0]
+                    has_c = conn.execute('SELECT COUNT(*) FROM contributions WHERE user_id = %s', (uid,)).fetchone()[0]
                     if has_c == 0:
-                        conn.execute('UPDATE users SET is_anonymous = 0, anonymous_label = "fake" WHERE user_id = ?', (uid,))
+                        conn.execute('UPDATE users SET is_anonymous = 0, anonymous_label = "fake" WHERE user_id = %s', (uid,))
                         conn.commit()
                         done += 1
                     import time

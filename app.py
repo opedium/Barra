@@ -1728,9 +1728,14 @@ def main():
     parser.add_argument('--host', default=_web_config['host'])
     parser.add_argument('--port', default=_web_config['port'], type=int)
     parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--log-level', default='INFO',
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'BARRAGE'],
+                        help='Log level (default: INFO)')
     parser.add_argument('--auto-start', action='store_true',
                         help='Auto-start streamers that were enabled on last shutdown')
     args = parser.parse_args()
+    from base.output import setup_logger
+    setup_logger(log_dir='logs', log_level=args.log_level)
     os.makedirs(os.path.join(os.path.dirname(__file__), 'data'), exist_ok=True)
 
     # Seed streamer config from rooms.txt (one-time)
