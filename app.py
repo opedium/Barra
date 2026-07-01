@@ -277,26 +277,14 @@ class StreamerManager:
                 self._instances.pop(live_id, None)
             return False, str(e)
 
-    def stop_streamer(self, live_id, shutdown=False):
-        """Stop and remove a running instance.
-
-        Args:
-            live_id: 主播 ID。
-            shutdown: True = 进程关闭（保留 session），False = 手动停止（结束 session）。
-        """
+    def stop_streamer(self, live_id):
+        """Stop and remove a running instance."""
         with self._lock:
             instance = self._instances.pop(live_id, None)
 
         if instance is not None:
             try:
                 instance.stop()
-            except Exception:
-                pass
-
-        # 手动停止时结束 session；重启时保留 session 供复用
-        if not shutdown and instance and hasattr(instance, '_session_id') and instance._session_id:
-            try:
-                db_end_session(instance._session_id)
             except Exception:
                 pass
 
@@ -407,7 +395,7 @@ class StreamerManager:
         with self._lock:
             ids = list(self._instances.keys())
         for lid in ids:
-            self.stop_streamer(lid, shutdown=True)
+            self.stop_streamer(lid)
 
 
 # ── Collection Stats API ──

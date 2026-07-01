@@ -634,8 +634,8 @@ class DouyinBarrage:
                 if cnt == 0:
                     _ds(self._session_id)
                     logger.info(f"[DB] ç©ºåœºæ¬¡ #{self._session_id} å·²åˆ é™¤")
-                # 不 end_session，让 session 保持 live
-                # 重启时 create_session 会复用，手动停止时由 app.py:stop_streamer 处理
+                else:
+                    end_session(self._session_id)
             except Exception:
                 pass
 
