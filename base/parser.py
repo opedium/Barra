@@ -3698,7 +3698,7 @@ def query_big_spenders(min_consume=10000, trend='all', anchor='', page=1, size=5
             SELECT MAX(g.created_at) as last_time
             FROM gift_logs g
             JOIN sessions s ON s.id = g.session_id
-            WHERE g.user_id = ? {anchor_filter.replace('s.', 's2.') if anchor else ''}
+            WHERE g.user_id = ? {anchor_filter}
         ''', (uid,) + anchor_params if anchor else (uid,)).fetchone()
         silent_days = 0
         if last_seen and last_seen['last_time']:
