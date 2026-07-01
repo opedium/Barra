@@ -3568,7 +3568,7 @@ def query_user_retention(anchor='', period='30d', tier=0, page=1, size=20):
     ''', anchor_params).fetchone()
 
     curve_data = {
-        'labels': ['第1场', '第2场', '第3场', '第4场', '第5场'],
+        'labels': ['第1场', '第2场', '第3场', '第4场', '第5场', '第6场'],
         'series': [
             {'name': '全部用户', 'color': '#94a3b8',
              'data': [100.0] + [round(rows[i] or 0, 1) for i in range(1, 6)]}
@@ -3717,7 +3717,6 @@ def query_big_spenders(min_consume=10000, trend='all', anchor='', page=1, size=5
                 pass
 
         users_list.append({
-            'rank': offset + i + 1,
             'user_id': uid,
             'user_name': r['user_name'] or uid,
             'fans_club': r['fans_club'],
@@ -3731,6 +3730,10 @@ def query_big_spenders(min_consume=10000, trend='all', anchor='', page=1, size=5
             'avatar_url': r['avatar_url'] or '',
             'sec_uid': r['sec_uid'] or '',
         })
+
+    # assign sequential ranks after trend filtering
+    for idx, u in enumerate(users_list):
+        u['rank'] = idx + 1
 
     # paginate after filtering
     paginated = users_list[offset:offset + size]
@@ -3764,7 +3767,7 @@ def query_silent_whales(threshold=30000, silent_days=7, anchor=''):
         WHERE 1=1 {anchor_filter}
         GROUP BY g.user_id
         HAVING SUM(g.diamond_total) >= ?
-           AND MAX(g.created_at) < datetime('now', '-%d days', '+8 hours') % silent_days
+           AND MAX(g.created_at) < datetime('now', '-{silent_days} days', '+8 hours')
         ORDER BY total_consume DESC
     ''', anchor_params + (threshold,)).fetchall()
 
