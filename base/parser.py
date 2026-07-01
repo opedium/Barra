@@ -1871,6 +1871,7 @@ def _get_conn():
             with _db_schema_lock:
                 if not _db_schema_inited:
                     init_db()
+                    init_gift_prices_table()
                     _db_schema_inited = True
     return _local.conn
 
@@ -1993,6 +1994,29 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_upgrade_logs_session ON upgrade_logs(session_id);
         CREATE INDEX IF NOT EXISTS idx_upgrade_logs_type ON upgrade_logs(upgrade_type);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_upgrade_logs_dedup ON upgrade_logs(session_id, user_id, upgrade_type, from_level, to_level);
+        CREATE TABLE IF NOT EXISTS gift_prices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            gift_name TEXT NOT NULL UNIQUE,
+            gift_id INTEGER DEFAULT 0,
+            diamond_count INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'auto',
+            is_limited_skin INTEGER NOT NULL DEFAULT 0,
+            base_gift_name TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+            updated_at DATETIME DEFAULT (datetime('now', '+8 hours'))
+        );
+        CREATE TABLE IF NOT EXISTS price_change_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            gift_name TEXT NOT NULL,
+            old_price INTEGER NOT NULL,
+            new_price INTEGER NOT NULL,
+            affected_rows INTEGER DEFAULT 0,
+            affected_sessions INTEGER DEFAULT 0,
+            notes TEXT DEFAULT '',
+            changed_by TEXT DEFAULT 'web_ui',
+            created_at DATETIME DEFAULT (datetime('now', '+8 hours'))
+        );
     ''')
     # 兼容旧表：给 users 表补充 grade 字段
     try:
@@ -2020,6 +2044,117 @@ def init_db():
     conn.commit()
     logger.info(f"[DB] 已初始化: {DB_PATH}")
     return True
+
+
+def init_gift_prices_table():
+    """Populate gift_prices table from all available sources.
+
+    Priority (higher = never overwritten by lower):
+        1. _GIFT_PRICE_OVERRIDE  (manually verified, source='override')
+        2. _GIFT_FALLBACK        (manually verified, source='override')
+        3. gift_registry.json    (official registry, source='registry')
+        4. Auto-detected from gift_logs (consensus price, source='auto')
+
+    Auto-detected entries are refreshed on each startup.
+    Authoritative entries (override/registry) are INSERT OR IGNORE only.
+    """
+    conn = _get_conn()
+
+    # Source 1: _GIFT_PRICE_OVERRIDE
+    for name, price in _GIFT_PRICE_OVERRIDE.items():
+        conn.execute('''
+            INSERT OR IGNORE INTO gift_prices (gift_name, diamond_count, source, is_limited_skin, notes)
+            VALUES (?, ?, 'override', 1, 'Limited-edition skin price override')
+        ''', (name, price))
+
+    # Source 2: _GIFT_FALLBACK (gift_id-based)
+    for gid, info in _GIFT_FALLBACK.items():
+        conn.execute('''
+            INSERT OR IGNORE INTO gift_prices (gift_name, gift_id, diamond_count, source)
+            VALUES (?, ?, ?, 'override')
+        ''', (info['name'], gid, info['diamond_count']))
+
+    # Source 3: gift_registry.json (if exists)
+    import json, os as _os
+    _reg_path = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), 'data', 'gift_registry.json')
+    if _os.path.exists(_reg_path):
+        try:
+            with open(_reg_path, 'r', encoding='utf-8') as _f:
+                _registry = json.load(_f)
+            for _name, _info in _registry.items():
+                _gid = _info.get('id')
+                _price = _info.get('diamond_count', 0)
+                if _gid and _price:
+                    conn.execute('''
+                        INSERT OR IGNORE INTO gift_prices (gift_name, gift_id, diamond_count, source)
+                        VALUES (?, ?, ?, 'registry')
+                    ''', (_name, _gid, _price))
+        except Exception:
+            pass  # registry is optional
+
+    # Source 4: Auto-detect from gift_logs (refresh on every startup)
+    # First, collect consensus prices for each gift_name
+    auto_rows = conn.execute('''
+        SELECT gift_name, diamond_total / MAX(gift_count, 1) AS unit_price,
+               COUNT(*) AS occurrences
+        FROM gift_logs
+        WHERE gift_count > 0
+        GROUP BY gift_name, unit_price
+        ORDER BY gift_name, occurrences DESC
+    ''').fetchall()
+
+    # Group by gift_name: pick most common price, flag conflicts
+    from collections import defaultdict
+    gift_prices_map = {}      # gift_name -> (unit_price, occurrences, has_conflict)
+    gift_conflicts = defaultdict(list)  # gift_name -> [(price, count), ...]
+    for row in auto_rows:
+        name = row['gift_name']
+        price = row['unit_price']
+        cnt = row['occurrences']
+        if name not in gift_prices_map:
+            gift_prices_map[name] = (price, cnt, False)
+        else:
+            existing_price, existing_cnt, _ = gift_prices_map[name]
+            if price != existing_price:
+                gift_conflicts[name].append((price, cnt))
+                if cnt > existing_cnt:
+                    gift_prices_map[name] = (price, cnt, True)
+                else:
+                    gift_prices_map[name] = (existing_price, existing_cnt, True)
+
+    # Upsert auto-detected prices (skip if authoritative source exists)
+    for name, (price, cnt, has_conflict) in gift_prices_map.items():
+        existing = conn.execute(
+            'SELECT source FROM gift_prices WHERE gift_name = ?', (name,)
+        ).fetchone()
+        if existing:
+            # Only update auto-detected entries; skip authoritative ones
+            if existing['source'] == 'auto':
+                notes = ''
+                if has_conflict:
+                    conflict_str = '; '.join(
+                        f'{p} dia ({c}x)' for p, c in gift_conflicts[name]
+                    )
+                    notes = f'Conflict: other prices {conflict_str}'
+                conn.execute('''
+                    UPDATE gift_prices
+                    SET diamond_count = ?, notes = ?, updated_at = datetime("now", "+8 hours")
+                    WHERE gift_name = ? AND source = 'auto'
+                ''', (price, notes, name))
+        else:
+            # New entry — insert
+            notes = ''
+            if has_conflict:
+                conflict_str = '; '.join(
+                    f'{p} dia ({c}x)' for p, c in gift_conflicts[name]
+                )
+                notes = f'Conflict: other prices {conflict_str}'
+            conn.execute('''
+                INSERT INTO gift_prices (gift_name, diamond_count, source, notes)
+                VALUES (?, ?, 'auto', ?)
+            ''', (name, price, notes))
+
+    conn.commit()
 
 
 def create_session(room_id, anchor_name=''):
