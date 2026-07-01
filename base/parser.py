@@ -3487,3 +3487,304 @@ def query_audit():
     result['dedup_sessions'] = dedup_list
 
     return result
+
+
+# ═══════════════════════════════════════════════════════════════
+#  User Behavior Analytics — query functions
+# ═══════════════════════════════════════════════════════════════
+
+def query_user_retention(anchor='', period='30d', tier=0, page=1, size=20):
+    """用户留存漏斗：按主播过滤，按 sessions.start_time 排序定义第N场。
+
+    Returns:
+        dict with keys: summary (dict), retention_curve (dict), details (list), total (int), page (int)
+    """
+    conn = _get_conn()
+    offset = (page - 1) * size
+
+    # ── period → SQL snippet ──
+    days_map = {'7d': 7, '30d': 30, '90d': 90}
+    time_filter = ''
+    time_params = ()
+    if period in days_map:
+        time_filter = 'AND s.start_time >= datetime(\'now\', \'-%d days\', \'+8 hours\')' % days_map[period]
+
+    anchor_filter = ''
+    anchor_params = ()
+    if anchor:
+        anchor_filter = 'AND s.anchor_name = ?'
+        anchor_params = (anchor,)
+
+    # ── target sessions with sequential numbering ──
+    session_sql = f'''
+        SELECT s.id, ROW_NUMBER() OVER (ORDER BY s.start_time) as session_seq
+        FROM sessions s
+        WHERE 1=1 {anchor_filter} {time_filter}
+    '''
+    # ── first session per user within target sessions ──
+    first_sql = f'''
+        SELECT g.user_id, MIN(sub.session_seq) as fs_seq,
+               SUM(g.diamond_total) as total_consume
+        FROM gift_logs g
+        JOIN ({session_sql}) sub ON sub.id = g.session_id
+        GROUP BY g.user_id
+    '''
+    tier_having = f'HAVING total_consume >= {int(tier)}' if tier > 0 else ''
+
+    # ── count first-session users (for pagination) ──
+    total = conn.execute(f'''
+        SELECT COUNT(*) FROM ({first_sql}) f {tier_having}
+    ''', anchor_params).fetchone()[0]
+
+    # ── retention per session offset ──
+    rows = conn.execute(f'''
+        SELECT
+            COUNT(*) as total_users,
+            SUM(CASE WHEN retained_1 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) * 100 as retain_1_rate,
+            SUM(CASE WHEN retained_2 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) * 100 as retain_2_rate,
+            SUM(CASE WHEN retained_3 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) * 100 as retain_3_rate,
+            SUM(CASE WHEN retained_4 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) * 100 as retain_4_rate,
+            SUM(CASE WHEN retained_5 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) * 100 as retain_5_rate
+        FROM (
+            SELECT f.user_id,
+                (SELECT COUNT(*) FROM gift_logs g2
+                 JOIN ({session_sql}) s2 ON s2.id = g2.session_id
+                 WHERE g2.user_id = f.user_id AND s2.session_seq = f.fs_seq + 1) > 0 as retained_1,
+                (SELECT COUNT(*) FROM gift_logs g2
+                 JOIN ({session_sql}) s2 ON s2.id = g2.session_id
+                 WHERE g2.user_id = f.user_id AND s2.session_seq <= f.fs_seq + 2) > 0 as retained_2,
+                (SELECT COUNT(*) FROM gift_logs g2
+                 JOIN ({session_sql}) s2 ON s2.id = g2.session_id
+                 WHERE g2.user_id = f.user_id AND s2.session_seq <= f.fs_seq + 3) > 0 as retained_3,
+                (SELECT COUNT(*) FROM gift_logs g2
+                 JOIN ({session_sql}) s2 ON s2.id = g2.session_id
+                 WHERE g2.user_id = f.user_id AND s2.session_seq <= f.fs_seq + 4) > 0 as retained_4,
+                (SELECT COUNT(*) FROM gift_logs g2
+                 JOIN ({session_sql}) s2 ON s2.id = g2.session_id
+                 WHERE g2.user_id = f.user_id AND s2.session_seq <= f.fs_seq + 5) > 0 as retained_5
+            FROM ({first_sql}) f
+            {tier_having}
+        ) r
+    ''', anchor_params).fetchone()
+
+    curve_data = {
+        'labels': ['第1场', '第2场', '第3场', '第4场', '第5场'],
+        'series': [
+            {'name': '全部用户', 'color': '#94a3b8',
+             'data': [100.0] + [round(rows[i] or 0, 1) for i in range(1, 6)]}
+        ]
+    }
+
+    summary = {}
+    if rows and rows['total_users']:
+        summary = {
+            'total_active_users': rows['total_users'],
+            'first_session_users': rows['total_users'],
+            'overall_retention_rate': round(rows['retain_1_rate'] or 0, 1),
+            'high_value_retention_rate': round(rows['retain_1_rate'] or 0, 1),
+        }
+
+    # ── detail rows per anchor-date group ──
+    details = conn.execute(f'''
+        SELECT
+            date(s_min.start_time) as first_date,
+            s_min.anchor_name as anchor,
+            COUNT(DISTINCT f.user_id) as first_users,
+            COALESCE(SUM(CASE WHEN r2.retained THEN 1 ELSE 0 END), 0) as retained_2,
+            COALESCE(SUM(CASE WHEN r5.retained THEN 1 ELSE 0 END), 0) as retained_5,
+            COALESCE(SUM(f.total_consume), 0) as total_consume
+        FROM (
+            SELECT g.user_id, SUM(g.diamond_total) as total_consume,
+                   MIN(g.session_id) as fs_id
+            FROM gift_logs g
+            JOIN sessions s ON s.id = g.session_id
+            WHERE 1=1 {anchor_filter} {time_filter}
+            GROUP BY g.user_id
+        ) f
+        JOIN sessions s_min ON s_min.id = f.fs_id
+        LEFT JOIN (
+            SELECT g2.user_id, 1 as retained
+            FROM gift_logs g2
+            JOIN sessions s2 ON s2.id = g2.session_id
+            WHERE 1=1 {anchor_filter} {time_filter}
+            GROUP BY g2.user_id
+            HAVING MIN(s2.id) > f.fs_id
+        ) r2 ON r2.user_id = f.user_id
+        WHERE 1=1 {tier_having}
+        GROUP BY date(s_min.start_time), s_min.anchor_name
+        ORDER BY first_date DESC
+        LIMIT ? OFFSET ?
+    ''', anchor_params + (size, offset)).fetchall()
+
+    detail_list = []
+    for r in details:
+        d = dict(r)
+        d['retained_2_rate'] = round(d['retained_2'] / d['first_users'] * 100, 1) if d['first_users'] else 0
+        d['retained_5_rate'] = round(d['retained_5'] / d['first_users'] * 100, 1) if d['first_users'] else 0
+        detail_list.append(d)
+
+    return {
+        'summary': summary,
+        'retention_curve': curve_data,
+        'details': detail_list,
+        'total': total,
+        'page': page,
+    }
+
+
+def query_big_spenders(min_consume=10000, trend='all', anchor='', page=1, size=50):
+    """大R识别：消费排行 + 趋势分析（近3场 vs 前3场）。
+
+    Returns:
+        dict with keys: users (list), total (int), page (int)
+    """
+    conn = _get_conn()
+    offset = (page - 1) * size
+
+    anchor_filter = ''
+    anchor_params = ()
+    if anchor:
+        anchor_filter = 'AND s.anchor_name = ?'
+        anchor_params = (anchor,)
+
+    # ── per-user ranked sessions (only target anchor) ──
+    ranked = conn.execute(f'''
+        SELECT c.user_id, c.consume, c.session_id, s.start_time
+        FROM contributions c
+        JOIN sessions s ON s.id = c.session_id
+        WHERE c.consume > 0 {anchor_filter}
+        ORDER BY c.user_id, s.start_time DESC
+    ''', anchor_params).fetchall()
+
+    # ── aggregate in Python (SQLite doesn't support ROW_NUMBER filtering easily) ──
+    from collections import defaultdict
+    user_sessions = defaultdict(list)
+    for r in ranked:
+        user_sessions[r['user_id']].append(r['consume'])
+
+    rows = conn.execute(f'''
+        SELECT c.user_id,
+               COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name,
+               COALESCE(u.fans_club, '') AS fans_club,
+               COALESCE(u.grade, '') AS grade,
+               u.sec_uid, u.avatar_url,
+               SUM(c.consume) as total_consume,
+               COUNT(DISTINCT c.session_id) as active_days
+        FROM contributions c
+        JOIN sessions s ON s.id = c.session_id
+        LEFT JOIN users u ON u.user_id = c.user_id
+        WHERE c.consume > 0 {anchor_filter}
+        GROUP BY c.user_id
+        HAVING SUM(c.consume) >= ?
+        ORDER BY total_consume DESC
+    ''', anchor_params + (min_consume,)).fetchall()
+
+    total = len(rows)
+    users_list = []
+    for i, r in enumerate(rows):
+        uid = r['user_id']
+        sess = user_sessions.get(uid, [])
+        recent_3 = sum(sess[:3])
+        prev_3 = sum(sess[3:6])
+        total_cons = r['total_consume']
+
+        if len(sess) >= 6 and prev_3 > 0:
+            if recent_3 > prev_3 * 1.5:
+                trend_label = 'accelerating'
+            elif recent_3 < prev_3 * 0.5:
+                trend_label = 'decelerating'
+            else:
+                trend_label = 'stable'
+        else:
+            trend_label = 'insufficient_data'
+
+        if trend != 'all' and trend_label != trend:
+            continue
+
+        # silence days: days since last gift in this anchor's sessions
+        last_seen = conn.execute(f'''
+            SELECT MAX(g.created_at) as last_time
+            FROM gift_logs g
+            JOIN sessions s ON s.id = g.session_id
+            WHERE g.user_id = ? {anchor_filter.replace('s.', 's2.') if anchor else ''}
+        ''', (uid,) + anchor_params if anchor else (uid,)).fetchone()
+        silent_days = 0
+        if last_seen and last_seen['last_time']:
+            try:
+                lt = datetime.strptime(last_seen['last_time'][:19], '%Y-%m-%d %H:%M:%S')
+                silent_days = (datetime.now() - lt).days
+            except (ValueError, TypeError):
+                pass
+
+        users_list.append({
+            'rank': offset + i + 1,
+            'user_id': uid,
+            'user_name': r['user_name'] or uid,
+            'fans_club': r['fans_club'],
+            'grade': r['grade'],
+            'total_consume': total_cons,
+            'recent_3': recent_3,
+            'prev_3': prev_3,
+            'trend': trend_label,
+            'active_days': r['active_days'],
+            'silent_days': silent_days,
+            'avatar_url': r['avatar_url'] or '',
+            'sec_uid': r['sec_uid'] or '',
+        })
+
+    # paginate after filtering
+    paginated = users_list[offset:offset + size]
+
+    return {'users': paginated, 'total': len(users_list), 'page': page}
+
+
+def query_silent_whales(threshold=30000, silent_days=7, anchor=''):
+    """沉默大R预警：总消费 >= threshold 且最近活跃超过 silent_days 的用户。
+
+    Returns:
+        dict with key: users (list)
+    """
+    conn = _get_conn()
+
+    anchor_filter = ''
+    anchor_params = ()
+    if anchor:
+        anchor_filter = 'AND s.anchor_name = ?'
+        anchor_params = (anchor,)
+
+    rows = conn.execute(f'''
+        SELECT g.user_id,
+               COALESCE(NULLIF(u.user_name, ''), g.user_name) AS user_name,
+               u.avatar_url, u.sec_uid,
+               SUM(g.diamond_total) as total_consume,
+               MAX(g.created_at) as last_seen
+        FROM gift_logs g
+        JOIN sessions s ON s.id = g.session_id
+        LEFT JOIN users u ON u.user_id = g.user_id
+        WHERE 1=1 {anchor_filter}
+        GROUP BY g.user_id
+        HAVING SUM(g.diamond_total) >= ?
+           AND MAX(g.created_at) < datetime('now', '-%d days', '+8 hours') % silent_days
+        ORDER BY total_consume DESC
+    ''', anchor_params + (threshold,)).fetchall()
+
+    users_list = []
+    for r in rows:
+        silent = 0
+        if r['last_seen']:
+            try:
+                lt = datetime.strptime(r['last_seen'][:19], '%Y-%m-%d %H:%M:%S')
+                silent = (datetime.now() - lt).days
+            except (ValueError, TypeError):
+                pass
+        users_list.append({
+            'user_id': r['user_id'],
+            'user_name': r['user_name'] or r['user_id'],
+            'total_consume': r['total_consume'],
+            'last_seen': r['last_seen'] or '',
+            'silent_days': silent,
+            'avatar_url': r['avatar_url'] or '',
+            'sec_uid': r['sec_uid'] or '',
+        })
+
+    return {'users': users_list}
