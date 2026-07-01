@@ -829,7 +829,6 @@ def api_gift_prices():
     conn = _get_conn()
     search = request.args.get('search', '').strip()
     source_filter = request.args.get('source', '').strip()
-    needs_review = request.args.get('needs_review', '').strip()
     page = request.args.get('page', 1, type=int)
     size = request.args.get('size', 50, type=int)
     offset = (page - 1) * size
@@ -844,10 +843,6 @@ def api_gift_prices():
     if source_filter:
         where.append('g.source = ?')
         params.append(source_filter)
-
-    if needs_review == '1':
-        # "Needs review" = auto-detected + has conflicting prices in notes
-        where.append("(g.source = 'auto' AND g.notes != '')")
 
     w = ' AND '.join(where)
 
@@ -873,6 +868,58 @@ def api_gift_prices():
         'page': page,
         'size': size,
     })
+
+
+@app.route('/api/gift-prices', methods=['POST'])
+@require_auth
+def api_gift_price_create():
+    """Create a new gift price entry."""
+    data = request.get_json(force=True, silent=True) or {}
+    gift_name = (data.get('gift_name') or '').strip()
+    if not gift_name:
+        return jsonify({'error': 'gift_name is required'}), 400
+    diamond_count = int(data.get('diamond_count', 0))
+    if diamond_count < 0:
+        return jsonify({'error': 'price must be >= 0'}), 400
+
+    conn = _get_conn()
+    # Check if already exists in gift_prices (exact match)
+    existing = conn.execute('SELECT id FROM gift_prices WHERE gift_name = ?', (gift_name,)).fetchone()
+    if existing:
+        return jsonify({'error': f'礼物 "{gift_name}" 已存在'}), 409
+
+    # Check for similar names (case-insensitive, to catch typos/case differences)
+    similar = conn.execute('SELECT gift_name, diamond_count, source FROM gift_prices WHERE LOWER(gift_name) = LOWER(?)', (gift_name,)).fetchall()
+    if similar:
+        s = similar[0]
+        return jsonify({
+            'error': f'礼物 "{gift_name}" 与已有记录 "{s["gift_name"]}" 仅大小写不同',
+            'similar_name': s['gift_name'],
+        }), 409
+
+    # Check if name exists in gift_logs data (not yet in gift_prices)
+    log_count = conn.execute('SELECT COUNT(*) AS cnt FROM gift_logs WHERE gift_name = ?', (gift_name,)).fetchone()[0]
+    if log_count > 0:
+        # Name already exists in live data — warn but allow creation
+        pass  # handled in response below
+
+    conn.execute('''
+        INSERT INTO gift_prices (gift_name, gift_id, diamond_count, source, is_limited_skin)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (
+        gift_name,
+        int(data.get('gift_id', 0)),
+        diamond_count,
+        data.get('source', 'manual'),
+        1 if data.get('is_limited_skin') else 0,
+    ))
+    conn.commit()
+
+    new_id = conn.execute('SELECT id FROM gift_prices WHERE gift_name = ?', (gift_name,)).fetchone()[0]
+    result = {'success': True, 'id': new_id, 'gift_name': gift_name}
+    if log_count > 0:
+        result['warning'] = f'礼物名 "{gift_name}" 已在 {log_count} 条直播记录中出现，价格已覆盖自动检测值'
+    return jsonify(result), 201
 
 
 @app.route('/api/gift-prices/<int:price_id>')
@@ -921,14 +968,6 @@ def api_gift_price_update(price_id):
     if 'is_limited_skin' in data:
         updates.append('is_limited_skin = ?')
         params.append(1 if data['is_limited_skin'] else 0)
-
-    if 'base_gift_name' in data:
-        updates.append('base_gift_name = ?')
-        params.append(data['base_gift_name'])
-
-    if 'notes' in data:
-        updates.append('notes = ?')
-        params.append(data['notes'])
 
     if updates:
         updates.append('updated_at = datetime("now", "+8 hours")')
@@ -1023,19 +1062,11 @@ def api_gift_prices_audit():
         d['db_price'] = db_row['diamond_count'] if db_row else None
         d['db_source'] = db_row['source'] if db_row else 'unknown'
 
-    # Section 2: Needs review (auto-detected with conflicts)
-    needs_review = conn.execute('''
-        SELECT * FROM gift_prices
-        WHERE source = 'auto' AND notes != ''
-        ORDER BY updated_at DESC
-    ''').fetchall()
-
-    # Section 3: Change history
+    # Section 2: Change history
     history = get_price_change_history(30)
 
     return jsonify({
         'discrepancies': audit_discrepancies,
-        'needs_review': [dict(r) for r in needs_review],
         'history': history,
     })
 

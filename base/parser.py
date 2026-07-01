@@ -2048,8 +2048,6 @@ def init_db():
             diamond_count INTEGER NOT NULL DEFAULT 0,
             source TEXT NOT NULL DEFAULT 'auto',
             is_limited_skin INTEGER NOT NULL DEFAULT 0,
-            base_gift_name TEXT NOT NULL DEFAULT '',
-            notes TEXT NOT NULL DEFAULT '',
             created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
             updated_at DATETIME DEFAULT (datetime('now', '+8 hours'))
         );
@@ -2068,6 +2066,15 @@ def init_db():
     # 兼容旧表：给 users 表补充 grade 字段
     try:
         conn.execute('ALTER TABLE users ADD COLUMN grade TEXT DEFAULT ""')
+    except Exception:
+        pass
+    # 迁移旧版 gift_prices：移除废弃的 base_gift_name 和 notes 列
+    try:
+        conn.execute('ALTER TABLE gift_prices DROP COLUMN base_gift_name')
+    except Exception:
+        pass
+    try:
+        conn.execute('ALTER TABLE gift_prices DROP COLUMN notes')
     except Exception:
         pass
     # 清理僵尸场次：结束标记为"直播中"但开始时间超过 12 小时前的场次
@@ -2110,8 +2117,8 @@ def init_gift_prices_table():
     # Source 1: _GIFT_PRICE_OVERRIDE
     for name, price in _GIFT_PRICE_OVERRIDE.items():
         conn.execute('''
-            INSERT OR IGNORE INTO gift_prices (gift_name, diamond_count, source, is_limited_skin, notes)
-            VALUES (?, ?, 'override', 1, 'Limited-edition skin price override')
+            INSERT OR IGNORE INTO gift_prices (gift_name, diamond_count, source, is_limited_skin)
+            VALUES (?, ?, 'override', 1)
         ''', (name, price))
 
     # Source 2: _GIFT_FALLBACK (gift_id-based)
@@ -2140,66 +2147,34 @@ def init_gift_prices_table():
             pass  # registry is optional
 
     # Source 4: Auto-detect from gift_logs (refresh on every startup)
-    # First, collect consensus prices for each gift_name
     auto_rows = conn.execute('''
         SELECT gift_name, diamond_total / MAX(gift_count, 1) AS unit_price,
                COUNT(*) AS occurrences
         FROM gift_logs
         WHERE gift_count > 0
-        GROUP BY gift_name, unit_price
-        ORDER BY gift_name, occurrences DESC
+        GROUP BY gift_name
+        ORDER BY occurrences DESC
     ''').fetchall()
 
-    # Group by gift_name: pick most common price, flag conflicts
-    from collections import defaultdict
-    gift_prices_map = {}      # gift_name -> (unit_price, occurrences, has_conflict)
-    gift_conflicts = defaultdict(list)  # gift_name -> [(price, count), ...]
+    # Upsert auto-detected prices (skip if authoritative source exists)
     for row in auto_rows:
         name = row['gift_name']
         price = row['unit_price']
-        cnt = row['occurrences']
-        if name not in gift_prices_map:
-            gift_prices_map[name] = (price, cnt, False)
-        else:
-            existing_price, existing_cnt, _ = gift_prices_map[name]
-            if price != existing_price:
-                gift_conflicts[name].append((price, cnt))
-                if cnt > existing_cnt:
-                    gift_prices_map[name] = (price, cnt, True)
-                else:
-                    gift_prices_map[name] = (existing_price, existing_cnt, True)
-
-    # Upsert auto-detected prices (skip if authoritative source exists)
-    for name, (price, cnt, has_conflict) in gift_prices_map.items():
         existing = conn.execute(
             'SELECT source FROM gift_prices WHERE gift_name = ?', (name,)
         ).fetchone()
         if existing:
-            # Only update auto-detected entries; skip authoritative ones
             if existing['source'] == 'auto':
-                notes = ''
-                if has_conflict:
-                    conflict_str = '; '.join(
-                        f'{p} dia ({c}x)' for p, c in gift_conflicts[name]
-                    )
-                    notes = f'Conflict: other prices {conflict_str}'
                 conn.execute('''
                     UPDATE gift_prices
-                    SET diamond_count = ?, notes = ?, updated_at = datetime("now", "+8 hours")
+                    SET diamond_count = ?, updated_at = datetime("now", "+8 hours")
                     WHERE gift_name = ? AND source = 'auto'
-                ''', (price, notes, name))
+                ''', (price, name))
         else:
-            # New entry — insert
-            notes = ''
-            if has_conflict:
-                conflict_str = '; '.join(
-                    f'{p} dia ({c}x)' for p, c in gift_conflicts[name]
-                )
-                notes = f'Conflict: other prices {conflict_str}'
             conn.execute('''
-                INSERT INTO gift_prices (gift_name, diamond_count, source, notes)
-                VALUES (?, ?, 'auto', ?)
-            ''', (name, price, notes))
+                INSERT INTO gift_prices (gift_name, diamond_count, source)
+                VALUES (?, ?, 'auto')
+            ''', (name, price))
 
     conn.commit()
 
