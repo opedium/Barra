@@ -2313,11 +2313,15 @@ def get_price_change_history(limit=50):
 
 def create_session(room_id, anchor_name=''):
     conn = _get_conn()
-    # 结束同一房间下仍标记为"直播中"的旧场次，避免累积僵尸场次
-    old = conn.execute('SELECT id FROM sessions WHERE room_id = ? AND status = "live"', (room_id,)).fetchall()
-    for row in old:
-        conn.execute('UPDATE sessions SET end_time = datetime("now", "+8 hours"), status = "ended" WHERE id = ?', (row['id'],))
-        logger.info(f"[DB] 自动结束旧场次 #{row['id']} (新场次创建)")
+    # 复用同一房间已有的 live 场次（进程重启后保持同一 session_id）
+    existing = conn.execute(
+        'SELECT id FROM sessions WHERE room_id = ? AND status = "live" LIMIT 1',
+        (room_id,)
+    ).fetchone()
+    if existing:
+        sid = existing['id']
+        logger.info(f"[DB] 复用场次 #{sid}: {anchor_name} ({room_id})")
+        return sid
     cur = conn.execute('INSERT INTO sessions (room_id, anchor_name) VALUES (?, ?)', (room_id, anchor_name))
     conn.commit()
     sid = cur.lastrowid
