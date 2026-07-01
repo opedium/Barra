@@ -33,6 +33,7 @@ from base.parser import (
     query_sessions, query_session_detail, query_search, _get_conn, DB_PATH,
     end_session as db_end_session, delete_session as db_delete_session,
     set_sse_callback,
+    init_gift_prices_table, recalculate_gift_price, get_price_change_history,
 )
 from service.fetcher import DouyinBarrage
 from service.network import fetch_user_info_by_sec_uid, fetch_user_info_by_user_id, fetch_user_info
@@ -811,6 +812,232 @@ def api_compare():
         session_data['top_gift'] = top_gift['gift_name'] if top_gift else ''
         result['sessions'].append(session_data)
     return jsonify(result)
+
+
+# ── Gift Price Management ──
+
+@app.route('/gift-prices')
+@require_auth
+def gift_prices():
+    return render_template('gift_prices.html', auth_enabled=bool(_web_config['password']))
+
+
+@app.route('/api/gift-prices')
+@require_auth
+def api_gift_prices():
+    """List gift prices with search, filter, and pagination."""
+    conn = _get_conn()
+    search = request.args.get('search', '').strip()
+    source_filter = request.args.get('source', '').strip()
+    needs_review = request.args.get('needs_review', '').strip()
+    page = request.args.get('page', 1, type=int)
+    size = request.args.get('size', 50, type=int)
+    offset = (page - 1) * size
+
+    where = ['1=1']
+    params = []
+
+    if search:
+        where.append('g.gift_name LIKE ?')
+        params.append(f'%{search}%')
+
+    if source_filter:
+        where.append('g.source = ?')
+        params.append(source_filter)
+
+    if needs_review == '1':
+        # "Needs review" = auto-detected + has conflicting prices in notes
+        where.append("(g.source = 'auto' AND g.notes != '')")
+
+    w = ' AND '.join(where)
+
+    total = conn.execute(f'SELECT COUNT(*) FROM gift_prices g WHERE {w}', params).fetchone()[0]
+
+    rows = conn.execute(f'''
+        SELECT g.*,
+               COALESCE(d.logs, 0) AS logs,
+               COALESCE(d.total_dia, 0) AS total_dia
+        FROM gift_prices g
+        LEFT JOIN (
+            SELECT gift_name, COUNT(*) AS logs, SUM(diamond_total) AS total_dia
+            FROM gift_logs GROUP BY gift_name
+        ) d ON d.gift_name = g.gift_name
+        WHERE {w}
+        ORDER BY d.total_dia DESC, g.gift_name
+        LIMIT ? OFFSET ?
+    ''', params + [size, offset]).fetchall()
+
+    return jsonify({
+        'prices': [dict(r) for r in rows],
+        'total': total,
+        'page': page,
+        'size': size,
+    })
+
+
+@app.route('/api/gift-prices/<int:price_id>')
+@require_auth
+def api_gift_price(price_id):
+    conn = _get_conn()
+    row = conn.execute('SELECT * FROM gift_prices WHERE id = ?', (price_id,)).fetchone()
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify(dict(row))
+
+
+@app.route('/api/gift-prices/<int:price_id>', methods=['POST'])
+@require_auth
+def api_gift_price_update(price_id):
+    """Update a gift price. If diamond_count changes, optionally recalculate."""
+    conn = _get_conn()
+    row = conn.execute('SELECT * FROM gift_prices WHERE id = ?', (price_id,)).fetchone()
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+
+    data = request.get_json(force=True, silent=True) or {}
+
+    updates = []
+    params = []
+
+    if 'diamond_count' in data:
+        new_price = int(data['diamond_count'])
+        if new_price < 0:
+            return jsonify({'error': 'price must be >= 0'}), 400
+        old_price = row['diamond_count']
+        updates.append('diamond_count = ?')
+        params.append(new_price)
+    else:
+        old_price = row['diamond_count']
+        new_price = old_price
+
+    if 'gift_id' in data:
+        updates.append('gift_id = ?')
+        params.append(int(data['gift_id']))
+
+    if 'source' in data:
+        updates.append('source = ?')
+        params.append(data['source'])
+
+    if 'is_limited_skin' in data:
+        updates.append('is_limited_skin = ?')
+        params.append(1 if data['is_limited_skin'] else 0)
+
+    if 'base_gift_name' in data:
+        updates.append('base_gift_name = ?')
+        params.append(data['base_gift_name'])
+
+    if 'notes' in data:
+        updates.append('notes = ?')
+        params.append(data['notes'])
+
+    if updates:
+        updates.append('updated_at = datetime("now", "+8 hours")')
+        params.append(price_id)
+        conn.execute(f'UPDATE gift_prices SET {", ".join(updates)} WHERE id = ?', params)
+        conn.commit()
+
+    recalculate = data.get('recalculate', False)
+    recalc_result = None
+    if recalculate and new_price != old_price:
+        recalc_result = recalculate_gift_price(
+            row['gift_name'], new_price, old_price,
+            notes=data.get('notes', '')
+        )
+
+    return jsonify({
+        'success': True,
+        'gift_name': row['gift_name'],
+        'old_price': old_price,
+        'new_price': new_price if 'diamond_count' in data else old_price,
+        'recalculated': recalc_result is not None,
+        'recalc_result': recalc_result,
+    })
+
+
+@app.route('/api/gift-prices/bulk-recalculate', methods=['POST'])
+@require_auth
+def api_gift_prices_bulk_recalculate():
+    """Recalculate all gift_logs rows for a specific gift_name using its current price."""
+    data = request.get_json(force=True, silent=True) or {}
+    price_id = data.get('price_id')
+    gift_name = data.get('gift_name')
+
+    conn = _get_conn()
+
+    if price_id:
+        row = conn.execute('SELECT * FROM gift_prices WHERE id = ?', (price_id,)).fetchone()
+    elif gift_name:
+        row = conn.execute('SELECT * FROM gift_prices WHERE gift_name = ?', (gift_name,)).fetchone()
+    else:
+        return jsonify({'error': 'price_id or gift_name required'}), 400
+
+    if not row:
+        return jsonify({'error': 'gift price not found'}), 404
+
+    result = recalculate_gift_price(row['gift_name'], row['diamond_count'], row['diamond_count'],
+                                    notes='Bulk recalculation')
+    return jsonify({'success': True, 'result': result})
+
+
+@app.route('/api/gift-prices/audit')
+@require_auth
+def api_gift_prices_audit():
+    """Return audit data: discrepancies, needs-review items, change history."""
+    conn = _get_conn()
+
+    # Section 1: Price discrepancies — same gift_name, different unit prices in gift_logs
+    discrepancies = conn.execute('''
+        SELECT gift_name, diamond_total / MAX(gift_count, 1) AS unit_price,
+               COUNT(*) AS occurrences,
+               COUNT(DISTINCT session_id) AS sessions
+        FROM gift_logs
+        WHERE gift_count > 0
+        GROUP BY gift_name, unit_price
+        HAVING COUNT(*) > 0
+        ORDER BY gift_name, occurrences DESC
+    ''').fetchall()
+
+    # Group by gift_name, find conflicts
+    disc_dict = {}
+    for r in discrepancies:
+        name = r['gift_name']
+        if name not in disc_dict:
+            disc_dict[name] = {'gift_name': name, 'prices': [], 'total_occurrences': 0}
+        disc_dict[name]['prices'].append({
+            'unit_price': r['unit_price'],
+            'occurrences': r['occurrences'],
+            'sessions': r['sessions'],
+        })
+        disc_dict[name]['total_occurrences'] += r['occurrences']
+
+    audit_discrepancies = [
+        d for d in disc_dict.values() if len(d['prices']) > 1
+    ]
+
+    # Cross-reference with gift_prices table
+    for d in audit_discrepancies:
+        db_row = conn.execute(
+            'SELECT diamond_count, source FROM gift_prices WHERE gift_name = ?',
+            (d['gift_name'],)
+        ).fetchone()
+        d['db_price'] = db_row['diamond_count'] if db_row else None
+        d['db_source'] = db_row['source'] if db_row else 'unknown'
+
+    # Section 2: Needs review (auto-detected with conflicts)
+    needs_review = conn.execute('''
+        SELECT * FROM gift_prices
+        WHERE source = 'auto' AND notes != ''
+        ORDER BY updated_at DESC
+    ''').fetchall()
+
+    # Section 3: Change history
+    history = get_price_change_history(30)
+
+    return jsonify({
+        'discrepancies': audit_discrepancies,
+        'needs_review': [dict(r) for r in needs_review],
+        'history': history,
+    })
 
 
 @app.route('/settings')
