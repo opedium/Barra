@@ -2204,6 +2204,122 @@ def init_gift_prices_table():
     conn.commit()
 
 
+def recalculate_gift_price(gift_name, new_price, old_price, notes=''):
+    """Recalculate gift_logs.diamond_total for a price change and cascade to derived tables.
+
+    This is called AFTER the gift_prices entry has been updated.
+    Uses the existing single-writer queue pattern for safe writes.
+
+    Args:
+        gift_name: The gift name that changed.
+        new_price: New diamond_count value.
+        old_price: Previous diamond_count value.
+        notes: Optional change notes.
+
+    Returns:
+        dict with affected_rows, affected_sessions, diamond_diff.
+    """
+    conn = _get_conn()
+
+    # Step A: Find affected gift_logs rows
+    affected = conn.execute('''
+        SELECT id, gift_count, diamond_total
+        FROM gift_logs
+        WHERE gift_name = ? AND diamond_total != ? * gift_count
+    ''', (gift_name, new_price)).fetchall()
+
+    if not affected:
+        return {'affected_rows': 0, 'affected_sessions': 0, 'diamond_diff': 0}
+
+    affected_rows = len(affected)
+
+    # Compute diamond difference
+    old_total = sum(r['diamond_total'] for r in affected)
+    new_total = sum(new_price * r['gift_count'] for r in affected)
+    diamond_diff = new_total - old_total
+
+    # Get affected session IDs
+    session_ids = [r['session_id'] for r in conn.execute(
+        'SELECT DISTINCT session_id FROM gift_logs WHERE gift_name = ? AND diamond_total != ? * gift_count',
+        (gift_name, new_price)
+    ).fetchall()]
+    affected_sessions = len(session_ids)
+
+    # Step B: Update gift_logs
+    conn.execute(
+        'UPDATE gift_logs SET diamond_total = ? * gift_count WHERE gift_name = ? AND diamond_total != ? * gift_count',
+        (new_price, gift_name, new_price)
+    )
+
+    # Step C: Recalculate contributions.consume for affected sessions
+    for sid in session_ids:
+        conn.execute('''
+            UPDATE contributions
+            SET consume = (
+                SELECT COALESCE(SUM(g.diamond_total), 0)
+                FROM gift_logs g
+                WHERE g.session_id = contributions.session_id
+                  AND g.user_id = contributions.user_id
+            )
+            WHERE session_id = ?
+        ''', (sid,))
+
+    # Step D: Recalculate daily_stats for affected users
+    affected_users = [r['user_id'] for r in conn.execute(
+        'SELECT DISTINCT user_id FROM gift_logs WHERE gift_name = ?', (gift_name,)
+    ).fetchall()]
+
+    for uid in affected_users:
+        conn.execute('''
+            UPDATE daily_stats
+            SET total_consume = (
+                SELECT COALESCE(SUM(g.diamond_total), 0)
+                FROM gift_logs g
+                WHERE g.user_id = daily_stats.user_id
+                  AND date(g.created_at) = daily_stats.date
+            )
+            WHERE user_id = ?
+        ''', (uid,))
+
+        conn.execute('''
+            UPDATE monthly_stats
+            SET total_consume = (
+                SELECT COALESCE(SUM(g.diamond_total), 0)
+                FROM gift_logs g
+                WHERE g.user_id = monthly_stats.user_id
+                  AND strftime('%Y-%m', g.created_at) = monthly_stats.year_month
+            )
+            WHERE user_id = ?
+        ''', (uid,))
+
+    # Step E: Log the change
+    conn.execute('''
+        INSERT INTO price_change_log (gift_name, old_price, new_price, affected_rows, affected_sessions, notes)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (gift_name, old_price, new_price, affected_rows, affected_sessions, notes or ''))
+
+    conn.commit()
+
+    logger.info(f"[礼物定价] 已重算 {gift_name}: {old_price}→{new_price}, "
+                f"影响 {affected_rows} 行, {affected_sessions} 场次, 差额 {diamond_diff:+d} 钻石")
+
+    return {
+        'affected_rows': affected_rows,
+        'affected_sessions': affected_sessions,
+        'diamond_diff': diamond_diff,
+    }
+
+
+def get_price_change_history(limit=50):
+    """Return recent price change log entries."""
+    conn = _get_conn()
+    rows = conn.execute('''
+        SELECT * FROM price_change_log
+        ORDER BY id DESC LIMIT ?
+    ''', (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def create_session(room_id, anchor_name=''):
     conn = _get_conn()
     # 结束同一房间下仍标记为"直播中"的旧场次，避免累积僵尸场次
