@@ -206,6 +206,50 @@ try:
 except Exception:
     pass  # 注册表加载失败不阻塞启动，静态覆盖表兜底
 
+# ── Gift Price Cache (DB-backed, with hardcoded fallback) ──
+_gift_price_cache = None
+_gift_price_cache_lock = threading.Lock()
+
+def _load_gift_price_cache():
+    """Load all gift prices from DB into a dict, then overlay hardcoded overrides.
+
+    Hardcoded _GIFT_PRICE_OVERRIDE always wins (emergency fix path).
+    """
+    global _gift_price_cache
+    cache = {}
+    try:
+        conn = _get_conn()
+        for row in conn.execute('SELECT gift_name, diamond_count FROM gift_prices'):
+            cache[row['gift_name']] = row['diamond_count']
+    except Exception:
+        pass  # DB not ready yet, use fallback only
+    # Hardcoded fallbacks (gift_id-based, when protobuf is null)
+    for fb in _GIFT_FALLBACK.values():
+        cache[fb['name']] = fb['diamond_count']
+    # Hardcoded overrides take highest precedence (safety net + emergency edits)
+    cache.update(_GIFT_PRICE_OVERRIDE)
+    _gift_price_cache = cache
+    logger.debug(f"[礼物定价] 已加载 {len(cache)} 条礼物价格 (DB + 覆盖)")
+
+def _lookup_gift_price(gift_name, protobuf_price):
+    """Look up a gift's diamond price.
+
+    Resolution order:
+        1. In-memory cache (loaded from DB + hardcoded overrides)
+        2. protobuf gift.diamond_count (fallback)
+
+    Returns (price, was_overridden) tuple.
+    """
+    global _gift_price_cache
+    if _gift_price_cache is None:
+        with _gift_price_cache_lock:
+            if _gift_price_cache is None:
+                _load_gift_price_cache()
+    cached = _gift_price_cache.get(gift_name)
+    if cached is not None and cached != protobuf_price:
+        return cached, True
+    return protobuf_price, False
+
 # ── 去重诊断计数器 ────────────────────────────────
 _dedup_diag = {
     'raw': 0, 'passed': 0, 'rejected': 0,
@@ -506,7 +550,10 @@ def parse_gift_msg(payload, enable_outputs=None):
     if composite_price > 0:
         unit_price = composite_price; display_name = composite_name or gift.name
     else:
-        unit_price = _GIFT_PRICE_OVERRIDE.get(gift.name, gift.diamond_count); display_name = gift.name
+        unit_price, was_overridden = _lookup_gift_price(gift.name, gift.diamond_count)
+        display_name = gift.name
+        if was_overridden:
+            logger.debug(f"[礼物-定价覆盖] {gift.name}: protobuf={gift.diamond_count} → DB={unit_price}")
 
     # ── 路径 A：连击礼物 → Combo 缓冲器 ──
     if is_combo:
