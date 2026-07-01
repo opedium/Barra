@@ -366,6 +366,9 @@ _gift_combo_buffer = {}
 _gift_combo_lock = threading.Lock()
 _gift_combo_timeout = 5.0
 _gift_finalize_callbacks = {}  # anchor_name → callable
+# 已 finalize 的 combo 组（防 WebSocket 乱序重入）
+_finalized_groups = {}        # key -> finalize_time
+_finalized_groups_max_age = 10  # 秒
 
 def set_gift_finalize_callback(anchor_name, cb):
     """按主播名注册礼物最终化回调，支持多房间共存。"""
@@ -380,6 +383,13 @@ def remove_gift_finalize_callback(anchor_name):
 def _combo_finalize(key):
     with _gift_combo_lock:
         buf = _gift_combo_buffer.pop(key, None)
+        if buf:
+            _finalized_groups[key] = time.time()
+        # 清理过期 finalized 条目
+        now = time.time()
+        stale = [k for k, t in list(_finalized_groups.items()) if now - t > _finalized_groups_max_age]
+        for k in stale:
+            del _finalized_groups[k]
     if not buf:
         return
     # passed 已在 parse_gift_msg 入口处计数，这里不再重复计
@@ -561,9 +571,15 @@ def parse_gift_msg(payload, enable_outputs=None):
         with _gift_combo_lock:
             entry = _gift_combo_buffer.get(key)
             if entry is None:
+                # 乱序保护：此 group 已被 finalize → 丢弃
+                ft = _finalized_groups.get(key, 0)
+                if ft and time.time() - ft < _finalized_groups_max_age:
+                    _dedup_diag['combo_block'] += 1
+                    _dedup_diag['rejected'] += 1
+                    return []
                 from base.utils import get_current_anchor
                 entry = {
-                    'cnt': rc, 'unit_price': unit_price, 'display_name': display_name,
+                    'cnt': msg.repeat_count or rc, 'unit_price': unit_price, 'display_name': display_name,
                     'user_name': user_display_name or str(uid), 'user_id': uid,
                     'douyin_id': douyin_id, 'grade': fmt_grade(user),
                     'fans_club': fmt_fans_club(user), 'sec_uid': get_user_sec_uid(user),
@@ -573,7 +589,7 @@ def parse_gift_msg(payload, enable_outputs=None):
                 }
                 _gift_combo_buffer[key] = entry
             else:
-                entry['cnt'] = max(entry['cnt'], rc)
+                entry['cnt'] = max(entry['cnt'], msg.repeat_count or rc)
                 entry['last_update'] = now
                 if msg.repeat_end: entry['repeat_end_seen'] = True
                 if entry.get('timer'):
