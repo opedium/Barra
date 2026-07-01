@@ -3505,7 +3505,6 @@ def query_user_retention(anchor='', period='30d', tier=0, page=1, size=20):
     # ── period → SQL snippet ──
     days_map = {'7d': 7, '30d': 30, '90d': 90}
     time_filter = ''
-    time_params = ()
     if period in days_map:
         time_filter = 'AND s.start_time >= datetime(\'now\', \'-%d days\', \'+8 hours\')' % days_map[period]
 
@@ -3587,31 +3586,25 @@ def query_user_retention(anchor='', period='30d', tier=0, page=1, size=20):
     # ── detail rows per anchor-date group ──
     details = conn.execute(f'''
         SELECT
-            date(s_min.start_time) as first_date,
-            s_min.anchor_name as anchor,
-            COUNT(DISTINCT f.user_id) as first_users,
-            COALESCE(SUM(CASE WHEN r2.retained THEN 1 ELSE 0 END), 0) as retained_2,
-            COALESCE(SUM(CASE WHEN r5.retained THEN 1 ELSE 0 END), 0) as retained_5,
-            COALESCE(SUM(f.total_consume), 0) as total_consume
+            date(s_first.start_time) as first_date,
+            s_first.anchor_name as anchor,
+            COUNT(*) as first_users,
+            SUM(CASE WHEN f.session_count >= 2 THEN 1 ELSE 0 END) as retained_2,
+            SUM(CASE WHEN f.session_count >= 5 THEN 1 ELSE 0 END) as retained_5,
+            SUM(f.total_consume) as total_consume
         FROM (
-            SELECT g.user_id, SUM(g.diamond_total) as total_consume,
-                   MIN(g.session_id) as fs_id
+            SELECT g.user_id,
+                   MIN(g.session_id) as fs_id,
+                   SUM(g.diamond_total) as total_consume,
+                   COUNT(DISTINCT g.session_id) as session_count
             FROM gift_logs g
             JOIN sessions s ON s.id = g.session_id
             WHERE 1=1 {anchor_filter} {time_filter}
             GROUP BY g.user_id
+            {tier_having}
         ) f
-        JOIN sessions s_min ON s_min.id = f.fs_id
-        LEFT JOIN (
-            SELECT g2.user_id, 1 as retained
-            FROM gift_logs g2
-            JOIN sessions s2 ON s2.id = g2.session_id
-            WHERE 1=1 {anchor_filter} {time_filter}
-            GROUP BY g2.user_id
-            HAVING MIN(s2.id) > f.fs_id
-        ) r2 ON r2.user_id = f.user_id
-        WHERE 1=1 {tier_having}
-        GROUP BY date(s_min.start_time), s_min.anchor_name
+        JOIN sessions s_first ON s_first.id = f.fs_id
+        GROUP BY date(s_first.start_time), s_first.anchor_name
         ORDER BY first_date DESC
         LIMIT ? OFFSET ?
     ''', anchor_params + (size, offset)).fetchall()
@@ -3679,7 +3672,6 @@ def query_big_spenders(min_consume=10000, trend='all', anchor='', page=1, size=5
         ORDER BY total_consume DESC
     ''', anchor_params + (min_consume,)).fetchall()
 
-    total = len(rows)
     users_list = []
     for i, r in enumerate(rows):
         uid = r['user_id']
