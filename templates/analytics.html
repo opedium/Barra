@@ -314,7 +314,6 @@ function renderRetentionStats(summary) {
         {label: '总活跃用户', num: summary.total_active_users.toLocaleString(), color: '#6366f1'},
         {label: '首场用户数', num: summary.first_session_users.toLocaleString(), color: '#06b6d4'},
         {label: '整体留存率 (第2场)', num: summary.overall_retention_rate + '%', color: '#10b981'},
-        {label: '高价值用户留存', num: summary.high_value_retention_rate + '%', color: '#f59e0b'},
     ];
     cards.forEach(function(c) {
         html += '<div class="stat-card" style="border-left-color:' + c.color + ';">'

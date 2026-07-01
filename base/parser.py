@@ -3523,6 +3523,7 @@ def query_user_retention(anchor='', period='30d', tier=0, page=1, size=20):
     # ── first session per user within target sessions ──
     first_sql = f'''
         SELECT g.user_id, MIN(sub.session_seq) as fs_seq,
+               MIN(g.session_id) as fs_id,
                SUM(g.diamond_total) as total_consume
         FROM gift_logs g
         JOIN ({session_sql}) sub ON sub.id = g.session_id
@@ -3530,9 +3531,17 @@ def query_user_retention(anchor='', period='30d', tier=0, page=1, size=20):
     '''
     tier_having = f'HAVING total_consume >= {int(tier)}' if tier > 0 else ''
 
-    # ── count first-session users (for pagination) ──
+    # ── count date-anchor groups (for pagination) ──
     total = conn.execute(f'''
-        SELECT COUNT(*) FROM ({first_sql}) f {tier_having}
+        SELECT COUNT(*) FROM (
+            SELECT date(s_first.start_time), s_first.anchor_name
+            FROM (
+                {first_sql}
+            ) f
+            JOIN sessions s_first ON s_first.id = f.fs_id
+            {tier_having}
+            GROUP BY date(s_first.start_time), s_first.anchor_name
+        )
     ''', anchor_params).fetchone()[0]
 
     # ── retention per session offset ──
@@ -3580,7 +3589,6 @@ def query_user_retention(anchor='', period='30d', tier=0, page=1, size=20):
             'total_active_users': rows['total_users'],
             'first_session_users': rows['total_users'],
             'overall_retention_rate': round(rows['retain_1_rate'] or 0, 1),
-            'high_value_retention_rate': round(rows['retain_1_rate'] or 0, 1),
         }
 
     # ── detail rows per anchor-date group ──

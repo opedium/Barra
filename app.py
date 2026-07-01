@@ -1887,7 +1887,7 @@ def api_user_timeline_csv(user_id):
 @app.route('/analytics')
 @require_auth
 def analytics():
-    return render_template('analytics.html')
+    return render_template('analytics.html', auth_enabled=bool(_web_config['password']))
 
 
 @app.route('/api/analytics/retention')
