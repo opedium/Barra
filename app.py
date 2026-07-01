@@ -34,6 +34,7 @@ from base.parser import (
     end_session as db_end_session, delete_session as db_delete_session,
     set_sse_callback,
     init_gift_prices_table, recalculate_gift_price, get_price_change_history,
+    query_user_retention, query_big_spenders, query_silent_whales,
 )
 from service.fetcher import DouyinBarrage
 from service.network import fetch_user_info_by_sec_uid, fetch_user_info_by_user_id, fetch_user_info
@@ -1877,6 +1878,59 @@ def api_user_timeline_csv(user_id):
     return _make_csv_response(timeline,
         ['time', 'type', 'anchor_name', 'content', 'amount', 'grade', '用户链接'],
         f'user_{user_id}_timeline.csv')
+
+
+# ═══════════════════════════════════════════════════════════════
+#  User Behavior Analytics
+# ═══════════════════════════════════════════════════════════════
+
+@app.route('/analytics')
+@require_auth
+def analytics():
+    return render_template('analytics.html')
+
+
+@app.route('/api/analytics/retention')
+@require_auth
+def api_analytics_retention():
+    anchor = request.args.get('anchor', '')
+    period = request.args.get('period', '30d')
+    tier = request.args.get('tier', 0, type=int)
+    page = request.args.get('page', 1, type=int)
+    size = request.args.get('size', 20, type=int)
+    try:
+        data = query_user_retention(anchor, period, tier, page, size)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/analytics/big-spenders')
+@require_auth
+def api_analytics_big_spenders():
+    min_consume = request.args.get('min_consume', 10000, type=int)
+    trend = request.args.get('trend', 'all')
+    anchor = request.args.get('anchor', '')
+    page = request.args.get('page', 1, type=int)
+    size = request.args.get('size', 50, type=int)
+    try:
+        data = query_big_spenders(min_consume, trend, anchor, page, size)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/analytics/silent-whales')
+@require_auth
+def api_analytics_silent_whales():
+    threshold = request.args.get('threshold', 30000, type=int)
+    silent_days = request.args.get('silent_days', 7, type=int)
+    anchor = request.args.get('anchor', '')
+    try:
+        data = query_silent_whales(threshold, silent_days, anchor)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 def main():

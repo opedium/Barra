@@ -202,7 +202,8 @@ class DouyinBarrage:
         # â”€â”€ åŒ¿åç”¨æˆ·è§£æžè·Ÿè¸ªï¼ˆé¿å…é‡å¤ API è°ƒç”¨ï¼‰â”€â”€
         self._resolving_anon = set()
         self._last_anon_resolve = 0
-        self._subscribe_dedup = {}  # sub_key -> timestampï¼Œè®¢é˜…æ¶ˆæ¯ 30s çª—å£åŽ»é‡
+        self._subscribe_dedup = {}
+        self._backfilled_users = set()  # (session_id, user_name) -> å·²å›žå¡« uidï¼Œé¿å…é‡å¤ API è°ƒç”¨
 
         # â”€â”€ ç»Ÿè®¡å®šæ—¶æ‰“å° â”€â”€
         self._stats_interval = self.config.get('stats_interval', 60)

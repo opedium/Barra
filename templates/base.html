@@ -962,6 +962,7 @@
             <a href="/compare" class="{% if request.path == '/compare' %}active{% endif %}">对比</a>
             <a href="/upgrades" class="{% if request.path == '/upgrades' %}active{% endif %}">升级</a>
             <a href="/audit" class="{% if request.path == '/audit' or request.path.startswith('/audit/') %}active{% endif %}">审计</a>
+            <a href="/analytics" class="{% if request.path == '/analytics' %}active{% endif %}">用户分析</a>
             <a href="/gift-prices" class="{% if request.path == '/gift-prices' %}active{% endif %}">礼物价格</a>
             <a href="/settings" class="{% if request.path == '/settings' %}active{% endif %}">设置</a>
             {% if auth_enabled %}<a href="/logout" style="color:#f87171;">&#10149; 登出</a>{% endif %}
