@@ -53,6 +53,17 @@
     transition: transform var(--transition-fast);
 }
 .silent-whale-card:hover { transform: translateX(4px); }
+
+/* Filter bar helpers (shared with leaderboard) */
+.filter-divider {
+    display: inline-block; width: 1px; height: 22px;
+    background: var(--border); flex-shrink: 0;
+}
+.threshold-label {
+    font-size: 12px; color: var(--text-muted);
+    font-weight: 500; white-space: nowrap;
+}
+
 .silent-whale-card .sw-avatar {
     width: 36px; height: 36px; border-radius: 50%;
     background: var(--danger);
