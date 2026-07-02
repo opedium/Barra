@@ -337,12 +337,12 @@ def _compute_gift_count(group_id, gift_id, user_id, repeat_count, repeat_end=0):
         return delta, reject_reason
 
 
-def _prune_dedup_state(max_age=600):
+def _prune_dedup_state(max_age=300):
     """清理超过 max_age 秒未更新的去重状态。
 
     上游 C# 版本（DouyinBarrageGrab）使用 10 秒超时。
-    我们使用 30 秒作为平衡——足够覆盖连击间隔，又不会让
-    过期条目长时间滞留导致 delta_zero / out_of_order 误杀。
+    我们使用 300 秒作为平衡——足够覆盖连击间隔，又不会让
+    过期条目长时间滞留导致内存膨胀。
     """
     now = time.time()
     with _dedup_lock:
@@ -1922,11 +1922,13 @@ def _get_conn():
         _local.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         with _conn_lock:
             _conn_registry.add(_local.conn)
+            if len(_conn_registry) > 8:
+                print(f"[DB] 警告: 连接数过多 ({len(_conn_registry)})，建议检查线程泄漏")
         _local.conn.execute('PRAGMA journal_mode=WAL')
         _local.conn.execute('PRAGMA synchronous=NORMAL')
         _local.conn.execute('PRAGMA busy_timeout=30000')
-        _local.conn.execute('PRAGMA cache_size=-16000')
-        _local.conn.execute('PRAGMA mmap_size=268435456')
+        _local.conn.execute('PRAGMA cache_size=-4000')
+        _local.conn.execute('PRAGMA mmap_size=0')
         _local.conn.execute('PRAGMA temp_store=MEMORY')
         _local.conn.execute('PRAGMA foreign_keys=ON')
         _local.conn.row_factory = sqlite3.Row
