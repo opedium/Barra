@@ -1494,7 +1494,21 @@ class DouyinBarrage:
                                                 final_avatar = found['avatar_url'] or ''
                                                 logger.info(f"[订阅] 用户名 '{sub_uname}' -> user_id={final_uid}")
                                             else:
-                                                logger.info(f"[订阅] 用户名 '{sub_uname}' 未在 DB 中找到，留空 uid 等待补填")
+                                                # 用户可能还未建立 DB 记录，尝试从 gift_logs/chat_logs 反向找
+                                                found = _get_conn().execute(
+                                                    'SELECT user_id FROM gift_logs WHERE user_name = ? AND session_id = ? LIMIT 1',
+                                                    (sub_uname, self._session_id)
+                                                ).fetchone()
+                                                if not found:
+                                                    found = _get_conn().execute(
+                                                        'SELECT user_id FROM chat_logs WHERE user_name = ? AND session_id = ? LIMIT 1',
+                                                        (sub_uname, self._session_id)
+                                                    ).fetchone()
+                                                if found:
+                                                    final_uid = found['user_id']
+                                                    logger.info(f"[订阅] 从会话日志反查 '{sub_uname}' -> user_id={final_uid}")
+                                                else:
+                                                    logger.info(f"[订阅] 用户名 '{sub_uname}' 未在 DB 中找到，留空 uid 等待补填")
                                         except Exception as e:
                                             logger.debug(f"[订阅] DB 查询失败: {e}")
                                     if final_uid:
