@@ -204,6 +204,8 @@ class DouyinBarrage:
         self._last_anon_resolve = 0
         self._subscribe_dedup = {}
         self._backfilled_users = set()  # (session_id, user_name) -> å·²å›žå¡« uidï¼Œé¿å…é‡å¤ API è°ƒç”¨
+        self._sub_seen = 0
+        self._sub_deduped = 0
 
         # â”€â”€ ç»Ÿè®¡å®šæ—¶æ‰“å° â”€â”€
         self._stats_interval = self.config.get('stats_interval', 60)
@@ -1354,6 +1356,7 @@ class DouyinBarrage:
                                 uclub = rec_data.get('fans_club', '')
                                 usec_uid = rec_data.get('sec_uid', '')
                                 uavatar = rec_data.get('avatar_url', '')
+                                udisplay_id = rec_data.get('display_id', '')
                                 # åªè¦æœ‰ç”¨æˆ·ä¿¡æ¯å°±æ›´æ–° users è¡¨ï¼ˆè®°å½•è´¢å¯Œç­‰çº§ã€ç²‰ä¸å›¢ã€sec_uidã€å¤´åƒï¼‰
                                 if uid:
                                     # 升级检测前从 DB 读取旧值（upsert_user 会覆盖为新值）
@@ -1371,7 +1374,7 @@ class DouyinBarrage:
                                     except Exception:
                                         _old_lv_saved = 0
                                         _old_fc_saved = 0
-                                    upsert_user(uid, uname, ugrade, uclub, usec_uid, uavatar)
+                                    upsert_user(uid, uname, ugrade, uclub, usec_uid, uavatar, udisplay_id)
                                     if uid:
                                         self._fill_subscription_uid(uname, uid)
                                     # åŒ¿åç”¨æˆ·ï¼ˆç¥žç§˜äºº/douå‰ç¼€ï¼‰è‡ªåŠ¨è§£æžçœŸå®žæ˜µç§°
@@ -1475,11 +1478,11 @@ class DouyinBarrage:
                                     stale = [k for k, t in list(self._subscribe_dedup.items()) if now_ts - t > 180]
                                     for k in stale:
                                         del self._subscribe_dedup[k]
-                                    final_uid = uid
-                                    final_grade = ugrade
-                                    final_club = uclub
-                                    final_sec_uid = usec_uid
-                                    final_avatar = uavatar
+                                    final_uid = ""
+                                    final_grade = ""
+                                    final_club = ""
+                                    final_sec_uid = ""
+                                    final_avatar = ""
                                     if not final_uid:
                                         try:
                                             found = _get_conn().execute(
@@ -1512,12 +1515,13 @@ class DouyinBarrage:
                                         except Exception as e:
                                             logger.debug(f"[订阅] DB 查询失败: {e}")
                                     if final_uid:
-                                        upsert_user(final_uid, sub_uname, final_grade, final_club, final_sec_uid, final_avatar)
-                                        record_gift(self._session_id, final_uid, sub_uname, sub_name or '订阅',
-                                                    1, rec_data.get('diamond', 0), final_grade, final_club)
+                                        upsert_user(final_uid, sub_uname, final_grade, final_club, final_sec_uid, final_avatar, udisplay_id)
+                                    record_gift(self._session_id, final_uid or '', sub_uname, sub_name or '订阅',
+                                                1, rec_data.get('diamond', 0), final_grade, final_club)
+                                    if final_uid:
                                         logger.info(f"[订阅] {sub_uname} {sub_name} ({rec_data.get('diamond',0)}钻石) uid={final_uid}")
                                     else:
-                                        logger.info(f"[订阅] {sub_uname} {sub_name} ({rec_data.get('diamond',0)}钻石) uid=待定（等待补填）")
+                                        logger.info(f"[订阅] {sub_uname} {sub_name} ({rec_data.get('diamond',0)}钻石) uid=待定（后续自动补填）")
                             except Exception as e:
                                 logger.error(f"[DB] SQLite write failed in _process_item: {e} | type={rec_type} user={uid}")
 

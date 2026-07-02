@@ -86,13 +86,24 @@
             {% endif %}
         </div>
         <div class="stats-row" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));">
-            <div class="stat-card"><div class="num">{{ data.dedup.raw }}</div><div class="label">原始消息</div></div>
-            <div class="stat-card"><div class="num">{{ data.dedup.passed }}</div><div class="label">已通过</div></div>
-            <div class="stat-card" style="{% if data.dedup.rejected > 0 %}border-color:#ef4444;{% endif %}"><div class="num" style="{% if data.dedup.rejected > 0 %}color:#ef4444;{% endif %}">{{ data.dedup.rejected }}</div><div class="label">已拒绝</div></div>
-            <div class="stat-card" style="{% if data.dedup.delta_zero > 100 %}border-color:#f59e0b;{% endif %}"><div class="num">{{ data.dedup.delta_zero }}</div><div class="label">增量零</div></div>
-            <div class="stat-card" style="{% if data.dedup.out_of_order > 10 %}border-color:#ef4444;{% endif %}"><div class="num" style="{% if data.dedup.out_of_order > 10 %}color:#ef4444;{% endif %}">{{ data.dedup.out_of_order }}</div><div class="label">乱序</div></div>
-            <div class="stat-card" style="{% if data.dedup.combo_block > 10 %}border-color:#f59e0b;{% endif %}"><div class="num">{{ data.dedup.combo_block }}</div><div class="label">Combo封锁</div></div>
-            <div class="stat-card"><div class="num">{{ data.dedup.rc1_dup }}</div><div class="label">单次去重</div></div>
+            <div class="stat-card" title="去重系统收到的礼物消息总数（包括连击的每条进度消息）"><div class="num">{{ data.dedup.raw }}</div><div class="label">原始消息</div></div>
+            <div class="stat-card" title="被认为是有效增量、已记录到数据库的消息数"><div class="num">{{ data.dedup.passed }}</div><div class="label">已通过</div></div>
+            <div class="stat-card" style="{% if data.dedup.rejected > 0 %}border-color:#ef4444;{% endif %}" title="因重复被丢弃的消息数。少量（&lt;3%）正常，过高说明去重过于激进或有大量 WS 重放"><div class="num" style="{% if data.dedup.rejected > 0 %}color:#ef4444;{% endif %}">{{ data.dedup.rejected }}</div><div class="label">已拒绝</div></div>
+            <div class="stat-card" style="{% if data.dedup.delta_zero > 100 %}border-color:#f59e0b;{% endif %}" title="连击礼物中增量 Δ=0 的重复消息。同组连击计数未增加则判定为重复。少量正常，过高说明 combo buffer 未覆盖到"><div class="num">{{ data.dedup.delta_zero }}</div><div class="label">增量零</div></div>
+            <div class="stat-card" style="{% if data.dedup.out_of_order > 10 %}border-color:#ef4444;{% endif %}" title="连击消息到达顺序错乱（如 rc=3 比 rc=2 先到）。少量正常，过多说明 WebSocket 存在严重乱序"><div class="num" style="{% if data.dedup.out_of_order > 10 %}color:#ef4444;{% endif %}">{{ data.dedup.out_of_order }}</div><div class="label">乱序</div></div>
+            <div class="stat-card" style="{% if data.dedup.combo_block > 10 %}border-color:#f59e0b;{% endif %}" title="连击已结束后又来同组消息，被封锁防止重复计数。少量说明 combo buffer 正常生效"><div class="num">{{ data.dedup.combo_block }}</div><div class="label">Combo封锁</div></div>
+            <div class="stat-card" title="单次送礼（rc=1）通过 500ms trace_id 窗口去重拦截的重复消息"><div class="num">{{ data.dedup.rc1_dup }}</div><div class="label">单次去重</div></div>
+        </div>
+    </div>
+
+    <!-- 2b. Message Flow -->
+    <div class="audit-section">
+        <h3>📨 消息流追踪</h3>
+        <div style="font-family:monospace;font-size:13px;color:var(--text-dim);">
+            入队[C:{{ data.flow.chat_enqueued }} G:{{ data.flow.gift_enqueued }}]
+            落库[C:{{ data.flow.chat_written }} G:{{ data.flow.gift_written }}]
+            连击进度:{{ data.flow.combo_progress }}
+            缓冲中:{{ data.flow.combo_buf }}
         </div>
     </div>
 

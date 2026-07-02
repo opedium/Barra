@@ -251,6 +251,7 @@ def _lookup_gift_price(gift_name, protobuf_price):
     return protobuf_price, False
 
 # ── 去重诊断计数器 ────────────────────────────────
+_reject_log_count = 0  # 被拒礼物日志计数器，模块级
 _dedup_diag = {
     'raw': 0, 'passed': 0, 'rejected': 0,
     'repeat_zero': 0, 'combo_block': 0,
@@ -367,8 +368,8 @@ _gift_combo_lock = threading.Lock()
 _gift_combo_timeout = 5.0
 _gift_finalize_callbacks = {}  # anchor_name → callable
 # 已 finalize 的 combo 组（防 WebSocket 乱序重入）
-_finalized_groups = {}        # key -> finalize_time
-_finalized_groups_max_age = 10  # 秒
+_finalized_groups = {}        # key -> (finalize_time, final_count)
+_finalized_groups_max_age = 10  # 秒，超时后允许重新开始同 key 的 combo
 
 def set_gift_finalize_callback(anchor_name, cb):
     """按主播名注册礼物最终化回调，支持多房间共存。"""
@@ -384,10 +385,10 @@ def _combo_finalize(key):
     with _gift_combo_lock:
         buf = _gift_combo_buffer.pop(key, None)
         if buf:
-            _finalized_groups[key] = time.time()
+            _finalized_groups[key] = (time.time(), buf['cnt'])
         # 清理过期 finalized 条目
         now = time.time()
-        stale = [k for k, t in list(_finalized_groups.items()) if now - t > _finalized_groups_max_age]
+        stale = [k for k, (ft, _) in list(_finalized_groups.items()) if now - ft > _finalized_groups_max_age]
         for k in stale:
             del _finalized_groups[k]
     if not buf:
@@ -466,6 +467,7 @@ def parse_chat_msg(payload, enable_outputs=None):
         'time': time.strftime('%H:%M:%S'),
         'user_id': uid,
         'douyin_id': user.display_id,
+        'display_id': user.display_id,
         'user_name': uname,
         'gender': {1: "男", 2: "女"}.get(user.gender, "未知"),
         'grade': fmt_grade(user),
@@ -566,28 +568,31 @@ def parse_gift_msg(payload, enable_outputs=None):
             logger.debug(f"[礼物-定价覆盖] {gift.name}: protobuf={gift.diamond_count} → DB={unit_price}")
 
     # ── 路径 A：连击礼物 → Combo 缓冲器 ──
+    _combo_downgraded = False
+    _combo_finalized_count = 0
     if is_combo:
         key = (gid, str(gft_id), uid)
         with _gift_combo_lock:
             entry = _gift_combo_buffer.get(key)
             if entry is None:
-                # 乱序保护：此 group 已被 finalize → 丢弃
+                # 乱序保护：此 group 已被 finalize → 降级为非连击路径
                 ft = _finalized_groups.get(key, 0)
-                if ft and time.time() - ft < _finalized_groups_max_age:
+                if ft and time.time() - ft[0] < _finalized_groups_max_age:
                     _dedup_diag['combo_block'] += 1
-                    _dedup_diag['rejected'] += 1
-                    return []
-                from base.utils import get_current_anchor
-                entry = {
-                    'cnt': msg.repeat_count or rc, 'unit_price': unit_price, 'display_name': display_name,
-                    'user_name': user_display_name or str(uid), 'user_id': uid,
-                    'douyin_id': douyin_id, 'grade': fmt_grade(user),
-                    'fans_club': fmt_fans_club(user), 'sec_uid': get_user_sec_uid(user),
-                    'avatar_url': get_user_avatar_url(user), 'group_id': gid,
-                    'timer': None, 'repeat_end_seen': bool(msg.repeat_end or 0), 'last_update': now,
-                    'anchor_name': get_current_anchor() or '',
-                }
-                _gift_combo_buffer[key] = entry
+                    _combo_downgraded = True
+                    _combo_finalized_count = ft[1]
+                else:
+                    from base.utils import get_current_anchor
+                    entry = {
+                        'cnt': msg.repeat_count or rc, 'unit_price': unit_price, 'display_name': display_name,
+                        'user_name': user_display_name or str(uid), 'user_id': uid,
+                        'douyin_id': douyin_id, 'grade': fmt_grade(user),
+                        'fans_club': fmt_fans_club(user), 'sec_uid': get_user_sec_uid(user),
+                        'avatar_url': get_user_avatar_url(user), 'group_id': gid,
+                        'timer': None, 'repeat_end_seen': bool(msg.repeat_end or 0), 'last_update': now,
+                        'anchor_name': get_current_anchor() or '',
+                    }
+                    _gift_combo_buffer[key] = entry
             else:
                 entry['cnt'] = max(entry['cnt'], msg.repeat_count or rc)
                 entry['last_update'] = now
@@ -596,28 +601,32 @@ def parse_gift_msg(payload, enable_outputs=None):
                     try: entry['timer'].cancel()
                     except: pass
                     entry['timer'] = None
+        if _combo_downgraded:
+            # 恢复 _gift_dedup 状态，让 delta 法算出差值
+            with _dedup_lock:
+                _gift_dedup[key] = (_combo_finalized_count, time.time(), True)
+        elif entry:
             should_finalize = entry['repeat_end_seen']
             cnt_final = entry['cnt']
             price = entry['unit_price']
             uname = entry['user_name']
-        # 在锁外调用 _combo_finalize，避免死锁
-        if should_finalize:
-            _combo_finalize(key)
-            _dedup_diag['passed'] += 1  # 最终化也计数
-            total_value = price * cnt_final
-            diamond_info = f" ({total_value}钻石)" if total_value > 0 else ""
-            return [{'type': 'gift', 'msg': f"[礼物] {uname}[{uid}] 礼物:{display_name} x{cnt_final}{diamond_info}", 'data': {'_combo_progress': True}}]
-        else:
-            global _combo_progress_count; _combo_progress_count += 1
-            _dedup_diag['passed'] += 1
-            def _on_timeout(k=key): return _combo_finalize(k)
-            timer = threading.Timer(_gift_combo_timeout, _on_timeout); timer.daemon = True; timer.start()
-            with _gift_combo_lock:
-                if key in _gift_combo_buffer:
-                    _gift_combo_buffer[key]['timer'] = timer
-            total_value = price * cnt_final
-            diamond_info = f" ({total_value}钻石)" if total_value > 0 else ""
-            return [{'type': 'gift', 'msg': f"[礼物] {uname}[{uid}] 礼物:{display_name} x{cnt_final}", 'data': {'_combo_progress': True}}]
+            if should_finalize:
+                _combo_finalize(key)
+                _dedup_diag['passed'] += 1
+                total_value = price * cnt_final
+                diamond_info = f" ({total_value}钻石)" if total_value > 0 else ""
+                return [{'type': 'gift', 'msg': f"[礼物] {uname}[{uid}] 礼物:{display_name} x{cnt_final}{diamond_info}", 'data': {'_combo_progress': True}}]
+            else:
+                global _combo_progress_count; _combo_progress_count += 1
+                _dedup_diag['passed'] += 1
+                def _on_timeout(k=key): return _combo_finalize(k)
+                timer = threading.Timer(_gift_combo_timeout, _on_timeout); timer.daemon = True; timer.start()
+                with _gift_combo_lock:
+                    if key in _gift_combo_buffer:
+                        _gift_combo_buffer[key]['timer'] = timer
+                total_value = price * cnt_final
+                diamond_info = f" ({total_value}钻石)" if total_value > 0 else ""
+                return [{'type': 'gift', 'msg': f"[礼物] {uname}[{uid}] 礼物:{display_name} x{cnt_final}", 'data': {'_combo_progress': True}}]
 
     # ── 路径 B：非连击礼物 → 即时写入（trace_id 去重）──
     if rc == 1:
@@ -640,7 +649,11 @@ def parse_gift_msg(payload, enable_outputs=None):
     if rc > 0 and (rc % 100) == 0:
         _prune_dedup_state()
     if cnt <= 0:
-        _dedup_diag['rejected'] += 1; return []
+        _dedup_diag['rejected'] += 1
+        global _reject_log_count; _reject_log_count += 1
+        if _reject_log_count <= 100 or _reject_log_count % 1000 == 0:
+            logger.info(f"[礼物-拒绝] #{_reject_log_count} uid={uid} user={user_display_name} gift={gift.name} rc={rc} reason={reason}")
+        return []
     _dedup_diag['passed'] += 1
 
     if _sse_callback and uid:
@@ -652,7 +665,7 @@ def parse_gift_msg(payload, enable_outputs=None):
         'type': 'gift',
         'msg': f"[礼物] {user_display_name}[{uid}] 礼物:{display_name} x{cnt}{diamond_info}",
         'data': {
-            'time': time.strftime('%H:%M:%S'), 'user_id': uid, 'douyin_id': douyin_id,
+            'time': time.strftime('%H:%M:%S'), 'user_id': uid, 'douyin_id': douyin_id, 'display_id': douyin_id,
             'user_name': user_display_name, 'gender': {1: "男", 2: "女"}.get(user.gender, "未知"),
             'gift_name': display_name, 'gift_count': cnt, 'diamond_total': total_value,
             'grade': fmt_grade(user), 'fans_club': fmt_fans_club(user),
@@ -1215,7 +1228,7 @@ def parse_room_msg(payload, enable_outputs=None):
         price = _SUBSCRIBE_PRICES.get((event, action, sub_type), 0)
 
         # 从 RoomMessage.common.user 获取真实用户信息（比字节扫描更可靠）
-        real_uid = ''; real_sec_uid = ''; real_avatar = ''; real_grade = ''; real_fans_club = ''
+        real_uid = ''; real_sec_uid = ''; real_avatar = ''; real_grade = ''; real_fans_club = ''; real_display_id = ''
         try:
             room_msg = parse_proto(RoomMessage, payload)
             # 调试：看 common.user 到底有没有
@@ -1228,6 +1241,7 @@ def parse_room_msg(payload, enable_outputs=None):
                 user_id_from_proto = str(get_user_id(u) or '')
                 user_name_from_proto = get_user_name(u) or ''
                 uid = get_user_id(u)
+                real_display_id = getattr(u, 'display_id', '') or ''
                 if uid:
                     real_uid = uid
                     douyin_id = real_uid
@@ -1263,6 +1277,7 @@ def parse_room_msg(payload, enable_outputs=None):
                 'time': time.strftime('%H:%M:%S'),
                 'user_name': user,
                 'douyin_id': douyin_id,
+                'display_id': real_display_id,
                 'user_id': real_uid,
                 'sec_uid': real_sec_uid,
                 'avatar_url': real_avatar,
@@ -1834,14 +1849,15 @@ HANDLERS = {
 DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
 DB_PATH = os.path.join(DB_DIR, 'douyin_barrage.db')
 _local = threading.local()
-_conn_registry = set()  # 跟踪所有 SQLite 连接，退出时关闭
+# 连接注册表: {id(conn): conn}，进程退出时统一关闭（threading.local 在线程退出时自动清理）
+_conn_registry = {}
 _conn_lock = threading.Lock()
 
 
 def _close_all_connections():
     """进程退出时关闭所有 SQLite 连接，防止 fd 泄漏。"""
     with _conn_lock:
-        for c in list(_conn_registry):
+        for c in list(_conn_registry.values()):
             try:
                 c.close()
             except Exception:
@@ -1893,6 +1909,11 @@ try:
         _migrate_conn.commit()
     except sqlite3.OperationalError:
         pass
+    try:
+        _migrate_conn.execute('ALTER TABLE users ADD COLUMN display_id TEXT DEFAULT ""')
+        _migrate_conn.commit()
+    except sqlite3.OperationalError:
+        pass
     # 升级礼物去重索引：同一秒内同用户同礼物去重，不同秒的保留（防止 websocket 重放但不误伤连刷）
     try:
         _migrate_conn.execute('DROP INDEX IF EXISTS idx_gift_dedup')
@@ -1921,9 +1942,7 @@ def _get_conn():
         os.makedirs(DB_DIR, exist_ok=True)
         _local.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         with _conn_lock:
-            _conn_registry.add(_local.conn)
-            if len(_conn_registry) > 8:
-                print(f"[DB] 警告: 连接数过多 ({len(_conn_registry)})，建议检查线程泄漏")
+            _conn_registry[id(_local.conn)] = _local.conn
         _local.conn.execute('PRAGMA journal_mode=WAL')
         _local.conn.execute('PRAGMA synchronous=NORMAL')
         _local.conn.execute('PRAGMA busy_timeout=30000')
@@ -2413,12 +2432,12 @@ def _merge_fans_club_strings(existing, new_val):
     return ' '.join(f'[粉丝团:{n} Lv{merged[n]}]' for n in sorted_names)
 
 
-def upsert_user(user_id, user_name, grade='', fans_club='', sec_uid='', avatar_url=''):
-    """更新或插入用户信息（财富等级、粉丝团、sec_uid、头像URL等）。通过写者队列串行化。"""
+def upsert_user(user_id, user_name, grade='', fans_club='', sec_uid='', avatar_url='', display_id=''):
+    """更新或插入用户信息（财富等级、粉丝团、sec_uid、头像URL、display_id等）。通过写者队列串行化。"""
     if not user_id:
         return
     try:
-        _write_queue.put_nowait(('upsert', user_id, user_name, grade, fans_club, sec_uid, avatar_url))
+        _write_queue.put_nowait(('upsert', user_id, user_name, grade, fans_club, sec_uid, avatar_url, display_id))
     except queue.Full:
         logger.warning(f"[DB] upsert queue full: uid={user_id}")
 
@@ -2580,7 +2599,8 @@ def _flush_write_batch(conn, batch):
                                      (sid, uid, uname, gname, cnt, dia, grade, club))
                 _gift_written[sid] = _gift_written.get(sid, 0) + r.rowcount
             elif op == 'upsert':
-                _, uid, uname, grade, club, sec, av = item
+                did = item[7] if len(item) >= 8 else ''
+                _, uid, uname, grade, club, sec, av = item[:7]
                 is_anon, anon_label = _detect_anonymous(uname)
                 # 合并粉丝团（保留最高等级）
                 if club:
@@ -2588,19 +2608,21 @@ def _flush_write_batch(conn, batch):
                     if existing and existing['fans_club']:
                         club = _merge_fans_club_strings(existing['fans_club'], club)
                 conn.execute('''
-                    INSERT INTO users (user_id, user_name, grade, fans_club, sec_uid, avatar_url, is_anonymous, anonymous_label, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime("now", "+8 hours"))
+                    INSERT INTO users (user_id, user_name, grade, fans_club, sec_uid, avatar_url, display_id, is_anonymous, anonymous_label, last_seen)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime("now", "+8 hours"))
                     ON CONFLICT(user_id) DO UPDATE SET
                         user_name = CASE WHEN ? != '' THEN ? ELSE user_name END,
                         grade = CASE WHEN ? != '' THEN ? ELSE grade END,
                         fans_club = CASE WHEN ? != '' THEN ? ELSE fans_club END,
                         sec_uid = CASE WHEN ? != '' THEN ? ELSE sec_uid END,
                         avatar_url = CASE WHEN ? != '' THEN ? ELSE avatar_url END,
+                        display_id = CASE WHEN ? != '' THEN ? ELSE display_id END,
                         is_anonymous = CASE WHEN ? = 1 THEN 1 ELSE is_anonymous END,
                         anonymous_label = CASE WHEN ? != '' THEN ? ELSE anonymous_label END,
                         last_seen = datetime("now", "+8 hours")
-                ''', (uid, uname, grade, club, sec, av, is_anon, anon_label,
+                ''', (uid, uname, grade, club, sec, av, did, is_anon, anon_label,
                       uname, uname, grade, grade, club, club, sec, sec, av, av,
+                      did, did,
                       is_anon, anon_label, anon_label))
             elif op == 'backfill_uid':
                 _, sid, uname, ruid = item
@@ -2609,6 +2631,7 @@ def _flush_write_batch(conn, batch):
                     (ruid, sid, uname)
                 )
                 if r.rowcount:
+                    logger.info(f"[DB] 补填 uid: user_name={uname} uid={ruid} sid={sid} 影响{r.rowcount}行")
                     logger.info(f"[DB] 补填 {r.rowcount} 条订阅记录: {uname} -> {ruid}")
         except Exception as e:
             logger.warning(f"[DB] writer batch op failed: {op} {e}")
@@ -3374,6 +3397,11 @@ def query_audit():
     dd = get_dedup_stats()
     dd['reject_rate'] = round(dd['rejected'] / dd['raw'] * 100, 2) if dd['raw'] else 0
     result['dedup'] = dd
+
+    # ── 2b. 消息流计数器 ──
+    flow = get_flow_counters()
+    flow['combo_buf'] = get_combo_buffer_size()
+    result['flow'] = flow
 
     # ── 3. 时间间隙检测（最近 10 场） ──
     recent = conn.execute(

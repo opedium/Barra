@@ -35,6 +35,7 @@ from base.parser import (
     set_sse_callback,
     init_gift_prices_table, recalculate_gift_price, get_price_change_history,
     query_user_retention, query_big_spenders, query_silent_whales,
+    get_flow_counters, get_combo_buffer_size,
 )
 from service.fetcher import DouyinBarrage
 from service.network import fetch_user_info_by_sec_uid, fetch_user_info_by_user_id, fetch_user_info
@@ -675,6 +676,8 @@ def index():
         if anchor_row and anchor_row['avatar_url']:
             anchor_avatar = anchor_row['avatar_url']
 
+    flow = get_flow_counters()
+    flow['combo_buf'] = get_combo_buffer_size()
     return render_template('index.html',
         session=dict(live) if live else None,
         anchor_avatar=anchor_avatar,
@@ -683,6 +686,7 @@ def index():
         sessions=[dict(r) for r in recent],
         recent_chats=[dict(r) for r in recent_chats],
         top_users=top_users,
+        flow=flow,
         db_path=DB_PATH,
         auto_refresh=_web_config['auto_refresh'],
         auth_enabled=bool(_web_config['password']))

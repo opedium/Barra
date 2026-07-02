@@ -352,6 +352,16 @@
     </div>
 </div>
 
+<!-- Message Flow -->
+<div class="card" style="padding:8px 16px;margin-bottom:12px;">
+    <div style="font-family:monospace;font-size:13px;color:var(--text-dim);">
+        入队[C:{{ flow.chat_enqueued }} G:{{ flow.gift_enqueued }}]
+        落库[C:{{ flow.chat_written }} G:{{ flow.gift_written }}]
+        连击进度:{{ flow.combo_progress }}
+        缓冲中:{{ flow.combo_buf }}
+    </div>
+</div>
+
 <!-- Session Selector -->
 {% if live_sessions and live_sessions|length > 1 %}
 <div class="card" style="padding:8px 16px;margin-bottom:8px;display:flex;align-items:center;gap:10px;">
