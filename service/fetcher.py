@@ -1475,27 +1475,28 @@ class DouyinBarrage:
                                     stale = [k for k, t in list(self._subscribe_dedup.items()) if now_ts - t > 180]
                                     for k in stale:
                                         del self._subscribe_dedup[k]
-                                    final_uid = ''
-                                    final_grade = ''
-                                    final_club = ''
-                                    final_sec_uid = ''
-                                    final_avatar = ''
-                                    try:
-                                        found = _get_conn().execute(
-                                            'SELECT user_id, grade, fans_club, sec_uid, avatar_url FROM users WHERE user_name = ? LIMIT 1',
-                                            (sub_uname,)
-                                        ).fetchone()
-                                        if found:
-                                            final_uid = found['user_id']
-                                            final_grade = found['grade'] or ''
-                                            final_club = found['fans_club'] or ''
-                                            final_sec_uid = found['sec_uid'] or ''
-                                            final_avatar = found['avatar_url'] or ''
-                                            logger.info(f"[订阅] 用户名 '{sub_uname}' -> user_id={final_uid}")
-                                        else:
-                                            logger.info(f"[订阅] 用户名 '{sub_uname}' 未在 DB 中找到，留空 uid 等待补填")
-                                    except Exception as e:
-                                        logger.debug(f"[订阅] DB 查询失败: {e}")
+                                    final_uid = uid
+                                    final_grade = ugrade
+                                    final_club = uclub
+                                    final_sec_uid = usec_uid
+                                    final_avatar = uavatar
+                                    if not final_uid:
+                                        try:
+                                            found = _get_conn().execute(
+                                                'SELECT user_id, grade, fans_club, sec_uid, avatar_url FROM users WHERE user_name = ? LIMIT 1',
+                                                (sub_uname,)
+                                            ).fetchone()
+                                            if found:
+                                                final_uid = found['user_id']
+                                                final_grade = found['grade'] or ''
+                                                final_club = found['fans_club'] or ''
+                                                final_sec_uid = found['sec_uid'] or ''
+                                                final_avatar = found['avatar_url'] or ''
+                                                logger.info(f"[订阅] 用户名 '{sub_uname}' -> user_id={final_uid}")
+                                            else:
+                                                logger.info(f"[订阅] 用户名 '{sub_uname}' 未在 DB 中找到，留空 uid 等待补填")
+                                        except Exception as e:
+                                            logger.debug(f"[订阅] DB 查询失败: {e}")
                                     if final_uid:
                                         upsert_user(final_uid, sub_uname, final_grade, final_club, final_sec_uid, final_avatar)
                                         record_gift(self._session_id, final_uid, sub_uname, sub_name or '订阅',
