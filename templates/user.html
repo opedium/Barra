@@ -387,8 +387,9 @@ function renderBadges(badge_json) {
             var baseKey = b.url.split('~tplv')[0];
             if (seen[baseKey]) return false;
             seen[baseKey] = true;
-            // Keep: level badge, league icon, membership V, star_guard, or fansclub _xmp overlay
-            var isLevel = b.url.indexOf('new_shining_level') !== -1 || b.url.indexOf('new_user_grade_level') !== -1;
+            // Keep: level badge (shining preferred, old as fallback), membership V, star_guard, fansclub _xmp
+            var isShiningLevel = b.url.indexOf('new_shining_level') !== -1;
+            var isOldLevel = b.url.indexOf('new_user_grade_level') !== -1;
             var isLeague = b.url.indexOf('league') !== -1;
             var isMembershipV = b.url.indexOf('1231241211V') !== -1;
             var isStarGuard = b.url.indexOf('star_guard') !== -1;
@@ -398,7 +399,13 @@ function renderBadges(badge_json) {
             if (isFansclubBase) return false;
             // When star_guard present, skip regular fansclub _xmp
             if (hasStarGuard && isFansclubXmp) return false;
-            return isLevel || isLeague || isMembershipV || isStarGuard || isFansclubXmp;
+            // Level: show shining version, skip old version if shining exists
+            if (isShiningLevel) return true;
+            if (isOldLevel) {
+                var hasShining = arr.some(function(x) { return x.url && x.url.indexOf('new_shining_level') !== -1; });
+                return !hasShining;
+            }
+            return isLeague || isMembershipV || isStarGuard || isFansclubXmp;
         }).map(function(b) {
             var title = '';
             if (b.name) title += b.name;

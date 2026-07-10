@@ -732,9 +732,10 @@ def make_badge_fallback(grade_text="", fans_club_text=""):
         m = _re.search(r'等级(\d+)', grade_text)
         if m:
             level = int(m.group(1))
-            # Shining level badge (new_shining_level — the main honor badge)
+            # Level badge: use the old PNG format. Shining webp variants exist for levels >= 40
+            # but are less reliable for lower levels.
             badges.append({
-                'url': f'https://p3-webcast.douyinpic.com/img/webcast/new_shining_level_{level}.webp~tplv-obj.image',
+                'url': f'https://p3-webcast.douyinpic.com/img/webcast/new_user_grade_level_v1_{level}.png~tplv-obj.image',
                 'level': level,
                 'alt': f'荣誉等级{level}级勋章',
             })
