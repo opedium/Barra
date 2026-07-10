@@ -883,6 +883,9 @@ def api_gift_prices():
     w = ' AND '.join(where_clauses)
     rg_w = ' AND '.join(rg_where_clauses)
 
+    # Alias the outer WHERE with g. prefix (gift_prices g has a LEFT JOIN d which also has gift_name)
+    w_g = w.replace('gift_name', 'g.gift_name').replace('source', 'g.source')
+
     total = conn.execute(f'''
         SELECT COUNT(*) FROM (
             SELECT gift_name FROM gift_prices WHERE {w}
@@ -909,7 +912,7 @@ def api_gift_prices():
                 SELECT gift_name, COUNT(*) AS logs, SUM(diamond_total) AS total_dia
                 FROM gift_logs GROUP BY gift_name
             ) d ON d.gift_name = g.gift_name
-            WHERE {w}
+            WHERE {w_g}
             UNION ALL
             SELECT
                 -r.gift_id AS id,

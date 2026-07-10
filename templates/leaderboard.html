@@ -23,11 +23,17 @@
             <button class="active" data-period="session">当前直播</button>
             <button data-period="recent">最近一场</button>
             <button data-period="month">本月</button>
-            <button data-period="30d">近30天</button>
+            <button data-period="custom">自定义</button>
             <button data-period="all">全部</button>
             <button data-period="million">月百万</button>
         </div>
         <input type="month" id="month-picker" class="month-picker" onchange="monthChanged()">
+
+        <!-- Custom date range (shown when period=custom) -->
+        <span id="date-range-label" style="display:none;font-size:12px;color:var(--text-muted);font-weight:500;white-space:nowrap;">从</span>
+        <input type="date" id="start-date-picker" style="display:none;width:150px;font-family:var(--font);">
+        <span id="date-range-sep" style="display:none;font-size:12px;color:var(--text-muted);">至</span>
+        <input type="date" id="end-date-picker" style="display:none;width:150px;font-family:var(--font);">
 
         <span class="threshold-label" id="streamer-label" style="display:none;">主播</span>
         <select id="streamer-select" onchange="onStreamerChange(this.value)" style="max-width:150px;display:none;">
@@ -301,22 +307,22 @@ function onSessionChange(sid) {
 function toggleControls(period) {
     var isMillion = period === 'million';
     var isSession = period === 'session';
-    var is30d = period === '30d';
+    var isCustom = period === 'custom';
 
     // 门槛 + 自定义: only session (uses qualified_1000/3000/10000/100000 columns)
     var showThreshold = period === 'session';
     document.getElementById('threshold-select').style.display = showThreshold ? '' : 'none';
     document.getElementById('custom-threshold').style.display = showThreshold ? '' : 'none';
 
-    // 最低消费: today, month, 30d, all (simple single-input filter)
-    var showMinConsume = period === 'recent' || period === 'month' || period === '30d' || period === 'all';
+    // 最低消费: today, month, 30d, all, custom (simple single-input filter)
+    var showMinConsume = period === 'recent' || period === 'month' || period === '30d' || period === 'all' || isCustom;
     document.getElementById('min-consume-input').style.display = showMinConsume ? '' : 'none';
 
-    // 排序按钮: session, today, month, all (not 30d, not million)
+    // 排序按钮: session, today, month, all (not 30d, not million, not custom)
     var showSort = period === 'session' || period === 'recent' || period === 'month' || period === 'all';
     document.getElementById('sort-btn').style.display = showSort ? '' : 'none';
 
-    // Top N: today, month, 30d, all (not session, not million)
+    // Top N: today, month, 30d, all, custom (not session, not million)
     var showTopN = !isMillion && !isSession;
     document.getElementById('topn-input').style.display = showTopN ? '' : 'none';
 
@@ -329,8 +335,15 @@ function toggleControls(period) {
     var showPicker = period === 'month' || period === 'million' || period === 'all';
     document.getElementById('month-picker').style.display = showPicker ? '' : 'none';
 
-    // 主播筛选: month, 30d, all, million (not session/recent)
-    var showStreamer = period === 'month' || period === '30d' || period === 'all' || period === 'million';
+    // 自定义日期范围: only custom
+    var showDateRange = isCustom;
+    document.getElementById('date-range-label').style.display = showDateRange ? '' : 'none';
+    document.getElementById('start-date-picker').style.display = showDateRange ? '' : 'none';
+    document.getElementById('date-range-sep').style.display = showDateRange ? '' : 'none';
+    document.getElementById('end-date-picker').style.display = showDateRange ? '' : 'none';
+
+    // 主播筛选: month, 30d, all, million, custom (not session/recent)
+    var showStreamer = period === 'month' || period === '30d' || period === 'all' || period === 'million' || isCustom;
     document.getElementById('streamer-label').style.display = showStreamer ? '' : 'none';
     document.getElementById('streamer-select').style.display = showStreamer ? '' : 'none';
 
@@ -374,6 +387,15 @@ document.getElementById('period-group').addEventListener('click', function(e) {
         toggleControls(currentPeriod);
         if (currentPeriod !== 'month') document.querySelector('[data-period="month"]').textContent = '本月';
         if (currentPeriod !== 'million') document.querySelector('[data-period="million"]').textContent = '月百万';
+        // 切换到自定义时设置默认起止日期（最近7天）
+        if (currentPeriod === 'custom') {
+            var d = new Date();
+            var endVal = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+            d.setDate(d.getDate() - 7);
+            var startVal = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+            document.getElementById('start-date-picker').value = startVal;
+            document.getElementById('end-date-picker').value = endVal;
+        }
         lockedSessionId = null;  // 切换周期时清除锁定的场次
         document.getElementById('session-selector').style.display = 'none';
         loadData();
@@ -401,6 +423,15 @@ document.getElementById('min-consume-input').addEventListener('change', function
 document.getElementById('topn-input').addEventListener('change', function() {
     var v = parseInt(this.value);
     currentTopN = v > 0 ? v : 50;
+    currentPage = 1;
+    loadData();
+});
+
+document.getElementById('start-date-picker').addEventListener('change', function() {
+    currentPage = 1;
+    loadData();
+});
+document.getElementById('end-date-picker').addEventListener('change', function() {
     currentPage = 1;
     loadData();
 });
@@ -510,6 +541,12 @@ function loadData() {
         var ym = document.getElementById('month-picker').value || '';
         if (ym) url += '&year_month=' + ym;
     }
+    if (currentPeriod === 'custom') {
+        var sd = document.getElementById('start-date-picker').value;
+        var ed = document.getElementById('end-date-picker').value;
+        if (sd) url += '&start_date=' + encodeURIComponent(sd);
+        if (ed) url += '&end_date=' + encodeURIComponent(ed);
+    }
 
     fetchWithTimeout(url)
         .then(function(r) { return r.json(); })
@@ -572,6 +609,12 @@ function exportCSV() {
     if (currentPeriod === 'month' || currentPeriod === '30d' || currentPeriod === 'all' || isMillion) {
         var ym = document.getElementById('month-picker').value || '';
         if (ym) url += '&year_month=' + ym;
+    }
+    if (currentPeriod === 'custom') {
+        var sd = document.getElementById('start-date-picker').value;
+        var ed = document.getElementById('end-date-picker').value;
+        if (sd) url += '&start_date=' + encodeURIComponent(sd);
+        if (ed) url += '&end_date=' + encodeURIComponent(ed);
     }
     var cols = isMillion
         ? ['rank', 'user_id', 'user_name', 'grade', 'fans_club', 'total_consume', 'days_active',
