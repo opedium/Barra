@@ -244,9 +244,9 @@ class PayGrade(proto.Message):
     new_live_icon = proto.Field(Image, number=20)
     upgrade_need_consume = proto.Field(proto.INT64, number=21)
     next_privileges = proto.Field(proto.STRING, number=22)
-    background = proto.Field(Image, number=23)
-    background_back = proto.Field(Image, number=24)
-    score = proto.Field(proto.INT64, number=25)
+    grade_describe_shining = proto.Field(proto.BOOL, number=23)
+    in_rebirth = proto.Field(proto.BOOL, number=24)
+    recent_consume_badge = proto.Field(Image, number=25)
     buff_info = proto.Field(GradeBuffInfo, number=26)
     grade_banner = proto.Field(proto.STRING, number=1001)
     profile_dialog_bg = proto.Field(Image, number=1002)
@@ -742,6 +742,18 @@ class RoomStreamAdaptationMessage(proto.Message):
     adaptation_type = proto.Field(proto.INT32, number=2)
     adaptation_height_ratio = proto.Field(proto.FLOAT, number=3)
     adaptation_body_center_ratio = proto.Field(proto.FLOAT, number=4)
+
+
+class AssetEffectUtilMessage(proto.Message):
+    """星守护/特权进场特效消息。
+
+    用于可靠检测星守护（star_guard）事件，
+    效果来源由 f[8] effect_source 指定。
+    """
+    common = proto.Field(Common, number=1)
+    effect_text = proto.Field(proto.BYTES, number=5)
+    effect_source = proto.Field(proto.STRING, number=8)
+    target_user_id = proto.Field(proto.STRING, number=9)
 
 
 # ── 业务层：电商/购物消息 ─────────────────────────

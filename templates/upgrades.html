@@ -54,6 +54,42 @@
         数据从接入之时开始记录，历史升级不会追溯。
     </div>
 
+    <div class="filter-bar" style="margin-bottom:12px;gap:8px;flex-wrap:wrap;">
+        <span class="threshold-label" style="font-size:12px;color:var(--text-muted);">主播</span>
+        <select id="streamer-select" onchange="onStreamerChange(this.value)" style="max-width:180px;">
+            <option value="">全部主播</option>
+        </select>
+        <button onclick="loadUpgrades()" class="btn-refresh" style="background:var(--card);color:var(--text-muted);border:1px solid var(--border);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:13px;">&#x27F3; 刷新</button>
+    </div>
+    <script>
+    function loadStreamers() {
+        fetch('/api/leaderboard/streamers')
+            .then(function(r) { return r.json(); })
+            .then(function(list) {
+                if (!list || list.length === 0) return;
+                var sel = document.getElementById('streamer-select');
+                sel.innerHTML = '<option value="">全部主播</option>';
+                list.forEach(function(item) {
+                    var opt = document.createElement('option');
+                    opt.value = item.id;
+                    opt.dataset.name = item.name;
+                    opt.textContent = item.name;
+                    sel.appendChild(opt);
+                });
+            });
+    }
+    function onStreamerChange(roomId) {
+        CUR_ROOM_ID = roomId;
+        var sel = document.getElementById('streamer-select');
+        var opt = sel.options[sel.selectedIndex];
+        CUR_ANCHOR_NAME = opt ? opt.dataset.name || '' : '';
+        CUR_PAGE = 1;
+        CUMULATIVE_ITEMS = 0;
+        loadUpgrades();
+    }
+    loadStreamers();
+    </script>
+
     <div class="type-tabs">
         <span class="type-tab active" data-type="" onclick="switchType('')">全部</span>
         <span class="type-tab" data-type="grade" onclick="switchType('grade')">财富等级</span>
@@ -70,6 +106,8 @@ var CUR_TYPE = '';
 var CUR_SCOPE = 'session';
 var CUR_PAGE = 1;
 var CUMULATIVE_ITEMS = 0;
+var CUR_ROOM_ID = '';
+var CUR_ANCHOR_NAME = '';
 
 function getActiveSessionId() {
     var p = new URLSearchParams(window.location.search);
@@ -104,6 +142,8 @@ function loadUpgrades(isAutoRefresh) {
 
     var params = 'page=' + CUR_PAGE + '&min_level=0';
     if (CUR_TYPE) params += '&type=' + CUR_TYPE;
+    if (CUR_ROOM_ID) params += '&room_id=' + encodeURIComponent(CUR_ROOM_ID);
+    else if (CUR_ANCHOR_NAME) params += '&anchor_name=' + encodeURIComponent(CUR_ANCHOR_NAME);
     if (CUR_SCOPE === 'session') {
         var sid = getActiveSessionId();
         if (sid) params += '&session_id=' + sid;

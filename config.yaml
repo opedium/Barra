@@ -1,72 +1,46 @@
-# ==================== 房间配置 ====================
-# 房间列表已移至 rooms.txt 文件
-# 格式：每行一个房间，id,name（逗号分隔）
-# # 开头表示不启用
-
-# ==================== 日志配置 ====================
-log_level: INFO                  # 日志级别: DEBUG / BARRAGE（终端输出弹幕） / INFO / WARNING / ERROR / NONE（NONE=关闭日志，数据文件照常写入）
-
-# ==================== Cookie 配置 ====================
-cookie_file: cookie.txt          # Cookie 文件路径（相对于脚本目录），不存在则以游客身份采集
-
-# ==================== 等待开播配置 ====================
-live_stop: false               # 直播结束后是否停止退出: true=结束退出 / false=等待重开播
-live_check_interval: 30         # 未开播时 HTTP 轮询间隔（秒）
-
-# ==================== 输出配置 ====================
+log_level: INFO
+cookie_file: cookie.txt
+live_stop: false
+live_check_interval: 30
 output:
-  chat: true                     # 弹幕
-  lucky_bag: false                # 福袋口令
-  gift: true                     # 礼物
-  light_gift: true                # 轻礼物/融合礼物（独立文件，钻石不合并）
-  like: false                     # 点赞
-  member: false                  # 进场
-  social: true                   # 关注/分享
-  rank: true                    # 排行榜
-  stats: true                    # 统计
-  fansclub: true                # 粉丝团
-  emoji: false                   # 表情
-  room: false                    # 直播间公告
-  roomstats: true               # 直播统计
-  contribution: true            # 贡献用户排行（1000贡献用户列表 Top 3）
-  control: true                  # 直播状态
-  file_dir: data                 # 数据输出目录（房间 meta、头像、raw frame 等）
-
-# ==================== 网络配置 ====================
+  chat: true
+  lucky_bag: false
+  gift: true
+  light_gift: true
+  like: false
+  member: false
+  social: true
+  rank: true
+  stats: true
+  fansclub: true
+  emoji: false
+  room: false
+  roomstats: true
+  contribution: true
+  control: true
+  file_dir: data
 network:
-  http_timeout: 15               # HTTP 超时（秒），超时后自动 ×1.5，封顶 60s，最多重试 3 次
-  ws_connect_timeout: 30         # WebSocket 底层 socket 超时（秒）
-  silence_timeout: 60            # 看门狗静默阈值（秒），超过则判定断连并重连
-  user_msg_timeout: 30           # 用户互动消息静默阈值（秒），无弹幕/礼物/点赞时重连
-  heartbeat_interval: 10         # 心跳间隔（秒）
-  rcvbuf_kb: 1024                # 接收缓冲区（KB），高流量直播间建议 1024
-  proxy: null                    # 代理地址，如 {"http": "http://127.0.0.1:8080", "https": "socks5://127.0.0.1:1080"}
-
-# ==================== 重连配置 ====================
-max_reconnects: 0              # 最大重连次数（0 = 无限）
-reconnect_base_delay: 2          # 重连基础延迟（秒），指数退避：2s → 4s → 8s → ...
-reconnect_max_delay: 120         # 最大重连延迟（秒），退避封顶
-
-# ==================== 统计配置 ====================
-stats_interval: 60              # 吞吐统计打印间隔（秒）
-
-# ==================== Web 面板配置 ====================
+  http_timeout: 15
+  ws_connect_timeout: 30
+  silence_timeout: 60
+  user_msg_timeout: 600
+  heartbeat_interval: 10
+  rcvbuf_kb: 1024
+  proxy: null
+  ws_proxy2: {"http": "http://8a102d60cee10e7a08aa__cr.cn:bbb6490d4e689be8@gw.dataimpulse.com:10000"}  # ws2 独立代理（不同出口IP）
+  dual_ws: true
+  dual_ws_identity: unique
+  ws_host2: webcast5-ws-web-hl.douyin.com
+  ws_cookie2: cookie2.txt
+max_reconnects: 0
+reconnect_base_delay: 2
+reconnect_max_delay: 120
+stats_interval: 60
 web:
-  host: "0.0.0.0"               # Flask 绑定地址
-  port: 8000                     # Flask 端口
-  password: "xky0304"             # 面板密码（空=无需认证）
-  auto_refresh: 30               # 仪表盘自动刷新间隔（秒，0=禁用）
+  host: 0.0.0.0
+  port: 8000
+  password: xky0304
+  auto_refresh: 30
   rate_limit:
-    enabled: true                  # 是否启用抖音 API 请求限流
-    max_per_minute: 30             # 每分钟最大请求数
-
-# ==================== 数据库配置 ====================
-database:
-  host: localhost
-  port: 5432
-  dbname: douyin_barrage
-  user: barrage
-  password: barrage
-  pool_min: 2
-  pool_max: 10
-
+    enabled: true
+    max_per_minute: 30

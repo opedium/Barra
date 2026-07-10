@@ -18,6 +18,7 @@ import os
 import random
 import re
 import secrets
+import sqlite3
 import sys
 import threading
 import time
@@ -33,6 +34,9 @@ from base.parser import (
     query_sessions, query_session_detail, query_search, _get_conn, DB_PATH,
     end_session as db_end_session, delete_session as db_delete_session,
     set_sse_callback,
+    init_gift_prices_table, recalculate_gift_price, get_price_change_history,
+    query_user_retention, query_big_spenders, query_silent_whales,
+    get_flow_counters, get_combo_buffer_size,
 )
 from service.fetcher import DouyinBarrage
 from service.network import fetch_user_info_by_sec_uid, fetch_user_info_by_user_id, fetch_user_info
@@ -174,20 +178,22 @@ class StreamerManager:
     def __init__(self):
         self._instances = {}   # live_id → DouyinBarrage
         self._lock = threading.Lock()
-        self._cookie_index = 0
-        self._cookie_assignments = {}  # live_id → cookie_filename
 
     # ── helpers ──────────────────────────────────────────────
 
     def _ensure_table(self):
         conn = _get_conn()
-        conn.execute("""CREATE TABLE IF NOT EXISTS streamer_config (
+        conn.execute('''CREATE TABLE IF NOT EXISTS streamer_config (
             live_id TEXT PRIMARY KEY,
             anchor_name TEXT DEFAULT '',
             enabled INTEGER DEFAULT 0,
-            added_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai')
-        )""")
-        conn.commit()
+            added_at DATETIME DEFAULT (datetime('now', '+8 hours'))
+        )''')
+        try:
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            if 'not an error' not in str(e):
+                raise
 
     # ── seed from rooms.txt ──────────────────────────────────
 
@@ -202,7 +208,7 @@ class StreamerManager:
         if not os.path.exists(rooms_file):
             return
         conn = _get_conn()
-        existing = set(r['live_id'] for r in conn.execute(
+        existing = set(r[0] for r in conn.execute(
             'SELECT live_id FROM streamer_config').fetchall())
         try:
             with open(rooms_file, 'r', encoding='utf-8') as f:
@@ -217,8 +223,8 @@ class StreamerManager:
                     name = parts[1].strip() if len(parts) > 1 else ''
                     if live_id and live_id not in existing:
                         conn.execute(
-                            'INSERT INTO streamer_config '
-                            '(live_id, anchor_name, enabled) VALUES (%s, %s, 0) ON CONFLICT DO NOTHING',
+                            'INSERT OR IGNORE INTO streamer_config '
+                            '(live_id, anchor_name, enabled) VALUES (?, ?, 0)',
                             (live_id, name))
             conn.commit()
         except Exception as e:
@@ -239,35 +245,20 @@ class StreamerManager:
 
         conn = _get_conn()
         row = conn.execute(
-            'SELECT anchor_name FROM streamer_config WHERE live_id = %s',
+            'SELECT anchor_name FROM streamer_config WHERE live_id = ?',
             (live_id,)).fetchone()
         anchor_name = row['anchor_name'] if row else ''
 
         def _on_room_info(rid, name):
             if name:
                 c = _get_conn()
-                c.execute('UPDATE streamer_config SET anchor_name = %s WHERE live_id = %s',
+                c.execute('UPDATE streamer_config SET anchor_name = ? WHERE live_id = ?',
                           (name, rid))
                 c.commit()
 
         try:
-            # 多 cookie 轮询分配，绕过单 cookie 限流
-            import os
-            _base = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookie.txt')
-            _cookie_file = _base
-            if os.path.exists(_base):
-                _cookies_avail = [_base]
-                for _i in range(2, 100):
-                    _cf = _base.replace('.txt', str(_i) + '.txt')
-                    if os.path.exists(_cf):
-                        _cookies_avail.append(_cf)
-                _cookie_file = _cookies_avail[self._cookie_index]
-                self._cookie_index = (self._cookie_index + 1) % len(_cookies_avail)
-            with self._lock:
-                self._cookie_assignments[live_id] = os.path.basename(_cookie_file)
             instance = DouyinBarrage(
-                live_id, multi_room=True, on_room_info=_on_room_info,
-                cookie_file=_cookie_file)
+                live_id, multi_room=True, on_room_info=_on_room_info)
             instance.config['live_stop'] = False   # wait for re-broadcast
 
             thread = threading.Thread(
@@ -282,7 +273,7 @@ class StreamerManager:
             thread.start()
 
             conn = _get_conn()
-            conn.execute('UPDATE streamer_config SET enabled = 1 WHERE live_id = %s',
+            conn.execute('UPDATE streamer_config SET enabled = 1 WHERE live_id = ?',
                          (live_id,))
             conn.commit()
 
@@ -304,7 +295,7 @@ class StreamerManager:
                 pass
 
         conn = _get_conn()
-        conn.execute('UPDATE streamer_config SET enabled = 0 WHERE live_id = %s',
+        conn.execute('UPDATE streamer_config SET enabled = 0 WHERE live_id = ?',
                      (live_id,))
         conn.commit()
 
@@ -341,7 +332,6 @@ class StreamerManager:
                     'room_id': info.get('room_id', ''),
                     'uptime_seconds': info.get('uptime_seconds', 0),
                     'last_error': info.get('last_error', ''),
-                    'cookie_file': self._cookie_assignments.get(live_id, ''),
                 }
             else:
                 entry = {
@@ -355,7 +345,6 @@ class StreamerManager:
                     'room_id': '',
                     'uptime_seconds': 0,
                     'last_error': '',
-                    'cookie_file': '',
                 }
 
             result.append(entry)
@@ -368,7 +357,7 @@ class StreamerManager:
         conn = _get_conn()
         try:
             conn.execute(
-                'INSERT INTO streamer_config (live_id, anchor_name) VALUES (%s, %s)',
+                'INSERT INTO streamer_config (live_id, anchor_name) VALUES (?, ?)',
                 (live_id, anchor_name))
             conn.commit()
             return True, 'Added'
@@ -378,7 +367,7 @@ class StreamerManager:
     def remove_streamer(self, live_id):
         self.stop_streamer(live_id)
         conn = _get_conn()
-        conn.execute('DELETE FROM streamer_config WHERE live_id = %s', (live_id,))
+        conn.execute('DELETE FROM streamer_config WHERE live_id = ?', (live_id,))
         conn.commit()
 
         # Also comment out the line in rooms.txt so it doesn't come back on restart
@@ -447,12 +436,12 @@ class CookieLoginManager:
 
     # ── Cookie file I/O ──────────────────────────────────
 
-    def _cookie_file_path(self):
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookie.txt')
+    def _cookie_file_path(self, filename='cookie.txt'):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
 
-    def _save_cookies_file(self, cookies_dict):
-        """Write cookies to cookie.txt in Netscape format (same as Playwright refresh)."""
-        path = self._cookie_file_path()
+    def _save_cookies_file(self, cookies_dict, filename='cookie.txt'):
+        """Write cookies to cookie.txt (or specified filename) in Netscape format."""
+        path = self._cookie_file_path(filename)
         expiry = int(time.time()) + 365 * 24 * 3600
         lines = ['# Netscape HTTP Cookie File',
                  '# https://curl.haxx.se/rfc/cookie_spec.html',
@@ -489,7 +478,7 @@ class CookieLoginManager:
 
     # ── Manual cookie save ──────────────────────────────
 
-    def manual_save(self, cookie_string):
+    def manual_save(self, cookie_string, filename='cookie.txt'):
         """Parse, validate, and save a manually-pasted cookie string.
 
         Returns ``(success: bool, message: str, details: dict | None)``.
@@ -540,8 +529,8 @@ class CookieLoginManager:
             # Don't block on network error — save anyway, the user can test live
             pass
 
-        # Save to cookie.txt
-        self._save_cookies_file(cookies)
+        # Save to cookie file
+        self._save_cookies_file(cookies, filename)
         expire = self._extract_expiry(cookies)
 
         return True, f'Cookie 已保存（{len(cookies)} 项）', {
@@ -575,9 +564,9 @@ class CookieLoginManager:
             pass
         return ''
 
-    def get_cookie_overview(self):
-        """Return a quick summary of the cookie.txt on disk."""
-        path = self._cookie_file_path()
+    def get_cookie_overview(self, filename='cookie.txt'):
+        """Return a quick summary of the cookie file on disk."""
+        path = self._cookie_file_path(filename)
         from base.utils import load_cookies
         cookies = load_cookies(path)
 
@@ -641,7 +630,7 @@ def index():
                 (SELECT COUNT(*) FROM gift_logs WHERE session_id=s.id) as total_gifts,
                 (SELECT COUNT(*) FROM chat_logs WHERE session_id=s.id) as total_chats,
                 (SELECT COUNT(*) FROM contributions WHERE session_id=s.id AND qualified_1000=1) as user_count
-            FROM sessions s WHERE s.id=%s
+            FROM sessions s WHERE s.id=?
         """, (sid,)).fetchone()
     else:
         live = conn.execute("""
@@ -652,12 +641,12 @@ def index():
             FROM sessions s WHERE status='live' ORDER BY s.id DESC LIMIT 1
         """).fetchone()
     live_sessions = conn.execute("SELECT id, anchor_name, room_id, start_time FROM sessions WHERE status='live' ORDER BY id DESC").fetchall()
-    total_gifts = conn.execute('SELECT COUNT(*) FROM gift_logs').fetchone()['count']
-    total_chats = conn.execute('SELECT COUNT(*) FROM chat_logs').fetchone()['count']
-    total_sessions = conn.execute('SELECT COUNT(*) FROM sessions').fetchone()['count']
-    today = conn.execute("SELECT COUNT(*) FROM gift_logs WHERE DATE(created_at) = CURRENT_DATE").fetchone()['count']
-    today_chats = conn.execute("SELECT COUNT(*) FROM chat_logs WHERE DATE(created_at) = CURRENT_DATE").fetchone()['count']
-    today_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM gift_logs WHERE DATE(created_at) = CURRENT_DATE").fetchone()['count']
+    total_gifts = conn.execute('SELECT COUNT(*) FROM gift_logs').fetchone()[0]
+    total_chats = conn.execute('SELECT COUNT(*) FROM chat_logs').fetchone()[0]
+    total_sessions = conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0]
+    today = conn.execute("SELECT COUNT(*) FROM gift_logs WHERE date(created_at)=date('now')").fetchone()[0]
+    today_chats = conn.execute("SELECT COUNT(*) FROM chat_logs WHERE date(created_at)=date('now')").fetchone()[0]
+    today_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM gift_logs WHERE date(created_at)=date('now')").fetchone()[0]
     recent = conn.execute('SELECT s.*, (SELECT COUNT(*) FROM gift_logs WHERE session_id=s.id) as total_gifts, (SELECT COUNT(*) FROM chat_logs WHERE session_id=s.id) as total_chats FROM sessions s ORDER BY s.id DESC LIMIT 10').fetchall()
     recent_chats = conn.execute('''
         SELECT cl.user_name, cl.user_id, cl.content, cl.created_at as time,
@@ -670,46 +659,57 @@ def index():
     if live:
         anchor_name = live['anchor_name']
         top = conn.execute('''
-            SELECT c.user_id, c.user_name, c.consume,
-                   CASE WHEN %s != '' THEN '[粉丝团:' || %s || ']' ELSE '' END AS fans_club,
+            SELECT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) as user_name, c.consume,
+                   CASE WHEN ? != '' THEN '[粉丝团:' || ? || ']' ELSE '' END AS fans_club,
                    COALESCE(u.grade, (SELECT grade FROM chat_logs WHERE user_id=c.user_id AND grade!='' ORDER BY id DESC LIMIT 1), '') as grade,
                    u.sec_uid, u.avatar_url,
                    (SELECT COUNT(*) FROM gift_logs WHERE session_id=c.session_id AND user_id=c.user_id) as gift_count,
-                   (SELECT COUNT(*) FROM chat_logs WHERE session_id=c.session_id AND user_id=c.user_id) as chat_count
+                   (SELECT COUNT(*) FROM chat_logs WHERE session_id=c.session_id AND user_id=c.user_id) as chat_count,
+                   (SELECT COALESCE(NULLIF(g.to_user_name, ''), s2.anchor_name, '')
+                    FROM gift_logs g
+                    LEFT JOIN sessions s2 ON s2.id = g.session_id
+                    WHERE g.session_id=c.session_id AND g.user_id=c.user_id
+                    GROUP BY COALESCE(NULLIF(g.to_user_name, ''), s2.anchor_name, '')
+                    ORDER BY SUM(g.diamond_total) DESC LIMIT 1) as top_recipient
             FROM contributions c
             LEFT JOIN users u ON u.user_id = c.user_id
-            WHERE c.session_id=%s ORDER BY c.consume DESC LIMIT 10
+            WHERE c.session_id=? ORDER BY c.consume DESC LIMIT 10
         ''', (anchor_name, anchor_name, live['id'],)).fetchall()
         top_users = [dict(r) for r in top]
+        # 尝试通过 API 解析匿名用户真实昵称
+        if top_users:
+            for u in top_users:
+                if '***' in (u['user_name'] or '') and u['user_id'] and _rate_limiter.acquire():
+                    try:
+                        info = fetch_user_info(u['user_id'])
+                        if info and info.get('nickname'):
+                            new_name = info['nickname']
+                            conn.execute('UPDATE users SET user_name = ? WHERE user_id = ?', (new_name, u['user_id']))
+                            u['user_name'] = new_name
+                    except Exception:
+                        pass
 
     # 查找主播头像（从 users 表中匹配主播昵称 + sec_uid）
     anchor_avatar = ''
     if live:
         anchor_row = conn.execute(
-            "SELECT avatar_url FROM users WHERE sec_uid != '' AND user_name = %s LIMIT 1",
+            'SELECT avatar_url FROM users WHERE sec_uid != "" AND user_name = ? LIMIT 1',
             (live['anchor_name'],)
         ).fetchone()
         if anchor_row and anchor_row['avatar_url']:
             anchor_avatar = anchor_row['avatar_url']
 
-    def _dt_to_str(d):
-        """Convert datetime objects to string before template rendering."""
-        if isinstance(d, dict):
-            return {k: _dt_to_str(v) for k, v in d.items()}
-        elif isinstance(d, list):
-            return [_dt_to_str(i) for i in d]
-        elif hasattr(d, 'strftime'):
-            return d.strftime('%Y-%m-%d %H:%M:%S')
-        return d
-
+    flow = get_flow_counters()
+    flow['combo_buf'] = get_combo_buffer_size()
     return render_template('index.html',
-        session=_dt_to_str(dict(live)) if live else None,
+        session=dict(live) if live else None,
         anchor_avatar=anchor_avatar,
-        live_sessions=_dt_to_str([dict(r) for r in live_sessions]),
+        live_sessions=[dict(r) for r in live_sessions],
         stats={'total_gifts': total_gifts, 'total_chats': total_chats, 'total_sessions': total_sessions, 'today_gifts': today, 'today_chats': today_chats, 'today_users': today_users},
-        sessions=_dt_to_str([dict(r) for r in recent]),
-        recent_chats=_dt_to_str([dict(r) for r in recent_chats]),
-        top_users=_dt_to_str(top_users),
+        sessions=[dict(r) for r in recent],
+        recent_chats=[dict(r) for r in recent_chats],
+        top_users=top_users,
+        flow=flow,
         db_path=DB_PATH,
         auto_refresh=_web_config['auto_refresh'],
         auth_enabled=bool(_web_config['password']))
@@ -749,7 +749,10 @@ def api_upgrades():
     session_id = request.args.get('session_id', type=int)
     min_level = request.args.get('min_level', 0, type=int)
     page = request.args.get('page', 1, type=int)
-    return jsonify(query_upgrades(upgrade_type=upgrade_type, session_id=session_id, min_level=min_level, page=page))
+    anchor_name = request.args.get('anchor_name', '').strip()
+    room_id = request.args.get('room_id', '').strip()
+    return jsonify(query_upgrades(upgrade_type=upgrade_type, session_id=session_id, min_level=min_level,
+                                  anchor_name=anchor_name, room_id=room_id, page=page))
 
 
 @app.route('/session/<int:session_id>')
@@ -816,22 +819,22 @@ def api_compare():
     conn = _get_conn()
     result = {'sessions': []}
     for sid in ids:
-        s = conn.execute('SELECT * FROM sessions WHERE id = %s', (sid,)).fetchone()
+        s = conn.execute('SELECT * FROM sessions WHERE id = ?', (sid,)).fetchone()
         if not s:
             continue
         session_data = dict(s)
         gifts = conn.execute(
             'SELECT COUNT(*) as total_gifts, COALESCE(SUM(diamond_total), 0) as total_diamonds '
-            'FROM gift_logs WHERE session_id = %s', (sid,)).fetchone()
+            'FROM gift_logs WHERE session_id = ?', (sid,)).fetchone()
         chats = conn.execute(
-            'SELECT COUNT(*) as total_chats FROM chat_logs WHERE session_id = %s',
+            'SELECT COUNT(*) as total_chats FROM chat_logs WHERE session_id = ?',
             (sid,)).fetchone()
         users = conn.execute(
             'SELECT COUNT(*) as total_users FROM contributions '
-            'WHERE session_id = %s AND qualified_1000 = 1', (sid,)).fetchone()
+            'WHERE session_id = ? AND qualified_1000 = 1', (sid,)).fetchone()
         top_gift = conn.execute(
             'SELECT gift_name, SUM(diamond_total) as total FROM gift_logs '
-            'WHERE session_id = %s GROUP BY gift_name ORDER BY total DESC LIMIT 1',
+            'WHERE session_id = ? GROUP BY gift_name ORDER BY total DESC LIMIT 1',
             (sid,)).fetchone()
         session_data['total_gifts'] = gifts['total_gifts'] if gifts else 0
         session_data['total_diamonds'] = gifts['total_diamonds'] if gifts else 0
@@ -840,6 +843,318 @@ def api_compare():
         session_data['top_gift'] = top_gift['gift_name'] if top_gift else ''
         result['sessions'].append(session_data)
     return jsonify(result)
+
+
+# ── Gift Price Management ──
+
+@app.route('/gift-prices')
+@require_auth
+def gift_prices():
+    return render_template('gift_prices.html', auth_enabled=bool(_web_config['password']))
+
+
+@app.route('/api/gift-prices')
+@require_auth
+def api_gift_prices():
+    """List gift prices with search, filter, and pagination."""
+    conn = _get_conn()
+    search = request.args.get('search', '').strip()
+    source_filter = request.args.get('source', '').strip()
+    page = request.args.get('page', 1, type=int)
+    size = request.args.get('size', 50, type=int)
+    offset = (page - 1) * size
+
+    where_clauses = ['1=1']
+    rg_where_clauses = ['1=1']
+    params = []
+    rg_params = []
+
+    if search:
+        where_clauses.append('gift_name LIKE ?')
+        params.append(f'%{search}%')
+        rg_where_clauses.append('r.gift_name LIKE ?')
+        rg_params.append(f'%{search}%')
+
+    if source_filter:
+        where_clauses.append('source = ?')
+        params.append(source_filter)
+    # rg subquery has no source column — skip filter there
+
+    w = ' AND '.join(where_clauses)
+    rg_w = ' AND '.join(rg_where_clauses)
+
+    total = conn.execute(f'''
+        SELECT COUNT(*) FROM (
+            SELECT gift_name FROM gift_prices WHERE {w}
+            UNION
+            SELECT r.gift_name FROM gift_id_registry r
+            LEFT JOIN gift_prices p ON r.gift_name = p.gift_name
+            WHERE p.id IS NULL AND {rg_w}
+        )
+    ''', params + rg_params).fetchone()[0]
+
+    rows = conn.execute(f'''
+        SELECT * FROM (
+            SELECT
+                g.id,
+                COALESCE(g.gift_id, 0) AS gift_id,
+                g.gift_name,
+                g.diamond_count,
+                g.source,
+                g.is_limited_skin,
+                COALESCE(d.logs, 0) AS logs,
+                COALESCE(d.total_dia, 0) AS total_dia
+            FROM gift_prices g
+            LEFT JOIN (
+                SELECT gift_name, COUNT(*) AS logs, SUM(diamond_total) AS total_dia
+                FROM gift_logs GROUP BY gift_name
+            ) d ON d.gift_name = g.gift_name
+            WHERE {w}
+            UNION ALL
+            SELECT
+                -r.gift_id AS id,
+                r.gift_id AS gift_id,
+                r.gift_name,
+                r.diamond_count,
+                r.source AS source,
+                0 AS is_limited_skin,
+                COALESCE(d2.logs, 0) AS logs,
+                COALESCE(d2.total_dia, 0) AS total_dia
+            FROM gift_id_registry r
+            LEFT JOIN gift_prices p ON r.gift_name = p.gift_name
+            LEFT JOIN (
+                SELECT gift_name, COUNT(*) AS logs, SUM(diamond_total) AS total_dia
+                FROM gift_logs GROUP BY gift_name
+            ) d2 ON d2.gift_name = r.gift_name
+            WHERE p.id IS NULL AND {rg_w}
+        )
+        ORDER BY total_dia DESC, gift_name
+        LIMIT ? OFFSET ?
+    ''', params + rg_params + [size, offset]).fetchall()
+
+    # Confirmed count (entries in gift_prices — has a user-set price)
+    confirmed = conn.execute('SELECT COUNT(*) FROM gift_prices').fetchone()[0]
+    unregistered = conn.execute('''
+        SELECT COUNT(*) FROM gift_id_registry r
+        LEFT JOIN gift_prices p ON r.gift_name = p.gift_name
+        WHERE p.id IS NULL AND r.source = 'auto'
+    ''').fetchone()[0]
+    registry_only = conn.execute('''
+        SELECT COUNT(*) FROM gift_id_registry r
+        LEFT JOIN gift_prices p ON r.gift_name = p.gift_name
+        WHERE p.id IS NULL AND r.source = 'official'
+    ''').fetchone()[0]
+
+    return jsonify({
+        'prices': [dict(r) for r in rows],
+        'total': total,
+        'confirmed': confirmed,
+        'unregistered': unregistered,
+        'registry_only': registry_only,
+        'page': page,
+        'size': size,
+    })
+
+
+@app.route('/api/gift-prices', methods=['POST'])
+@require_auth
+def api_gift_price_create():
+    """Create a new gift price entry."""
+    data = request.get_json(force=True, silent=True) or {}
+    gift_name = (data.get('gift_name') or '').strip()
+    if not gift_name:
+        return jsonify({'error': 'gift_name is required'}), 400
+    diamond_count = int(data.get('diamond_count', 0))
+    if diamond_count < 0:
+        return jsonify({'error': 'price must be >= 0'}), 400
+
+    conn = _get_conn()
+    # Check if already exists in gift_prices (exact match)
+    existing = conn.execute('SELECT id FROM gift_prices WHERE gift_name = ?', (gift_name,)).fetchone()
+    if existing:
+        return jsonify({'error': f'礼物 "{gift_name}" 已存在'}), 409
+
+    # Check for similar names (case-insensitive, to catch typos/case differences)
+    similar = conn.execute('SELECT gift_name, diamond_count, source FROM gift_prices WHERE LOWER(gift_name) = LOWER(?)', (gift_name,)).fetchall()
+    if similar:
+        s = similar[0]
+        return jsonify({
+            'error': f'礼物 "{gift_name}" 与已有记录 "{s["gift_name"]}" 仅大小写不同',
+            'similar_name': s['gift_name'],
+        }), 409
+
+    # Check if name exists in gift_logs data (not yet in gift_prices)
+    log_count = conn.execute('SELECT COUNT(*) AS cnt FROM gift_logs WHERE gift_name = ?', (gift_name,)).fetchone()[0]
+    if log_count > 0:
+        # Name already exists in live data — warn but allow creation
+        pass  # handled in response below
+
+    conn.execute('''
+        INSERT INTO gift_prices (gift_name, gift_id, diamond_count, source, is_limited_skin)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (
+        gift_name,
+        int(data.get('gift_id', 0)),
+        diamond_count,
+        data.get('source', 'manual'),
+        1 if data.get('is_limited_skin') else 0,
+    ))
+    conn.commit()
+
+    new_id = conn.execute('SELECT id FROM gift_prices WHERE gift_name = ?', (gift_name,)).fetchone()[0]
+    result = {'success': True, 'id': new_id, 'gift_name': gift_name}
+    if log_count > 0:
+        result['warning'] = f'礼物名 "{gift_name}" 已在 {log_count} 条直播记录中出现，价格已覆盖自动检测值'
+    return jsonify(result), 201
+
+
+@app.route('/api/gift-prices/<int:price_id>')
+@require_auth
+def api_gift_price(price_id):
+    conn = _get_conn()
+    row = conn.execute('SELECT * FROM gift_prices WHERE id = ?', (price_id,)).fetchone()
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify(dict(row))
+
+
+@app.route('/api/gift-prices/<int:price_id>', methods=['POST'])
+@require_auth
+def api_gift_price_update(price_id):
+    """Update a gift price. If diamond_count changes, optionally recalculate."""
+    conn = _get_conn()
+    row = conn.execute('SELECT * FROM gift_prices WHERE id = ?', (price_id,)).fetchone()
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+
+    data = request.get_json(force=True, silent=True) or {}
+
+    updates = []
+    params = []
+
+    if 'diamond_count' in data:
+        new_price = int(data['diamond_count'])
+        if new_price < 0:
+            return jsonify({'error': 'price must be >= 0'}), 400
+        old_price = row['diamond_count']
+        updates.append('diamond_count = ?')
+        params.append(new_price)
+    else:
+        old_price = row['diamond_count']
+        new_price = old_price
+
+    if 'gift_id' in data:
+        updates.append('gift_id = ?')
+        params.append(int(data['gift_id']))
+
+    if 'source' in data:
+        updates.append('source = ?')
+        params.append(data['source'])
+
+    if 'is_limited_skin' in data:
+        updates.append('is_limited_skin = ?')
+        params.append(1 if data['is_limited_skin'] else 0)
+
+    if updates:
+        updates.append('updated_at = datetime("now", "+8 hours")')
+        params.append(price_id)
+        conn.execute(f'UPDATE gift_prices SET {", ".join(updates)} WHERE id = ?', params)
+        conn.commit()
+
+    recalculate = data.get('recalculate', False)
+    recalc_result = None
+    if recalculate and new_price != old_price:
+        recalc_result = recalculate_gift_price(
+            row['gift_name'], new_price, old_price,
+            notes=data.get('notes', '')
+        )
+
+    return jsonify({
+        'success': True,
+        'gift_name': row['gift_name'],
+        'old_price': old_price,
+        'new_price': new_price if 'diamond_count' in data else old_price,
+        'recalculated': recalc_result is not None,
+        'recalc_result': recalc_result,
+    })
+
+
+@app.route('/api/gift-prices/bulk-recalculate', methods=['POST'])
+@require_auth
+def api_gift_prices_bulk_recalculate():
+    """Recalculate all gift_logs rows for a specific gift_name using its current price."""
+    data = request.get_json(force=True, silent=True) or {}
+    price_id = data.get('price_id')
+    gift_name = data.get('gift_name')
+
+    conn = _get_conn()
+
+    if price_id:
+        row = conn.execute('SELECT * FROM gift_prices WHERE id = ?', (price_id,)).fetchone()
+    elif gift_name:
+        row = conn.execute('SELECT * FROM gift_prices WHERE gift_name = ?', (gift_name,)).fetchone()
+    else:
+        return jsonify({'error': 'price_id or gift_name required'}), 400
+
+    if not row:
+        return jsonify({'error': 'gift price not found'}), 404
+
+    result = recalculate_gift_price(row['gift_name'], row['diamond_count'], row['diamond_count'],
+                                    notes='Bulk recalculation')
+    return jsonify({'success': True, 'result': result})
+
+
+@app.route('/api/gift-prices/audit')
+@require_auth
+def api_gift_prices_audit():
+    """Return audit data: discrepancies, needs-review items, change history."""
+    conn = _get_conn()
+
+    # Section 1: Price discrepancies — same gift_name, different unit prices in gift_logs
+    discrepancies = conn.execute('''
+        SELECT gift_name, diamond_total / MAX(gift_count, 1) AS unit_price,
+               COUNT(*) AS occurrences,
+               COUNT(DISTINCT session_id) AS sessions
+        FROM gift_logs
+        WHERE gift_count > 0
+        GROUP BY gift_name, unit_price
+        HAVING COUNT(*) > 0
+        ORDER BY gift_name, occurrences DESC
+    ''').fetchall()
+
+    # Group by gift_name, find conflicts
+    disc_dict = {}
+    for r in discrepancies:
+        name = r['gift_name']
+        if name not in disc_dict:
+            disc_dict[name] = {'gift_name': name, 'prices': [], 'total_occurrences': 0}
+        disc_dict[name]['prices'].append({
+            'unit_price': r['unit_price'],
+            'occurrences': r['occurrences'],
+            'sessions': r['sessions'],
+        })
+        disc_dict[name]['total_occurrences'] += r['occurrences']
+
+    audit_discrepancies = [
+        d for d in disc_dict.values() if len(d['prices']) > 1
+    ]
+
+    # Cross-reference with gift_prices table
+    for d in audit_discrepancies:
+        db_row = conn.execute(
+            'SELECT diamond_count, source FROM gift_prices WHERE gift_name = ?',
+            (d['gift_name'],)
+        ).fetchone()
+        d['db_price'] = db_row['diamond_count'] if db_row else None
+        d['db_source'] = db_row['source'] if db_row else 'unknown'
+
+    # Section 2: Change history
+    history = get_price_change_history(30)
+
+    return jsonify({
+        'discrepancies': audit_discrepancies,
+        'history': history,
+    })
 
 
 @app.route('/settings')
@@ -891,6 +1206,8 @@ def api_leaderboard():
     min_consume = request.args.get('min_consume', 0, type=int)
     streamer = request.args.get('streamer', '').strip()
     room_id = request.args.get('room_id', '').strip()
+    start_date = request.args.get('start_date', '')
+    end_date = request.args.get('end_date', '')
 
     # If session_id passed explicitly, use it; otherwise resolve from live session
     session_id = request.args.get('session_id', None, type=int)
@@ -898,12 +1215,12 @@ def api_leaderboard():
         conn = _get_conn()
         s = conn.execute("SELECT id FROM sessions WHERE status='live' ORDER BY id DESC LIMIT 1").fetchone()
         if s:
-            session_id = s['id']
+            session_id = s[0]
         else:
             # No live session and no explicit session_id — return empty
             return jsonify({'users': [], 'total': 0, 'page': 1})
 
-    data = query_leaderboard(threshold, period, page, size, session_id, year_month, min_consume, anchor_name=streamer, room_id=room_id)
+    data = query_leaderboard(threshold, period, page, size, session_id, year_month, min_consume, anchor_name=streamer, room_id=room_id, start_date=start_date, end_date=end_date)
     if sort_by == 'sessions' and data.get('users'):
         data['users'].sort(key=lambda u: (-u.get('sessions_count', 0), -u.get('consume', 0)))
         for i, u in enumerate(data['users']):
@@ -956,20 +1273,20 @@ def api_user():
             params = []
             if need_avatar and fetched.get('avatar_url'):
                 data['avatar_url'] = fetched['avatar_url']
-                updates.append('avatar_url = %s')
+                updates.append('avatar_url = ?')
                 params.append(fetched['avatar_url'])
             if need_sec_uid and fetched.get('sec_uid'):
                 data['sec_uid'] = fetched['sec_uid']
-                updates.append('sec_uid = %s')
+                updates.append('sec_uid = ?')
                 params.append(fetched['sec_uid'])
             if fetched.get('nickname'):
                 data['user_name'] = fetched['nickname']
-                updates.append('user_name = %s')
+                updates.append('user_name = ?')
                 params.append(fetched['nickname'])
             if updates:
                 params.append(uid)
                 conn = _get_conn()
-                conn.execute(f'UPDATE users SET {", ".join(updates)} WHERE user_id = %s', params)
+                conn.execute(f'UPDATE users SET {", ".join(updates)} WHERE user_id = ?', params)
                 conn.commit()
 
     return jsonify(data)
@@ -990,20 +1307,30 @@ def api_user_gifts(user_id):
     session_id = request.args.get('session_id', None, type=int)
     if session_id:
         rows = conn.execute(
-            '''SELECT g.gift_name, g.gift_count, g.diamond_total, g.created_at,
-                      COALESCE(s.anchor_name, '') as anchor_name
+            '''SELECT g.gift_name, g.gift_id, g.gift_count, g.diamond_total, g.created_at,
+                      g.to_user_name,
+                      COALESCE(NULLIF(g.to_user_name, ''), s.anchor_name, '') as to_user,
+                      COALESCE(s.anchor_name, '') as anchor_name,
+                      COALESCE(NULLIF(g.grade, ''), u.grade, '') as grade,
+                      COALESCE(NULLIF(g.fans_club, ''), u.fans_club, '') as fans_club
                FROM gift_logs g
                LEFT JOIN sessions s ON s.id = g.session_id
-               WHERE g.user_id=%s AND g.session_id=%s
+               LEFT JOIN users u ON u.user_id = g.user_id
+               WHERE g.user_id=? AND g.session_id=?
                ORDER BY g.created_at DESC LIMIT 5000''',
             (user_id, session_id)).fetchall()
     else:
         rows = conn.execute(
-            '''SELECT g.gift_name, g.gift_count, g.diamond_total, g.created_at,
-                      COALESCE(s.anchor_name, '') as anchor_name
+            '''SELECT g.gift_name, g.gift_id, g.gift_count, g.diamond_total, g.created_at,
+                      g.to_user_name,
+                      COALESCE(NULLIF(g.to_user_name, ''), s.anchor_name, '') as to_user,
+                      COALESCE(s.anchor_name, '') as anchor_name,
+                      COALESCE(NULLIF(g.grade, ''), u.grade, '') as grade,
+                      COALESCE(NULLIF(g.fans_club, ''), u.fans_club, '') as fans_club
                FROM gift_logs g
                LEFT JOIN sessions s ON s.id = g.session_id
-               WHERE g.user_id=%s
+               LEFT JOIN users u ON u.user_id = g.user_id
+               WHERE g.user_id=?
                ORDER BY g.created_at DESC LIMIT 5000''',
             (user_id,)).fetchall()
     return jsonify([dict(r) for r in rows])
@@ -1018,7 +1345,7 @@ def api_user_notes(user_id):
     conn = _get_conn()
     conn.execute('''
         INSERT INTO users (user_id, user_name, notes, tags)
-        VALUES (%s, %s, %s, %s)
+        VALUES (?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
             notes = excluded.notes,
             tags = excluded.tags
@@ -1061,7 +1388,7 @@ def api_user_avatar_lookup():
     # 传了 user_id：先从本地 DB 查
     conn = _get_conn()
     user = conn.execute(
-        'SELECT user_id, user_name, sec_uid, avatar_url, grade, fans_club FROM users WHERE user_id = %s',
+        'SELECT user_id, user_name, sec_uid, avatar_url, grade, fans_club FROM users WHERE user_id = ?',
         (user_id,)
     ).fetchone()
 
@@ -1089,15 +1416,15 @@ def api_user_avatar_lookup():
             updates = []
             params = []
             if info.get('avatar_url'):
-                updates.append('avatar_url = %s')
+                updates.append('avatar_url = ?')
                 params.append(info['avatar_url'])
             if info.get('nickname') and info['nickname'] != user['user_name']:
-                updates.append('user_name = %s')
+                updates.append('user_name = ?')
                 params.append(info['nickname'])
             if updates:
                 params.append(user_id)
                 conn.execute(
-                    f'UPDATE users SET {", ".join(updates)} WHERE user_id = %s',
+                    f'UPDATE users SET {", ".join(updates)} WHERE user_id = ?',
                     params
                 )
                 conn.commit()
@@ -1130,18 +1457,18 @@ def api_user_avatar_lookup():
         updates = []
         params = []
         if info.get('avatar_url'):
-            updates.append('avatar_url = %s')
+            updates.append('avatar_url = ?')
             params.append(info['avatar_url'])
         if info.get('sec_uid'):
-            updates.append('sec_uid = %s')
+            updates.append('sec_uid = ?')
             params.append(info['sec_uid'])
         if info.get('nickname'):
-            updates.append('user_name = %s')
+            updates.append('user_name = ?')
             params.append(info['nickname'])
         if updates:
             params.append(user_id)
             conn.execute(
-                f'UPDATE users SET {", ".join(updates)} WHERE user_id = %s',
+                f'UPDATE users SET {", ".join(updates)} WHERE user_id = ?',
                 params
             )
             conn.commit()
@@ -1215,21 +1542,21 @@ def api_anonymous_resolve():
                     sec = info.get('sec_uid', '')
                     avatar = info.get('avatar_url', '')
                     conn.execute(
-                        "UPDATE users SET user_name = %s, sec_uid = CASE WHEN %s != '' THEN %s ELSE sec_uid END, avatar_url = CASE WHEN %s != '' THEN %s ELSE avatar_url END, is_anonymous = 0 WHERE user_id = %s",
+                        'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0 WHERE user_id = ?',
                         (nick, sec, sec, avatar, avatar, uid)
                     )
                     if resolved_id and resolved_id != uid:
                         conn.execute(
-                            "UPDATE users SET user_name = %s, sec_uid = CASE WHEN %s != '' THEN %s ELSE sec_uid END, avatar_url = CASE WHEN %s != '' THEN %s ELSE avatar_url END, is_anonymous = 0 WHERE user_id = %s",
+                            'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0 WHERE user_id = ?',
                             (nick, sec, sec, avatar, avatar, resolved_id)
                         )
                     conn.commit()
                     resolved += 1
                     continue
             # API 返回空（用户不存在）+ 无贡献 → 假用户（如订阅垃圾ID），移出匿名统计
-            has_consume = conn.execute('SELECT COUNT(*) FROM contributions WHERE user_id = %s', (uid,)).fetchone()['count']
+            has_consume = conn.execute('SELECT COUNT(*) FROM contributions WHERE user_id = ?', (uid,)).fetchone()[0]
             if has_consume == 0:
-                conn.execute('UPDATE users SET is_anonymous = 0, anonymous_label = "fake" WHERE user_id = %s', (uid,))
+                conn.execute('UPDATE users SET is_anonymous = 0, anonymous_label = "fake" WHERE user_id = ?', (uid,))
                 conn.commit()
                 resolved += 1  # 算作"已处理"
                 continue
@@ -1279,10 +1606,10 @@ def api_session_hourly(session_id):
     """返回该场次按小时的礼物活跃度分布。"""
     conn = _get_conn()
     rows = conn.execute('''
-        SELECT CAST(TO_CHAR(created_at, 'HH24') AS INTEGER) as hour,
+        SELECT CAST(strftime('%H', created_at) AS INTEGER) as hour,
                COUNT(*) as count
         FROM gift_logs
-        WHERE session_id = %s
+        WHERE session_id = ?
         GROUP BY hour ORDER BY hour
     ''', (session_id,)).fetchall()
     return jsonify({'hours': [dict(r) for r in rows]})
@@ -1345,11 +1672,11 @@ def api_search():
 def api_stats():
     conn = _get_conn()
     return jsonify({
-        'total_users': conn.execute('SELECT COUNT(DISTINCT user_id) FROM contributions').fetchone()['count'],
-        'total_gifts': conn.execute('SELECT COUNT(*) FROM gift_logs').fetchone()['count'],
-        'total_chats': conn.execute('SELECT COUNT(*) FROM chat_logs').fetchone()['count'],
-        'total_sessions': conn.execute('SELECT COUNT(*) FROM sessions').fetchone()['count'],
-        'active_session': conn.execute("SELECT COUNT(*) FROM sessions WHERE status='live'").fetchone()['count'] > 0,
+        'total_users': conn.execute('SELECT COUNT(DISTINCT user_id) FROM contributions').fetchone()[0],
+        'total_gifts': conn.execute('SELECT COUNT(*) FROM gift_logs').fetchone()[0],
+        'total_chats': conn.execute('SELECT COUNT(*) FROM chat_logs').fetchone()[0],
+        'total_sessions': conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0],
+        'active_session': conn.execute("SELECT COUNT(*) FROM sessions WHERE status='live'").fetchone()[0] > 0,
     })
 
 
@@ -1420,77 +1747,72 @@ def api_cookie_login_manual():
     return jsonify({'success': ok, 'message': message, 'details': details})
 
 
-@app.route('/api/cookies/list')
-def api_cookies_list():
-    """列出所有可用的 cookie 文件，含登录态、昵称、过期时间"""
-    import os
-    basedir = os.path.dirname(os.path.abspath(__file__))
-    cookies = []
-    from base.utils import load_cookies
-    for f in sorted(os.listdir(basedir)):
-        if f.startswith('cookie') and f.endswith('.txt'):
-            fp = os.path.join(basedir, f)
-            size = os.path.getsize(fp)
-            content = open(fp, 'r', encoding='utf-8').read().strip()
-            if ';' in content and '\t' not in content:
-                item_count = len([p for p in content.split(';') if '=' in p])
-            else:
-                item_count = len([l for l in content.splitlines() if l.strip() and not l.startswith('#') and '\t' in l])
-            # 检查登录态、过期
-            ck = load_cookies(fp)
-            has_session = bool(ck.get('sessionid') or ck.get('sessionid_ss'))
-            expire = _cookie_manager._extract_expiry(ck) if hasattr(_cookie_manager, '_extract_expiry') else ''
-            # 获取账号昵称
-            try:
-                nick = _cookie_manager._fetch_nickname(ck) or ''
-            except Exception:
-                nick = ''
-            cookies.append({
-                'file': f, 'size': size, 'items': item_count,
-                'status': 'active' if has_session else 'guest',
-                'has_session': has_session,
-                'expire': expire or '',
-                'nickname': nick,
-            })
-    return jsonify({'cookies': cookies, 'active_file': 'cookie.txt'})
+# ── Dual WebSocket Config API ──
+
+@app.route('/api/dual-ws-config')
+@require_auth
+def api_dual_ws_config():
+    """Return current dual WS config from config.yaml network section."""
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.yaml')
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception:
+        cfg = {}
+    net = cfg.get('network', {})
+    return jsonify({
+        'dual_ws': net.get('dual_ws', False),
+        'dual_ws_identity': net.get('dual_ws_identity', 'smart'),
+        'ws_host2': net.get('ws_host2', None),
+        'ws_cookie2': net.get('ws_cookie2', None),
+    })
 
 
-@app.route('/api/cookies/save', methods=['POST'])
-def api_cookies_save():
-    """保存 cookie 到指定文件"""
-    import os
+@app.route('/api/dual-ws-config', methods=['POST'])
+@require_auth
+def api_dual_ws_config_save():
+    """Save dual WS config to config.yaml network section."""
     data = request.get_json(force=True, silent=True) or {}
-    filename = data.get('filename', 'cookie.txt')
-    content = data.get('content', '').strip()
-    basedir = os.path.dirname(os.path.abspath(__file__))
-    # Validate filename
-    if not filename.startswith('cookie') or not filename.endswith('.txt'):
-        return jsonify({'success': False, 'message': '文件名必须以 cookie 开头、.txt 结尾'})
-    # Validate content
-    if not content:
-        return jsonify({'success': False, 'message': '内容不能为空'})
-    filepath = os.path.join(basedir, filename)
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(content + '\n')
-    return jsonify({'success': True, 'message': f'{filename} 已保存（{len(content)} 字节）'})
+    allowed_keys = {'dual_ws', 'dual_ws_identity', 'ws_host2', 'ws_cookie2'}
+    updates = {k: v for k, v in data.items() if k in allowed_keys}
+
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.yaml')
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception:
+        cfg = {}
+
+    if 'network' not in cfg:
+        cfg['network'] = {}
+    cfg['network'].update(updates)
+
+    tmp = config_path + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        os.replace(tmp, config_path)
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'保存失败: {e}'}), 500
+
+    return jsonify({'success': True, 'message': '双 WS 配置已保存'})
 
 
-@app.route('/api/cookies/delete', methods=['POST'])
-def api_cookies_delete():
-    """删除 cookie 文件"""
-    import os
+@app.route('/api/cookie2-status')
+@require_auth
+def api_cookie2_status():
+    """Return cookie2.txt overview (same shape as /api/cookie-status)."""
+    return jsonify(_cookie_manager.get_cookie_overview('cookie2.txt'))
+
+
+@app.route('/api/cookie2-login/manual', methods=['POST'])
+@require_auth
+def api_cookie2_login_manual():
+    """Save manually-pasted cookie string to cookie2.txt."""
     data = request.get_json(force=True, silent=True) or {}
-    filename = data.get('filename', '')
-    if not filename.startswith('cookie') or not filename.endswith('.txt'):
-        return jsonify({'success': False, 'message': '无效文件名'})
-    if filename == 'cookie.txt':
-        return jsonify({'success': False, 'message': '不能删除默认 cookie.txt'})
-    basedir = os.path.dirname(os.path.abspath(__file__))
-    fp = os.path.join(basedir, filename)
-    if os.path.exists(fp):
-        os.remove(fp)
-        return jsonify({'success': True, 'message': f'{filename} 已删除'})
-    return jsonify({'success': False, 'message': '文件不存在'})
+    cookie_string = data.get('cookie_string', '').strip()
+    ok, message, details = _cookie_manager.manual_save(cookie_string, 'cookie2.txt')
+    return jsonify({'success': ok, 'message': message, 'details': details})
 
 
 # ── CSV Export ──
@@ -1560,17 +1882,19 @@ def api_leaderboard_csv():
     streamer = request.args.get('streamer', '').strip()
     room_id = request.args.get('room_id', '').strip()
     session_id = request.args.get('session_id', None, type=int)
+    start_date = request.args.get('start_date', '')
+    end_date = request.args.get('end_date', '')
 
     if period == 'session' and session_id is None:
         conn = _get_conn()
         s = conn.execute("SELECT id FROM sessions WHERE status='live' ORDER BY id DESC LIMIT 1").fetchone()
         if s:
-            session_id = s['id']
+            session_id = s[0]
         else:
             return _make_csv_response([], ['user_id', 'user_name', 'consume'], 'leaderboard.csv')
 
     # Fetch ALL pages (size=999999)
-    data = query_leaderboard(threshold, period, 1, 999999, session_id, year_month, min_consume, anchor_name=streamer, room_id=room_id)
+    data = query_leaderboard(threshold, period, 1, 999999, session_id, year_month, min_consume, anchor_name=streamer, room_id=room_id, start_date=start_date, end_date=end_date)
     users = data.get('users', [])
 
     if sort_by == 'sessions' and users:
@@ -1723,19 +2047,67 @@ def api_user_timeline_csv(user_id):
         f'user_{user_id}_timeline.csv')
 
 
+# ═══════════════════════════════════════════════════════════════
+#  User Behavior Analytics
+# ═══════════════════════════════════════════════════════════════
+
+@app.route('/analytics')
+@require_auth
+def analytics():
+    return render_template('analytics.html', auth_enabled=bool(_web_config['password']))
+
+
+@app.route('/api/analytics/retention')
+@require_auth
+def api_analytics_retention():
+    anchor = request.args.get('anchor', '')
+    period = request.args.get('period', '30d')
+    tier = request.args.get('tier', 0, type=int)
+    page = request.args.get('page', 1, type=int)
+    size = request.args.get('size', 20, type=int)
+    try:
+        data = query_user_retention(anchor, period, tier, page, size)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/analytics/big-spenders')
+@require_auth
+def api_analytics_big_spenders():
+    min_consume = request.args.get('min_consume', 10000, type=int)
+    trend = request.args.get('trend', 'all')
+    anchor = request.args.get('anchor', '')
+    page = request.args.get('page', 1, type=int)
+    size = request.args.get('size', 50, type=int)
+    try:
+        data = query_big_spenders(min_consume, trend, anchor, page, size)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/analytics/silent-whales')
+@require_auth
+def api_analytics_silent_whales():
+    threshold = request.args.get('threshold', 30000, type=int)
+    silent_days = request.args.get('silent_days', 7, type=int)
+    anchor = request.args.get('anchor', '')
+    try:
+        data = query_silent_whales(threshold, silent_days, anchor)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 def main():
     parser = argparse.ArgumentParser(description='弹幕后台管理面板')
     parser.add_argument('--host', default=_web_config['host'])
     parser.add_argument('--port', default=_web_config['port'], type=int)
     parser.add_argument('--debug', action='store_true')
-    parser.add_argument('--log-level', default='INFO',
-                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'BARRAGE'],
-                        help='Log level (default: INFO)')
     parser.add_argument('--auto-start', action='store_true',
                         help='Auto-start streamers that were enabled on last shutdown')
     args = parser.parse_args()
-    from base.output import setup_logger
-    setup_logger(log_dir='logs', log_level=args.log_level)
     os.makedirs(os.path.join(os.path.dirname(__file__), 'data'), exist_ok=True)
 
     # Seed streamer config from rooms.txt (one-time)

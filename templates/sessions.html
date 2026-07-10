@@ -116,7 +116,7 @@ function load() {
             });
             tbody.appendChild(tr);
         });
-        document.getElementById('summary').innerHTML = '总计 <span class="num">'+total+'</span> &#128994; 直播中 <span class="num live">'+live+'</span> &#128309; 已结束 <span class="num ended">'+(total-live)+'</span>';
+        document.getElementById('summary').innerHTML = '总计 <span class="num">'+total+'</span> <span class="dot-green" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--success);vertical-align:middle;"></span> 直播中 <span class="num live">'+live+'</span> <span class="dot-blue" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#3b82f6;vertical-align:middle;"></span> 已结束 <span class="num ended">'+(total-live)+'</span>';
         document.getElementById('tbl').style.display = 'table';
     }).catch(function(e){
         document.getElementById('loading').style.display = 'none';

@@ -48,52 +48,35 @@
 .stats-row {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-    gap: 12px;
+    gap: 16px;
     margin-bottom: 24px;
 }
 .stat-card {
-    --accent: var(--primary);
     background: var(--card);
-    border-radius: var(--radius);
-    padding: 16px 18px;
-    box-shadow: var(--shadow);
+    border-radius: 8px;
+    padding: 24px 22px;
     border: 1px solid var(--border);
-    border-left: 3px solid var(--accent);
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    transition: transform var(--transition-base), box-shadow var(--transition-base);
+    text-align: center;
+    transition: background var(--transition-base);
     cursor: default;
 }
 .stat-card:hover {
-    transform: translateY(-3px);
-    box-shadow: var(--shadow-lg);
+    background: var(--bg-soft);
 }
-.stat-icon {
-    width: 44px;
-    height: 44px;
-    border-radius: 10px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 20px;
-    flex-shrink: 0;
-}
-.stat-body { min-width: 0; }
-.stat-body .num {
-    font-size: 24px;
-    font-weight: 800;
+.stat-card .num {
+    font-size: 28px;
+    font-weight: 700;
     font-family: var(--font-mono);
-    line-height: 1.2;
+    line-height: 1.15;
     color: var(--text);
 }
-.stat-body .label {
+.stat-card .label {
     font-size: 11px;
-    color: var(--text-muted);
-    font-weight: 600;
+    color: var(--text-soft);
+    font-weight: 500;
     text-transform: uppercase;
-    letter-spacing: 0.04em;
-    margin-top: 2px;
+    letter-spacing: 0.06em;
+    margin-top: 6px;
 }
 
 /* Table header row */
@@ -117,18 +100,8 @@
 .card-live {
     position: relative;
     border-left: 3px solid var(--success);
-    background: linear-gradient(135deg, #f0fdf4, var(--card) 50%);
+    background: var(--card);
     overflow: hidden;
-}
-.card-live::after {
-    content: '';
-    position: absolute;
-    top: 0;
-    right: 0;
-    width: 140px;
-    height: 140px;
-    background: radial-gradient(circle, rgba(16,185,129,0.06) 0%, transparent 70%);
-    pointer-events: none;
 }
 .live-header {
     display: flex;
@@ -308,47 +281,39 @@
 
 <!-- Stats Row -->
 <div class="stats-row">
-    <div class="stat-card" style="--accent: #e11d48;">
-        <div class="stat-icon" style="background: #ffe4e6;">&#127873;</div>
-        <div class="stat-body">
-            <div class="num">{{ stats.total_gifts }}</div>
-            <div class="label">总礼物</div>
-        </div>
+    <div class="stat-card">
+        <div class="num">{{ stats.total_gifts }}</div>
+        <div class="label">总礼物</div>
     </div>
-    <div class="stat-card" style="--accent: #2563eb;">
-        <div class="stat-icon" style="background: #dbeafe;">&#128172;</div>
-        <div class="stat-body">
-            <div class="num">{{ stats.total_chats }}</div>
-            <div class="label">总弹幕</div>
-        </div>
+    <div class="stat-card">
+        <div class="num">{{ stats.total_chats }}</div>
+        <div class="label">总弹幕</div>
     </div>
-    <div class="stat-card" style="--accent: #d97706;">
-        <div class="stat-icon" style="background: #fef3c7;">&#128200;</div>
-        <div class="stat-body">
-            <div class="num">{{ stats.today_gifts }}</div>
-            <div class="label">今日礼物</div>
-        </div>
+    <div class="stat-card">
+        <div class="num">{{ stats.today_gifts }}</div>
+        <div class="label">今日礼物</div>
     </div>
-    <div class="stat-card" style="--accent: #059669;">
-        <div class="stat-icon" style="background: #d1fae5;">&#128173;</div>
-        <div class="stat-body">
-            <div class="num">{{ stats.today_chats }}</div>
-            <div class="label">今日弹幕</div>
-        </div>
+    <div class="stat-card">
+        <div class="num">{{ stats.today_chats }}</div>
+        <div class="label">今日弹幕</div>
     </div>
-    <div class="stat-card" style="--accent: #7c3aed;">
-        <div class="stat-icon" style="background: #ede9fe;">&#128101;</div>
-        <div class="stat-body">
-            <div class="num">{{ stats.today_users }}</div>
-            <div class="label">今日用户</div>
-        </div>
+    <div class="stat-card">
+        <div class="num">{{ stats.today_users }}</div>
+        <div class="label">今日用户</div>
     </div>
-    <div class="stat-card" style="--accent: #475569;">
-        <div class="stat-icon" style="background: #f1f5f9;">&#128203;</div>
-        <div class="stat-body">
-            <div class="num">{{ stats.total_sessions }}</div>
-            <div class="label">总场次</div>
-        </div>
+    <div class="stat-card">
+        <div class="num">{{ stats.total_sessions }}</div>
+        <div class="label">总场次</div>
+    </div>
+</div>
+
+<!-- Message Flow -->
+<div class="card" style="padding:8px 16px;margin-bottom:12px;">
+    <div style="font-family:monospace;font-size:13px;color:var(--text-dim);">
+        入队[C:{{ flow.chat_enqueued }} G:{{ flow.gift_enqueued }}]
+        落库[C:{{ flow.chat_written }} G:{{ flow.gift_written }}]
+        连击进度:{{ flow.combo_progress }}
+        缓冲中:{{ flow.combo_buf }}
     </div>
 </div>
 
@@ -412,11 +377,12 @@
                     <th style="width:44px;">#</th>
                     <th style="width:40px;"></th>
                     <th>用户</th>
+                    <th>接收主播</th>
                     <th>财富等级</th>
                     <th>粉丝团</th>
                     <th style="text-align:right;">贡献值</th>
-                    <th style="text-align:right;">&#127873;</th>
-                    <th style="text-align:right;">&#128172;</th>
+                    <th style="text-align:right;"><i class="ph ph-gift"></i></th>
+                    <th style="text-align:right;"><i class="ph ph-chats"></i></th>
                 </tr>
             </thead>
             <tbody>
@@ -441,6 +407,11 @@
                         {% endif %}
                     </td>
                     <td><a href="/user?uid={{ u.user_id }}" style="font-weight:600;">{{ u.user_name }}</a></td>
+                    <td>
+                        {% if u.top_recipient %}
+                        <span style="font-size:12px;color:var(--text-muted);">{{ u.top_recipient }}</span>
+                        {% endif %}
+                    </td>
                     <td>
                         {% if u.grade %}
                         <span class="grade-badge">{{ u.grade }}</span>
@@ -467,7 +438,7 @@
 {% else %}
 <div class="card">
     <div class="card-empty">
-        <div class="icon">&#127942;</div>
+        <div class="icon"><i class="ph ph-trophy"></i></div>
         <div>暂无贡献数据</div>
         <div class="hint">直播开始后，贡献者排行将在此显示</div>
     </div>
@@ -487,8 +458,8 @@
                     <th style="width:50px;">#</th>
                     <th>主播</th>
                     <th>开始时间</th>
-                    <th style="text-align:right;">&#127873;</th>
-                    <th style="text-align:right;">&#128172;</th>
+                    <th style="text-align:right;"><i class="ph ph-gift"></i></th>
+                    <th style="text-align:right;"><i class="ph ph-chats"></i></th>
                     <th style="width:90px;">状态</th>
                 </tr>
             </thead>
@@ -528,7 +499,7 @@
     </div>
     <div id="live-feed" style="max-height:400px;overflow-y:auto;">
         <div style="text-align:center;padding:24px;color:var(--text-soft);font-size:13px;">
-            <div style="font-size:24px;margin-bottom:6px;">&#128225;</div>
+            <div style="font-size:24px;margin-bottom:6px;"><i class="ph ph-bell-ringing"></i></div>
             <div>等待实时数据...</div>
             <div style="font-size:11px;margin-top:4px;">直播开始后，新消息将实时显示</div>
         </div>
@@ -536,7 +507,7 @@
 </div>
 
 <!-- DB Path -->
-<div class="db-footer">&#128193; {{ db_path }}</div>
+<div class="db-footer"><i class="ph ph-folder-open"></i> {{ db_path }}</div>
 
 <!-- SSE Live Feed -->
 <script>
@@ -562,7 +533,7 @@
         try {
             var d = JSON.parse(e.data);
             addEvent('<span style="color:var(--text-muted);">' + d.time.substring(0,8) + '</span> ' +
-                     '<span style="color:#06b6d4;">&#128172;</span> ' +
+                     '<span style="color:#06b6d4;"><i class="ph ph-chats"></i></span> ' +
                      '<a href="/user?uid=' + d.user_id + '" style="font-weight:600;">' +
                      (d.user_name || d.user_id) + '</a>: ' + (d.content || ''));
         } catch(ex) {}
@@ -571,7 +542,7 @@
         try {
             var d = JSON.parse(e.data);
             addEvent('<span style="color:var(--text-muted);">' + d.time.substring(0,8) + '</span> ' +
-                     '<span style="color:#f59e0b;">&#127873;</span> ' +
+                     '<span style="color:#f59e0b;"><i class="ph ph-gift"></i></span> ' +
                      '<a href="/user?uid=' + d.user_id + '" style="font-weight:600;">' +
                      (d.user_name || d.user_id) + '</a> 送出 <b>' + d.gift_name + '</b> x' + d.gift_count +
                      ' <span style="color:#e67e22;font-weight:600;">(' +
@@ -580,6 +551,7 @@
     });
     es.onerror = function() { /* auto-reconnect handled by EventSource */ };
 })();
+
 </script>
 
 {% if auto_refresh and auto_refresh > 0 %}

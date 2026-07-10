@@ -211,7 +211,12 @@ def load_cookies(cookie_file, script_dir=''):
     if is_netscape:
         for line in lines:
             line = line.strip()
-            if not line or line.startswith('#'):
+            if not line:
+                continue
+            # Handle #HttpOnly_ prefix (Netscape format for secure cookies)
+            if line.startswith('#HttpOnly_'):
+                line = line[len('#HttpOnly_'):]
+            elif line.startswith('#'):
                 continue
             parts = line.split('\t')
             if len(parts) >= 7:
@@ -408,7 +413,7 @@ def fmt_fans_club(user):
         host = _get_anchor_name()
 
         def _fmt(name, level):
-            return f"[粉丝团:{name} Lv{level}]"
+            return f"{name} Lv{level}"
 
         # 收集所有粉丝团（去重，保留最高等级）
         seen = {}  # club_name → fmt_string
@@ -447,6 +452,20 @@ def fmt_fans_club(user):
     return ''
 
 
+def get_fans_club_anchor_id(user):
+    """Extract the anchor_id from the user's primary fans club data.
+
+    Returns the streamer's user ID string, or empty string if no fans club.
+    """
+    try:
+        data = user.fans_club.data
+        if data and data.anchor_id:
+            return str(data.anchor_id)
+    except (AttributeError, TypeError):
+        pass
+    return ''
+
+
 def fmt_grade(user):
     """格式化用户的消费等级为显示字符串。
 
@@ -461,9 +480,6 @@ def fmt_grade(user):
             return f"[等级{user.pay_grade.level}]"
     except (AttributeError, TypeError):
         pass
-    return ''
-
-
 def safe_time(ts):
     """安全地将 Unix 时间戳格式化为 'HH:MM:SS'。
 
@@ -628,3 +644,150 @@ def get_user_avatar_url(user):
     except (AttributeError, TypeError):
         pass
     return ''
+
+
+def get_badge_urls(user):
+    """Extract ALL badge image URLs from user's badge_image_list.
+
+    Returns a JSON array string with url, name, level for each badge.
+    Covers: pay grade, league, membership V, fans club, and any other badges.
+    """
+    import json as _json
+    badges = []
+    try:
+        pb_badges = getattr(user, 'badge_image_list', None)
+        if pb_badges:
+            for b in pb_badges:
+                if not b or not b.url_list_list:
+                    continue
+                entry = {'url': b.url_list_list[0]}
+                # Extract content metadata (name, font_color, level, alt text)
+                if hasattr(b, 'content') and b.content:
+                    c = b.content
+                    if getattr(c, 'name', None):
+                        entry['name'] = c.name
+                    if getattr(c, 'font_color', None):
+                        entry['font_color'] = c.font_color
+                    if getattr(c, 'level', 0) > 0:
+                        entry['level'] = c.level
+                    if getattr(c, 'alternative_text', None):
+                        entry['alt'] = c.alternative_text
+                badges.append(entry)
+
+        # Also extract from pay_grade sub-fields — includes league/recent_consume_badge
+        # and new_im_icon_with_level / new_live_icon
+        if user.pay_grade:
+            pg = user.pay_grade
+            for attr in ('new_im_icon_with_level', 'new_live_icon', 'recent_consume_badge'):
+                icon = getattr(pg, attr, None)
+                if icon and icon.url_list_list and icon.url_list_list[0]:
+                    entry = {'url': icon.url_list_list[0]}
+                    if hasattr(icon, 'content') and icon.content:
+                        c = icon.content
+                        if getattr(c, 'alternative_text', None):
+                            entry['alt'] = c.alternative_text
+                    badges.append(entry)
+
+        # Fans club badge from UserBadge.icons
+        if user.fans_club and user.fans_club.data and user.fans_club.data.badge:
+            icons = user.fans_club.data.badge.icons
+            if hasattr(icons, 'values'):
+                for icon in icons.values():
+                    if icon and icon.url_list_list and icon.url_list_list[0]:
+                        entry = {'url': icon.url_list_list[0]}
+                        fc_name = getattr(user.fans_club.data, 'club_name', '')
+                        if fc_name:
+                            entry['name'] = fc_name
+                        if hasattr(icon, 'content') and icon.content:
+                            c = icon.content
+                            if getattr(c, 'name', None):
+                                entry['name'] = c.name
+                            if getattr(c, 'font_color', None):
+                                entry['font_color'] = c.font_color
+                            if getattr(c, 'level', 0) > 0:
+                                entry['level'] = c.level
+                        badges.append(entry)
+    except Exception:
+        pass
+    return _json.dumps(badges, ensure_ascii=False)
+
+
+def make_badge_fallback(grade_text="", fans_club_text=""):
+    """Construct synthetic badge URLs from grade/fans_club text for historical records
+    that didn't capture the full badge_image_list from the websocket protobuf.
+
+    Generates URLs for:
+      - 荣誉等级 (pay grade / level badge)   e.g. [等级43]
+      - 消费等级图标                          e.g. aweme_pay_grade_2x_40_44
+      - 粉丝团 (fans club badge)             e.g. 逸楠💫 Lv20
+
+    This is a best-effort fallback — the real badge_image_list from the protobuf
+    is always richer (includes league icons, membership V, super badges, etc).
+    """
+    import json as _json, re as _re
+    badges = []
+
+    # Extract level number from grade like "[等级43]"
+    if grade_text:
+        m = _re.search(r'等级(\d+)', grade_text)
+        if m:
+            level = int(m.group(1))
+            # Shining level badge (new_shining_level — the main honor badge)
+            badges.append({
+                'url': f'https://p3-webcast.douyinpic.com/img/webcast/new_shining_level_{level}.webp~tplv-obj.image',
+                'level': level,
+                'alt': f'荣誉等级{level}级勋章',
+            })
+            # League icon is ONLY from real Douyin data (pay_grade.recent_consume_badge).
+            # For fallback records without websocket data, do NOT generate it — the
+            # actual league level per-user is unknown.
+
+            # Membership V badge — monthly by default, yearly if text contains 年度
+            is_yearly = grade_text and '年度' in grade_text
+            membership_url = 'https://p11-webcast.douyinpic.com/img/webcast/31231321Vnian.png~tplv-obj.image' if is_yearly else 'https://p3-webcast.douyinpic.com/img/webcast/1231241211V.png~tplv-obj.image'
+            badges.append({
+                'url': membership_url,
+                'alt': '年度会员' if is_yearly else '会员',
+            })
+
+    # Extract fans club name + level from text like "逸楠💫 Lv20" or "[粉丝团:香奈儿 Lv20]"
+    if fans_club_text:
+        m = _re.search(r'(?:\[?粉丝团:)?([^\]]+?)\s+Lv(\d+)\]?', fans_club_text)
+        if m:
+            club_name = m.group(1).strip()
+            level = m.group(2)
+            # only keep the _xmp overlay badge (represents fansclub visually)
+            badges.append({
+                'url': f'https://p3-webcast.douyinpic.com/img/webcast/fansclub_new_advanced_badge_{level}_xmp.png~tplv-obj.image',
+                'name': club_name,
+                'level': int(level),
+            })
+    return _json.dumps(badges, ensure_ascii=False)
+
+
+def _merge_badges(existing_json, grade_text='', fans_club_text=''):
+    """Augment existing badge_url JSON with missing badges (league, membership V)
+    that the websocket protobuf often omits. Returns JSON string or None if no merge needed."""
+    import json as _json, re as _re
+    try:
+        existing = _json.loads(existing_json) if isinstance(existing_json, str) else existing_json
+        if not isinstance(existing, list):
+            return None
+    except Exception:
+        return None
+    existing_urls = set()
+    for b in existing:
+        if b.get('url'):
+            existing_urls.add(b['url'].split('~tplv')[0])
+    added = False
+    if grade_text:
+        m = _re.search(r'等级(\d+)', grade_text)
+        if m:
+            level = int(m.group(1))
+            # League icon is ONLY from real Douyin data. Skip here.
+            pass
+    v_url = 'https://p3-webcast.douyinpic.com/img/webcast/1231241211V.png~tplv-obj.image'
+    if v_url.split('~tplv')[0] not in existing_urls:
+        existing.append({'url': v_url, 'alt': '会员'})
+        added = True
+    return _json.dumps(existing, ensure_ascii=False) if added else None

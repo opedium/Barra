@@ -245,7 +245,7 @@
         <div class="table-wrap">
             <table>
                 <thead>
-                    <tr><th>时间</th><th>主播</th><th>礼物</th><th>数量</th><th>钻石</th></tr>
+                    <tr><th>时间</th><th>主播</th><th>礼物</th><th>数量</th><th>钻石</th><th>财富等级</th><th>粉丝团</th></tr>
                 </thead>
                 <tbody id="gift-table-body"></tbody>
             </table>
@@ -368,6 +368,52 @@ document.querySelectorAll('.tab-btn').forEach(function(btn) {
 });
 
 var currentFilter = 'all';
+
+/**
+ * Parse badge JSON array and render <img> tags for each badge.
+ * badge_json is a JSON array of {url, name?, level?, alt?, font_color?}.
+ * Also handles legacy badge_img_list (array of base64-encoded PNGs).
+ */
+function renderBadges(badge_json) {
+    if (!badge_json) return '';
+    try {
+        var arr = typeof badge_json === 'string' ? JSON.parse(badge_json) : badge_json;
+        if (!Array.isArray(arr)) return '';
+        var hasStarGuard = arr.some(function(b) { return b.url && b.url.indexOf('star_guard') !== -1; });
+        var seen = {};
+        return arr.filter(function(b) {
+            if (!b || !b.url) return false;
+            // Dedup by base URL
+            var baseKey = b.url.split('~tplv')[0];
+            if (seen[baseKey]) return false;
+            seen[baseKey] = true;
+            // Keep: level badge, league icon, membership V, star_guard, or fansclub _xmp overlay
+            var isLevel = b.url.indexOf('new_shining_level') !== -1 || b.url.indexOf('new_user_grade_level') !== -1;
+            var isLeague = b.url.indexOf('league') !== -1;
+            var isMembershipV = b.url.indexOf('1231241211V') !== -1;
+            var isStarGuard = b.url.indexOf('star_guard') !== -1;
+            var isFansclubXmp = b.url.indexOf('fansclub') !== -1 && b.url.indexOf('_xmp') !== -1;
+            var isFansclubBase = b.url.indexOf('fansclub_level_v6_') !== -1 && b.url.indexOf('_xmp') === -1;
+            // Skip base fansclub image
+            if (isFansclubBase) return false;
+            // When star_guard present, skip regular fansclub _xmp
+            if (hasStarGuard && isFansclubXmp) return false;
+            return isLevel || isLeague || isMembershipV || isStarGuard || isFansclubXmp;
+        }).map(function(b) {
+            var title = '';
+            if (b.name) title += b.name;
+            if (b.level) title += (title ? ' ' : '') + 'Lv' + b.level;
+            if (b.alt && !b.name) title = b.alt;
+            return '<img src="' + b.url + '" alt="' + (b.alt || '') + '" title="' + title + '" ' +
+                   'style="height:16px;width:auto;object-fit:contain;border-radius:2px;">';
+        }).join('');
+    } catch(e) {
+        if (typeof badge_json === 'string' && badge_json.startsWith('[') && badge_json.includes('http')) {
+            try { return renderBadges(JSON.parse(badge_json)); } catch(e2) {}
+        }
+        return '';
+    }
+}
 function filterTimeline(type) {
     if (!allData) return;
     currentFilter = type;
@@ -452,10 +498,39 @@ function loadUser() {
                         metaEl.appendChild(cb);
                     });
                 } else {
-                    var cb = document.createElement('span');
-                    cb.className = 'badge badge-amber';
-                    cb.textContent = data.fans_club;
-                    metaEl.appendChild(cb);
+                    // Support multiple clubs: "香奈儿 Lv20 迅猛龙 特蕾莎 Lv16"
+                    // Each club ends with " LvN", followed by space or end
+                    var clubsArr = [];
+                    var re = /(.+? Lv\d+)\s*/g;
+                    var m;
+                    while ((m = re.exec(data.fans_club)) !== null) {
+                        if (m[1]) clubsArr.push(m[1]);
+                    }
+                    if (clubsArr.length > 1) {
+                        clubsArr.forEach(function(p) {
+                            p = p.trim();
+                            if (p) {
+                                var cb = document.createElement('span');
+                                cb.className = 'badge badge-amber';
+                                cb.textContent = p;
+                                metaEl.appendChild(cb);
+                            }
+                        });
+                    } else {
+                        // Single club display
+                        var m = data.fans_club.match(/^(.+?)\s+Lv(\d+)$/);
+                        if (m) {
+                            var cb = document.createElement('span');
+                            cb.className = 'badge badge-amber';
+                            cb.textContent = m[1].trim() + ' Lv' + m[2];
+                            metaEl.appendChild(cb);
+                        } else {
+                            var cb = document.createElement('span');
+                            cb.className = 'badge badge-amber';
+                            cb.textContent = data.fans_club;
+                            metaEl.appendChild(cb);
+                        }
+                    }
                 }
             } else {
                 var noClub = document.createElement('span');
@@ -559,10 +634,13 @@ function renderSessions(data) {
                 var row = document.createElement('div');
                 row.style.cssText = 'padding:4px 0;display:flex;gap:10px;align-items:center;';
                 row.innerHTML =
-                    '<span style="color:var(--text-muted);min-width:70px;font-size:12px;">' + timeStr + '</span>' +
-                    '<span>' + icon + '</span>' +
-                    '<span style="flex:1;">' + t.content + anchorStr + '</span>' +
-                    (amt ? '<span style="color:#e67e22;margin-left:auto;font-weight:600;font-size:12px;">' + amt + '</span>' : '');
+                    '<span style="color:var(--text-muted);flex-shrink:0;width:70px;font-size:12px;">' + timeStr + '</span>' +
+                    '<span style="flex-shrink:0;">' + icon + '</span>' +
+                    '<span style="flex-shrink:0;display:flex;gap:4px;align-items:center;height:20px;">' +
+                        (t.badge_url ? renderBadges(t.badge_url) : '') +
+                    '</span>' +
+                    '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;">' + t.content + anchorStr + '</span>' +
+                    (amt ? '<span style="color:#e67e22;flex-shrink:0;font-weight:600;font-size:12px;">' + amt + '</span>' : '');
                 body.appendChild(row);
             });
             if (count === 0) {
@@ -593,14 +671,14 @@ function loadGifts() {
         })
         .catch(function(err) {
             document.getElementById('gift-table-body').innerHTML =
-                '<tr><td colspan="5" style="text-align:center;padding:30px;color:var(--danger);">加载失败</td></tr>';
+                '<tr><td colspan="7" style="text-align:center;padding:30px;color:var(--danger);">加载失败</td></tr>';
         });
 }
 
 function renderGifts(gifts) {
     var tbody = document.getElementById('gift-table-body');
     if (!gifts || gifts.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px;color:var(--text-muted);">暂无</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px;color:var(--text-muted);">暂无</td></tr>';
         return;
     }
     gifts.forEach(function(g) {
@@ -611,7 +689,9 @@ function renderGifts(gifts) {
             '<td>' + (g.anchor_name || '') + '</td>' +
             '<td>' + (g.gift_name || '') + '</td>' +
             '<td>' + (g.gift_count || 0) + '</td>' +
-            '<td>' + (g.diamond_total || 0) + '</td>';
+            '<td>' + (g.diamond_total || 0) + '</td>' +
+            '<td style="font-size:11px;color:var(--text-muted);">' + (g.grade || '') + '</td>' +
+            '<td style="font-size:11px;color:var(--text-muted);">' + (g.fans_club || '') + '</td>';
         tbody.appendChild(tr);
     });
 }
@@ -632,14 +712,14 @@ function loadChats(page) {
         })
         .catch(function(err) {
             document.getElementById('chat-table-body').innerHTML =
-                '<tr><td colspan="5" style="text-align:center;padding:30px;color:var(--danger);">加载失败</td></tr>';
+                '<tr><td colspan="7" style="text-align:center;padding:30px;color:var(--danger);">加载失败</td></tr>';
         });
 }
 
 function renderChats(data) {
     var tbody = document.getElementById('chat-table-body');
     if (!data.chats || data.chats.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px;color:var(--text-muted);">暂无弹幕记录</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px;color:var(--text-muted);">暂无弹幕记录</td></tr>';
         return;
     }
     tbody.innerHTML = '';

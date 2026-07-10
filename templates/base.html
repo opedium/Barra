@@ -149,6 +149,38 @@
             background: var(--primary);
             box-shadow: 0 0 8px rgba(99,102,241,0.7);
         }
+
+        /* ── Nav dropdown ── */
+        .nav-dropdown {
+            position: relative;
+            display: inline-flex;
+        }
+        .nav-dropdown > a {
+            cursor: default;
+        }
+        .nav-dropdown-content {
+            display: none;
+            position: absolute;
+            top: 100%;
+            left: 0;
+            min-width: 100px;
+            background: var(--nav-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 4px 0;
+            z-index: 100;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+        }
+        .nav-dropdown-content a {
+            display: block;
+            padding: 8px 16px;
+            font-size: 13px;
+            white-space: nowrap;
+        }
+        .nav-dropdown:hover .nav-dropdown-content {
+            display: block;
+        }
+
         .nav-search {
             margin-left: auto;
             display: flex;
@@ -844,6 +876,24 @@
                 width: 5px;
                 height: 5px;
             }
+            .nav-dropdown {
+                width: 100%;
+                flex-direction: column;
+            }
+            .nav-dropdown-content {
+                position: static;
+                display: flex;
+                flex-direction: column;
+                box-shadow: none;
+                border: none;
+                border-radius: 0;
+                padding: 0 0 0 16px;
+                background: transparent;
+            }
+            .nav-dropdown-content a {
+                font-size: 14px;
+                padding: 8px 12px;
+            }
             .nav-toggle { display: block; }
             .nav-search { margin-left: 0; width: 100%; }
             .nav-search input { flex: 1; width: auto; }
@@ -956,12 +1006,23 @@
         <div class="nav-links">
             <a href="/" class="{% if request.path == '/' %}active{% endif %}">仪表盘</a>
             <a href="/leaderboard" class="{% if request.path == '/leaderboard' %}active{% endif %}">积分榜</a>
-            <a href="/chat" class="{% if request.path == '/chat' %}active{% endif %}">弹幕</a>
-            <a href="/anonymous" class="{% if request.path == '/anonymous' %}active{% endif %}">神秘人</a>
+            <div class="nav-dropdown">
+                <a class="{% if request.path in ['/chat','/anonymous','/upgrades'] %}active{% endif %}">用户 &#9662;</a>
+                <div class="nav-dropdown-content">
+                    <a href="/chat">弹幕</a>
+                    <a href="/anonymous">神秘人</a>
+                    <a href="/upgrades">升级</a>
+                </div>
+            </div>
             <a href="/sessions" class="{% if request.path == '/sessions' %}active{% endif %}">场次</a>
             <a href="/compare" class="{% if request.path == '/compare' %}active{% endif %}">对比</a>
-            <a href="/upgrades" class="{% if request.path == '/upgrades' %}active{% endif %}">升级</a>
-            <a href="/audit" class="{% if request.path == '/audit' or request.path.startswith('/audit/') %}active{% endif %}">审计</a>
+            <div class="nav-dropdown">
+                <a class="{% if request.path in ['/audit','/gift-prices'] %}active{% endif %}">审计 &#9662;</a>
+                <div class="nav-dropdown-content">
+                    <a href="/audit">诊断</a>
+                    <a href="/gift-prices">礼物价格</a>
+                </div>
+            </div>
             <a href="/settings" class="{% if request.path == '/settings' %}active{% endif %}">设置</a>
             {% if auth_enabled %}<a href="/logout" style="color:#f87171;">&#10149; 登出</a>{% endif %}
         </div>
@@ -1176,9 +1237,18 @@
 
         /* ── Close mobile nav on link click ── */
         document.querySelectorAll('.nav-links a').forEach(function(a) {
+            if (!a.getAttribute('href')) return;
             a.addEventListener('click', function() {
                 var navLinks = document.querySelector('.nav-links');
                 if (navLinks) navLinks.classList.remove('open');
+            });
+        });
+        document.querySelectorAll('.nav-dropdown > a').forEach(function(a) {
+            a.addEventListener('click', function(e) {
+                var content = this.nextElementSibling;
+                if (content && content.classList.contains('nav-dropdown-content')) {
+                    content.style.display = content.style.display === 'block' ? '' : 'block';
+                }
             });
         });
 

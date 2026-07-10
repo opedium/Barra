@@ -1,0 +1,646 @@
+{% extends "base.html" %}
+{% block title %}用户分析{% endblock %}
+{% block content %}
+<style>
+/* ════════════════════════════════════════════════
+   Analytics Page Styles
+   ════════════════════════════════════════════════ */
+
+/* Tab navigation */
+.analytics-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 2px solid var(--border);
+    margin-bottom: 16px;
+}
+.analytics-tab {
+    padding: 10px 20px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-muted);
+    border-bottom: 2px solid transparent;
+    margin-bottom: -2px;
+    transition: all var(--transition-fast);
+    user-select: none;
+}
+.analytics-tab:hover { color: var(--text); }
+.analytics-tab.active { color: var(--primary); border-bottom-color: var(--primary); }
+
+/* Tab content */
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+/* Chart containers */
+.chart-container {
+    position: relative;
+    width: 100%;
+    height: 320px;
+    margin: 10px 0;
+}
+
+/* Silent whale cards */
+.silent-whale-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    background: var(--danger-bg);
+    border-radius: var(--radius);
+    margin-bottom: 8px;
+    border-left: 4px solid var(--danger);
+    cursor: pointer;
+    transition: transform var(--transition-fast);
+}
+.silent-whale-card:hover { transform: translateX(4px); }
+
+/* Filter bar helpers (shared with leaderboard) */
+.filter-divider {
+    display: inline-block; width: 1px; height: 22px;
+    background: var(--border); flex-shrink: 0;
+}
+.threshold-label {
+    font-size: 12px; color: var(--text-muted);
+    font-weight: 500; white-space: nowrap;
+}
+
+.silent-whale-card .sw-avatar {
+    width: 36px; height: 36px; border-radius: 50%;
+    background: var(--danger);
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-weight: 700; font-size: 14px;
+    flex-shrink: 0; overflow: hidden;
+}
+.silent-whale-card .sw-avatar img {
+    width: 100%; height: 100%; object-fit: cover;
+}
+.silent-whale-card .sw-info { flex: 1; min-width: 0; }
+.silent-whale-card .sw-name { font-weight: 600; font-size: 13px; }
+.silent-whale-card .sw-meta { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+.silent-whale-card .sw-amount { font-weight: 700; font-size: 14px; color: var(--danger); }
+
+/* Trend badge */
+.trend-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 11px; font-weight: 700;
+}
+.trend-badge.accelerating { background: var(--success-bg); color: #065f46; }
+.trend-badge.stable { background: #fef3c7; color: #92400e; }
+.trend-badge.decelerating { background: var(--danger-bg); color: #be123c; }
+.trend-badge.insufficient_data { background: #f1f5f9; color: #64748b; }
+
+/* Metric cards */
+.stats-row.analytics-stats {
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+}
+</style>
+
+<div class="card">
+    <!-- Tab Navigation -->
+    <div class="analytics-tabs">
+        <div class="analytics-tab active" data-tab="retention" onclick="switchTab('retention')"><i class="ph ph-chart-bar"></i> 留存漏斗</div>
+        <div class="analytics-tab" data-tab="spenders" onclick="switchTab('spenders')"><i class="ph ph-crown"></i> 大R识别</div>
+    </div>
+
+    <!-- Global Filter Bar -->
+    <div class="filter-bar" style="margin-bottom:16px;">
+        <span class="threshold-label">主播</span>
+        <select id="anchor-select" onchange="onFilterChange()" style="max-width:150px;">
+            <option value="">全部主播</option>
+        </select>
+
+        <span class="filter-divider"></span>
+        <span class="threshold-label">时间范围</span>
+        <select id="period-select" onchange="onFilterChange()">
+            <option value="7d">近7天</option>
+            <option value="30d" selected>近30天</option>
+            <option value="90d">近90天</option>
+            <option value="all">全部</option>
+        </select>
+
+        <span class="filter-divider"></span>
+        <span class="threshold-label">消费层级</span>
+        <select id="tier-select" onchange="onFilterChange()">
+            <option value="0">全部</option>
+            <option value="1000">1000+</option>
+            <option value="3000">3000+</option>
+            <option value="10000">10000+</option>
+            <option value="100000">100000+</option>
+        </select>
+
+        <button onclick="loadCurrentTab()">&#x27F3; 刷新</button>
+    </div>
+
+    <!-- ════════ Tab: Retention Funnel ════════ -->
+    <div id="tab-retention" class="tab-content active">
+        <div class="loading" id="retention-loading">
+            <div class="spinner"></div>
+            <div class="msg">加载留存数据...</div>
+        </div>
+        <div id="retention-content" style="display:none;">
+            <div class="stats-row analytics-stats" id="retention-stats"></div>
+            <div class="card" style="margin-top:16px;">
+                <h2><i class="ph ph-chart-line"></i> 留存曲线</h2>
+                <div class="chart-container">
+                    <canvas id="retention-chart"></canvas>
+                </div>
+            </div>
+            <div class="card" style="margin-top:16px;">
+                <h2><i class="ph ph-clipboard-text"></i> 详细数据</h2>
+                <div class="table-wrap" id="retention-table-wrap">
+                    <div class="empty-state"><div class="icon"><i class="ph ph-chart-bar"></i></div>加载中...</div>
+                </div>
+                <div class="pagination" id="retention-pagination"></div>
+            </div>
+        </div>
+        <div class="empty-state" id="retention-empty" style="display:none;">
+            <div class="icon"><i class="ph ph-chart-bar"></i></div>
+            <div>暂无足够数据</div>
+            <div class="hint">至少需要 2 场直播才能计算留存率</div>
+        </div>
+    </div>
+
+    <!-- ════════ Tab: Big Spenders ════════ -->
+    <div id="tab-spenders" class="tab-content">
+        <div class="loading" id="spenders-loading">
+            <div class="spinner"></div>
+            <div class="msg">加载大R数据...</div>
+        </div>
+        <div id="spenders-content" style="display:none;">
+            <div class="card">
+                <h2><i class="ph ph-trophy"></i> 用户终身价值排行</h2>
+                <div class="chart-container" style="height:420px;">
+                    <canvas id="spender-chart"></canvas>
+                </div>
+            </div>
+            <div class="card" style="margin-top:16px;">
+                <h2><i class="ph ph-clipboard-text"></i> 大R明细</h2>
+                <div class="filter-bar">
+                    <span class="threshold-label">最低消费</span>
+                    <input type="number" id="spender-min-consume" value="10000" style="width:100px;"
+                           onchange="loadSpenders()">
+                    <span class="filter-divider"></span>
+                    <span class="threshold-label">趋势</span>
+                    <select id="spender-trend" onchange="loadSpenders()">
+                        <option value="all">全部</option>
+                        <option value="accelerating"><i class="ph ph-rocket"></i> 加速中</option>
+                        <option value="stable"><i class="ph ph-arrow-right"></i> 稳定</option>
+                        <option value="decelerating"><i class="ph ph-trend-down"></i> 减速中</option>
+                    </select>
+                    <button onclick="loadSpenders()">&#x27F3; 刷新</button>
+                </div>
+                <div class="table-wrap" id="spender-table-wrap">
+                    <div class="empty-state"><div class="icon"><i class="ph ph-crown"></i></div>加载中...</div>
+                </div>
+                <div class="pagination" id="spender-pagination"></div>
+            </div>
+            <div class="card" style="margin-top:16px;" id="silent-whales-card">
+                <h2><i class="ph ph-bell-slash"></i> 沉默大R预警</h2>
+                <div id="silent-whales-list">
+                    <div class="loading" style="padding:20px;">
+                        <div class="spinner-ring"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="empty-state" id="spenders-empty" style="display:none;">
+            <div class="icon"><i class="ph ph-crown"></i></div>
+            <div>暂无大R数据</div>
+            <div class="hint">调整最低消费阈值或确认有送礼记录</div>
+        </div>
+    </div>
+</div>
+
+<script>
+/* ════════════════════════════════════════════════════
+   Analytics Page JavaScript
+   ════════════════════════════════════════════════════ */
+var currentTab = 'retention';
+
+/* ── Tab switching ── */
+function switchTab(tab) {
+    currentTab = tab;
+    document.querySelectorAll('.analytics-tab').forEach(function(el) {
+        el.classList.toggle('active', el.dataset.tab === tab);
+    });
+    document.querySelectorAll('.tab-content').forEach(function(el) {
+        el.classList.toggle('active', el.id === 'tab-' + tab);
+    });
+    loadCurrentTab();
+}
+
+/* ── Filter helpers ── */
+function getFilters() {
+    return {
+        anchor: document.getElementById('anchor-select').value,
+        period: document.getElementById('period-select').value,
+        tier: parseInt(document.getElementById('tier-select').value) || 0,
+    };
+}
+
+function onFilterChange() {
+    loadCurrentTab();
+}
+
+function loadCurrentTab() {
+    if (currentTab === 'retention') loadRetention();
+    else loadSpenders();
+}
+
+/* ── Streamer dropdown ── */
+function loadStreamers() {
+    fetch('/api/leaderboard/streamers')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            var sel = document.getElementById('anchor-select');
+            var streamers = data.streamers || data || [];
+            streamers.forEach(function(s) {
+                var opt = document.createElement('option');
+                opt.value = s.anchor_name || s;
+                opt.textContent = s.anchor_name || s;
+                sel.appendChild(opt);
+            });
+            // auto-select first streamer if available
+            if (streamers.length > 0) {
+                sel.value = streamers[0].anchor_name || streamers[0];
+            }
+            loadRetention();
+        })
+        .catch(function() {
+            loadRetention();
+        });
+}
+
+/* ════════════════════════════════════════════════════
+   RETENTION FUNNEL
+   ════════════════════════════════════════════════════ */
+var retentionChart = null;
+
+function loadRetention() {
+    var f = getFilters();
+    var url = '/api/analytics/retention?anchor=' + encodeURIComponent(f.anchor)
+        + '&period=' + f.period + '&tier=' + f.tier + '&page=1&size=20';
+
+    document.getElementById('retention-loading').style.display = 'flex';
+    document.getElementById('retention-content').style.display = 'none';
+    document.getElementById('retention-empty').style.display = 'none';
+
+    fetch(url)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            document.getElementById('retention-loading').style.display = 'none';
+            if (data.error || !data.summary || !data.summary.total_active_users) {
+                document.getElementById('retention-empty').style.display = 'block';
+                if (data.error) {
+                    document.querySelector('#retention-empty .hint').textContent = data.error;
+                }
+                return;
+            }
+            document.getElementById('retention-content').style.display = 'block';
+            renderRetentionStats(data.summary);
+            renderRetentionChart(data.retention_curve);
+            renderRetentionTable(data);
+        })
+        .catch(function(err) {
+            document.getElementById('retention-loading').style.display = 'none';
+            document.getElementById('retention-empty').style.display = 'block';
+            document.querySelector('#retention-empty .hint').textContent = '加载失败: ' + err.message;
+        });
+}
+
+function renderRetentionStats(summary) {
+    var html = '';
+    var cards = [
+        {label: '总活跃用户', num: summary.total_active_users.toLocaleString(), color: '#6366f1'},
+        {label: '首场用户数', num: summary.first_session_users.toLocaleString(), color: '#06b6d4'},
+        {label: '整体留存率 (第2场)', num: summary.overall_retention_rate + '%', color: '#10b981'},
+    ];
+    cards.forEach(function(c) {
+        html += '<div class="stat-card" style="border-left-color:' + c.color + ';">'
+            + '<div class="num">' + c.num + '</div>'
+            + '<div class="label">' + c.label + '</div></div>';
+    });
+    document.getElementById('retention-stats').innerHTML = html;
+}
+
+function renderRetentionChart(curve) {
+    if (retentionChart) retentionChart.destroy();
+    if (!curve || !curve.series || curve.series.length === 0) return;
+
+    var datasets = curve.series.map(function(s) {
+        return {
+            label: s.name,
+            data: s.data,
+            borderColor: s.color,
+            backgroundColor: s.color + '20',
+            borderWidth: 2,
+            pointRadius: 4,
+            pointHoverRadius: 6,
+            tension: 0.2,
+            fill: false,
+        };
+    });
+
+    var ctx = document.getElementById('retention-chart').getContext('2d');
+    retentionChart = new Chart(ctx, {
+        type: 'line',
+        data: { labels: curve.labels, datasets: datasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { intersect: false, mode: 'index' },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    max: 100,
+                    ticks: { callback: function(v) { return v + '%'; } },
+                    grid: { color: 'var(--border-light)' },
+                },
+                x: { grid: { display: false } },
+            },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: { usePointStyle: true, padding: 16, font: { size: 12 } },
+                },
+                tooltip: {
+                    callbacks: {
+                        label: function(ctx) {
+                            return ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(1) + '%';
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+function renderRetentionTable(data) {
+    var html = '';
+    if (!data.details || data.details.length === 0) {
+        html = '<div class="empty-state"><div class="icon"><i class="ph ph-clipboard-text"></i></div>暂无详细数据</div>';
+        document.getElementById('retention-table-wrap').innerHTML = html;
+        document.getElementById('retention-pagination').innerHTML = '';
+        return;
+    }
+    html = '<table><thead><tr>'
+        + '<th>首场日期</th><th>主播</th><th>首场人数</th>'
+        + '<th>回流第2场</th><th>回流第5场</th><th>总消费</th>'
+        + '</tr></thead><tbody>';
+    data.details.forEach(function(r) {
+        html += '<tr>'
+            + '<td>' + (r.first_date || '-') + '</td>'
+            + '<td>' + (r.anchor || '-') + '</td>'
+            + '<td>' + r.first_users + '</td>'
+            + '<td>' + r.retained_2 + ' (' + (r.retained_2_rate || 0).toFixed(1) + '%)</td>'
+            + '<td>' + r.retained_5 + ' (' + (r.retained_5_rate || 0).toFixed(1) + '%)</td>'
+            + '<td>' + (r.total_consume || 0).toLocaleString() + '</td>'
+            + '</tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById('retention-table-wrap').innerHTML = html;
+
+    // pagination
+    var total = data.total || 0;
+    var page = data.page || 1;
+    var size = 20;
+    var totalPages = Math.ceil(total / size);
+    if (totalPages <= 1) {
+        document.getElementById('retention-pagination').innerHTML = '';
+        return;
+    }
+    var phtml = '<span>共 ' + total + ' 条</span>';
+    for (var i = 1; i <= totalPages && i <= 10; i++) {
+        phtml += '<a href="#" class="' + (i === page ? 'active' : '') + '" onclick="return loadRetentionPage(' + i + ')">' + i + '</a>';
+    }
+    document.getElementById('retention-pagination').innerHTML = phtml;
+}
+
+function loadRetentionPage(p) {
+    var f = getFilters();
+    var url = '/api/analytics/retention?anchor=' + encodeURIComponent(f.anchor)
+        + '&period=' + f.period + '&tier=' + f.tier + '&page=' + p + '&size=20';
+    fetch(url)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (data.retention_curve) renderRetentionChart(data.retention_curve);
+            renderRetentionTable(data);
+        })
+        .catch(function(err) { showToast('加载失败: ' + err.message, 'error'); });
+    return false;
+}
+
+/* ════════════════════════════════════════════════════
+   BIG SPENDERS
+   ════════════════════════════════════════════════════ */
+var spenderChart = null;
+
+function loadSpenders() {
+    var f = getFilters();
+    var minConsume = document.getElementById('spender-min-consume').value || 10000;
+    var trend = document.getElementById('spender-trend').value;
+    var url = '/api/analytics/big-spenders?min_consume=' + minConsume
+        + '&trend=' + trend
+        + '&anchor=' + encodeURIComponent(f.anchor)
+        + '&page=1&size=50';
+
+    document.getElementById('spenders-loading').style.display = 'flex';
+    document.getElementById('spenders-content').style.display = 'none';
+    document.getElementById('spenders-empty').style.display = 'none';
+
+    fetch(url)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            document.getElementById('spenders-loading').style.display = 'none';
+            if (data.error || !data.users || data.users.length === 0) {
+                document.getElementById('spenders-empty').style.display = 'block';
+                if (data.error) {
+                    document.querySelector('#spenders-empty .hint').textContent = data.error;
+                }
+                return;
+            }
+            document.getElementById('spenders-content').style.display = 'block';
+            renderSpenderChart(data.users);
+            renderSpenderTable(data);
+            loadSilentWhales();
+        })
+        .catch(function(err) {
+            document.getElementById('spenders-loading').style.display = 'none';
+            document.getElementById('spenders-empty').style.display = 'block';
+            document.querySelector('#spenders-empty .hint').textContent = '加载失败: ' + err.message;
+        });
+}
+
+function renderSpenderChart(users) {
+    if (spenderChart) spenderChart.destroy();
+
+    var labels = users.slice(0, 20).map(function(u) { return u.user_name; }).reverse();
+    var values = users.slice(0, 20).map(function(u) { return u.total_consume; }).reverse();
+    var colors = users.slice(0, 20).map(function(u) {
+        if (u.trend === 'accelerating') return '#10b981';
+        if (u.trend === 'decelerating') return '#ef4444';
+        if (u.trend === 'stable') return '#f59e0b';
+        return '#94a3b8';
+    }).reverse();
+
+    var ctx = document.getElementById('spender-chart').getContext('2d');
+    spenderChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: '累计钻石',
+                data: values,
+                backgroundColor: colors,
+                borderColor: colors.map(function(c) { return c + '80'; }),
+                borderWidth: 1,
+                borderRadius: 4,
+            }]
+        },
+        options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: {
+                    ticks: { callback: function(v) { return v.toLocaleString(); } },
+                    grid: { color: 'var(--border-light)' },
+                },
+                y: { grid: { display: false } },
+            },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: function(ctx) {
+                            var u = users[users.length - 1 - ctx.dataIndex] || users[0];
+                            var trendMap = {
+                                accelerating: '<i class="ph ph-rocket"></i> 加速中',
+                                stable: '<i class="ph ph-arrow-right"></i> 稳定',
+                                decelerating: '<i class="ph ph-trend-down"></i> 减速中',
+                                insufficient_data: '<i class="ph ph-warning"></i> 数据不足'
+                            };
+                            return ctx.parsed.x.toLocaleString() + ' 钻 | '
+                                + (trendMap[u.trend] || u.trend);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+function renderSpenderTable(data) {
+    var users = data.users || [];
+    var html = '';
+    if (users.length === 0) {
+        html = '<div class="empty-state"><div class="icon"><i class="ph ph-crown"></i></div>暂无匹配的大R用户</div>';
+        document.getElementById('spender-table-wrap').innerHTML = html;
+        document.getElementById('spender-pagination').innerHTML = '';
+        return;
+    }
+
+    var trendLabels = {
+        accelerating: '<span class="trend-badge accelerating"><i class="ph ph-rocket"></i> 加速</span>',
+        stable: '<span class="trend-badge stable"><i class="ph ph-arrow-right"></i> 稳定</span>',
+        decelerating: '<span class="trend-badge decelerating"><i class="ph ph-trend-down"></i> 减速</span>',
+        insufficient_data: '<span class="trend-badge insufficient_data"><i class="ph ph-warning"></i> 数据不足</span>',
+    };
+
+    html = '<table><thead><tr>'
+        + '<th>排名</th><th>用户</th><th>粉丝团</th><th>总消费</th>'
+        + '<th>近3场</th><th>前3场</th><th>趋势</th><th>活跃天数</th><th>沉默天数</th>'
+        + '</tr></thead><tbody>';
+    users.forEach(function(u) {
+        html += '<tr>'
+            + '<td><span class="rank-' + (u.rank <= 3 ? u.rank : '') + '">' + u.rank + '</span></td>'
+            + '<td><a href="/user?uid=' + encodeURIComponent(u.user_id) + '">'
+            + (u.user_name || u.user_id) + '</a></td>'
+            + '<td>' + (u.fans_club || '-') + '</td>'
+            + '<td><strong>' + (u.total_consume || 0).toLocaleString() + '</strong></td>'
+            + '<td>' + (u.recent_3 || 0).toLocaleString() + '</td>'
+            + '<td>' + (u.prev_3 || 0).toLocaleString() + '</td>'
+            + '<td>' + (trendLabels[u.trend] || '-') + '</td>'
+            + '<td>' + (u.active_days || 0) + '</td>'
+            + '<td>' + (u.silent_days > 0 ? '<span style="color:var(--danger);font-weight:600;">' + u.silent_days + '天</span>' : '-') + '</td>'
+            + '</tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById('spender-table-wrap').innerHTML = html;
+
+    // pagination
+    var total = data.total || 0;
+    var page = data.page || 1;
+    var totalPages = Math.ceil(total / 50);
+    if (totalPages <= 1) {
+        document.getElementById('spender-pagination').innerHTML = '';
+        return;
+    }
+    var phtml = '<span>共 ' + total + ' 条</span>';
+    for (var i = 1; i <= totalPages && i <= 10; i++) {
+        phtml += '<a href="#" class="' + (i === page ? 'active' : '') + '" onclick="return loadSpenderPage(' + i + ')">' + i + '</a>';
+    }
+    document.getElementById('spender-pagination').innerHTML = phtml;
+}
+
+function loadSpenderPage(p) {
+    var f = getFilters();
+    var minConsume = document.getElementById('spender-min-consume').value || 10000;
+    var trend = document.getElementById('spender-trend').value;
+    var url = '/api/analytics/big-spenders?min_consume=' + minConsume
+        + '&trend=' + trend
+        + '&anchor=' + encodeURIComponent(f.anchor)
+        + '&page=' + p + '&size=50';
+    fetch(url)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (data.users) renderSpenderTable(data);
+        })
+        .catch(function(err) { showToast('加载失败: ' + err.message, 'error'); });
+    return false;
+}
+
+/* ════════════════════════════════════════════════════
+   SILENT WHALES
+   ════════════════════════════════════════════════════ */
+function loadSilentWhales() {
+    var f = getFilters();
+    var url = '/api/analytics/silent-whales?threshold=30000&silent_days=7'
+        + '&anchor=' + encodeURIComponent(f.anchor);
+
+    fetch(url)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            var list = document.getElementById('silent-whales-list');
+            if (!data.users || data.users.length === 0) {
+                document.getElementById('silent-whales-card').style.display = 'none';
+                return;
+            }
+            document.getElementById('silent-whales-card').style.display = 'block';
+            var html = '';
+            data.users.forEach(function(u) {
+                var avatarContent = u.avatar_url
+                    ? '<img src="' + u.avatar_url + '" onerror="this.parentElement.textContent=\'' + (u.user_name || '?').charAt(0) + '\'">'
+                    : (u.user_name || '?').charAt(0);
+                html += '<a href="/user?uid=' + encodeURIComponent(u.user_id) + '" class="silent-whale-card" style="text-decoration:none;color:inherit;">'
+                    + '<div class="sw-avatar">' + avatarContent + '</div>'
+                    + '<div class="sw-info">'
+                    + '<div class="sw-name">' + (u.user_name || u.user_id) + '</div>'
+                    + '<div class="sw-meta">最后出现: ' + (u.last_seen ? u.last_seen.slice(11, 19) + ' (' + u.silent_days + '天前)' : '未知') + '</div>'
+                    + '</div>'
+                    + '<div class="sw-amount">' + (u.total_consume || 0).toLocaleString() + '</div>'
+                    + '</a>';
+            });
+            list.innerHTML = html;
+        })
+        .catch(function() {
+            document.getElementById('silent-whales-card').style.display = 'none';
+        });
+}
+
+/* ════════════════════════════════════════════════════
+   INIT
+   ════════════════════════════════════════════════════ */
+loadStreamers();
+</script>
+{% endblock %}

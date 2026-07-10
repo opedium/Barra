@@ -3,13 +3,13 @@
 {% block content %}
 <div class="card">
     <div class="flex-between" style="margin-bottom:16px;">
-        <h2 style="margin-bottom:0;">📊 数据完整性审计</h2>
+        <h2 style="margin-bottom:0;"><i class="ph ph-chart-bar"></i> 数据完整性审计</h2>
         <button onclick="location.reload()" class="btn-refresh" style="padding:6px 14px;border:1px solid var(--border);background:var(--card);border-radius:6px;cursor:pointer;">&#x27F3; 刷新</button>
     </div>
 
     <!-- 1. Overview -->
     <div class="audit-section">
-        <h3>📈 总体概览</h3>
+        <h3><i class="ph ph-chart-line"></i> 总体概览</h3>
         <div class="stats-row" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));">
             <div class="stat-card"><div class="num">{{ data.overview.total_gifts }}</div><div class="label">礼物总数</div></div>
             <div class="stat-card" style="border-color:#10b981;"><div class="num" style="color:#10b981;">{{ data.overview.total_diamond }}</div><div class="label">总钻石</div></div>
@@ -21,7 +21,7 @@
 
     <!-- 1.5 Live Collection -->
     <div class="audit-section">
-        <h3>⚡ 实时采集 <span class="badge badge-blue" style="font-weight:400;" id="live-badge">状态</span></h3>
+        <h3><i class="ph ph-lightning"></i> 实时采集 <span class="badge badge-blue" style="font-weight:400;" id="live-badge">状态</span></h3>
         <div id="live-stats" style="padding:8px 0;">
             <div class="text-muted">加载中...</div>
         </div>
@@ -66,7 +66,7 @@
 
     <!-- 2. Dedup Health -->
     <div class="audit-section">
-        <h3>🔄 去重健康状态</h3>
+        <h3><i class="ph ph-arrows-clockwise"></i> 去重健康状态</h3>
         {% set rr = data.dedup.reject_rate %}
         {% if rr > 10 %}
             {% set badge_cls = 'badge-red' %}
@@ -78,27 +78,38 @@
         <div style="margin-bottom:10px;">
             拒绝率: <span class="badge {{ badge_cls }}" style="font-size:14px;">{{ rr }}%</span>
             {% if rr > 10 %}
-            <span style="color:#ef4444;margin-left:8px;">⚠️ 拒绝率过高，可能存在过度去重</span>
+            <span style="color:#ef4444;margin-left:8px;"><i class="ph ph-warning"></i> 拒绝率过高，可能存在过度去重</span>
             {% elif rr > 3 %}
-            <span style="color:#f59e0b;margin-left:8px;">⚠️ 拒绝率偏高，建议检查时间窗口</span>
+            <span style="color:#f59e0b;margin-left:8px;"><i class="ph ph-warning"></i> 拒绝率偏高，建议检查时间窗口</span>
             {% else %}
-            <span style="color:#10b981;margin-left:8px;">✅ 健康</span>
+            <span style="color:#10b981;margin-left:8px;"><i class="ph ph-check-circle"></i> 健康</span>
             {% endif %}
         </div>
         <div class="stats-row" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));">
-            <div class="stat-card"><div class="num">{{ data.dedup.raw }}</div><div class="label">原始消息</div></div>
-            <div class="stat-card"><div class="num">{{ data.dedup.passed }}</div><div class="label">已通过</div></div>
-            <div class="stat-card" style="{% if data.dedup.rejected > 0 %}border-color:#ef4444;{% endif %}"><div class="num" style="{% if data.dedup.rejected > 0 %}color:#ef4444;{% endif %}">{{ data.dedup.rejected }}</div><div class="label">已拒绝</div></div>
-            <div class="stat-card" style="{% if data.dedup.delta_zero > 100 %}border-color:#f59e0b;{% endif %}"><div class="num">{{ data.dedup.delta_zero }}</div><div class="label">增量零</div></div>
-            <div class="stat-card" style="{% if data.dedup.out_of_order > 10 %}border-color:#ef4444;{% endif %}"><div class="num" style="{% if data.dedup.out_of_order > 10 %}color:#ef4444;{% endif %}">{{ data.dedup.out_of_order }}</div><div class="label">乱序</div></div>
-            <div class="stat-card" style="{% if data.dedup.combo_block > 10 %}border-color:#f59e0b;{% endif %}"><div class="num">{{ data.dedup.combo_block }}</div><div class="label">Combo封锁</div></div>
-            <div class="stat-card"><div class="num">{{ data.dedup.rc1_dup }}</div><div class="label">单次去重</div></div>
+            <div class="stat-card" title="去重系统收到的礼物消息总数（包括连击的每条进度消息）"><div class="num">{{ data.dedup.raw }}</div><div class="label">原始消息</div></div>
+            <div class="stat-card" title="被认为是有效增量、已记录到数据库的消息数"><div class="num">{{ data.dedup.passed }}</div><div class="label">已通过</div></div>
+            <div class="stat-card" style="{% if data.dedup.rejected > 0 %}border-color:#ef4444;{% endif %}" title="因重复被丢弃的消息数。少量（&lt;3%）正常，过高说明去重过于激进或有大量 WS 重放"><div class="num" style="{% if data.dedup.rejected > 0 %}color:#ef4444;{% endif %}">{{ data.dedup.rejected }}</div><div class="label">已拒绝</div></div>
+            <div class="stat-card" style="{% if data.dedup.delta_zero > 100 %}border-color:#f59e0b;{% endif %}" title="连击礼物中增量 Δ=0 的重复消息。同组连击计数未增加则判定为重复。少量正常，过高说明 combo buffer 未覆盖到"><div class="num">{{ data.dedup.delta_zero }}</div><div class="label">增量零</div></div>
+            <div class="stat-card" style="{% if data.dedup.out_of_order > 10 %}border-color:#ef4444;{% endif %}" title="连击消息到达顺序错乱（如 rc=3 比 rc=2 先到）。少量正常，过多说明 WebSocket 存在严重乱序"><div class="num" style="{% if data.dedup.out_of_order > 10 %}color:#ef4444;{% endif %}">{{ data.dedup.out_of_order }}</div><div class="label">乱序</div></div>
+            <div class="stat-card" style="{% if data.dedup.combo_block > 10 %}border-color:#f59e0b;{% endif %}" title="连击已结束后又来同组消息，被封锁防止重复计数。少量说明 combo buffer 正常生效"><div class="num">{{ data.dedup.combo_block }}</div><div class="label">Combo封锁</div></div>
+            <div class="stat-card" title="单次送礼（rc=1）通过 500ms trace_id 窗口去重拦截的重复消息"><div class="num">{{ data.dedup.rc1_dup }}</div><div class="label">单次去重</div></div>
+        </div>
+    </div>
+
+    <!-- 2b. Message Flow -->
+    <div class="audit-section">
+        <h3><i class="ph ph-mailbox"></i> 消息流追踪</h3>
+        <div style="font-family:monospace;font-size:13px;color:var(--text-dim);">
+            入队[C:{{ data.flow.chat_enqueued }} G:{{ data.flow.gift_enqueued }}]
+            落库[C:{{ data.flow.chat_written }} G:{{ data.flow.gift_written }}]
+            连击进度:{{ data.flow.combo_progress }}
+            缓冲中:{{ data.flow.combo_buf }}
         </div>
     </div>
 
     <!-- 3. Time Gaps -->
     <div class="audit-section">
-        <h3>⏱️ 时间间隙检测 <span class="badge badge-blue">最近10场</span></h3>
+        <h3><i class="ph ph-clock"></i> 时间间隙检测 <span class="badge badge-blue">最近10场</span></h3>
         {% set gap_warn = 'badge-red' if data.gaps.total_gaps > 50 else ('badge-amber' if data.gaps.total_gaps > 10 else 'badge-green') %}
         <div style="margin-bottom:10px;">
             间隙数: <span class="badge {{ gap_warn }}">{{ data.gaps.total_gaps }}</span>
@@ -120,13 +131,13 @@
             </tbody>
         </table>
         {% else %}
-        <div class="text-muted" style="padding:12px 0;">✅ 未检测到 >5s 的消息间隙</div>
+        <div class="text-muted" style="padding:12px 0;"><i class="ph ph-check-circle"></i> 未检测到 >5s 的消息间隙</div>
         {% endif %}
     </div>
 
     <!-- 4. Sessions Detail -->
     <div class="audit-section">
-        <h3>📋 场次详情 <span class="badge badge-blue">最近50场</span></h3>
+        <h3><i class="ph ph-clipboard-text"></i> 场次详情 <span class="badge badge-blue">最近50场</span></h3>
         <div class="table-wrap">
             <table class="mini-table">
                 <thead>
@@ -152,7 +163,7 @@
 
     <!-- 5. Anonymous Resolution Rate -->
     <div class="audit-section">
-        <h3>🎭 匿名用户解析率</h3>
+        <h3><i class="ph ph-mask-happy"></i> 匿名用户解析率</h3>
         {% set ar = data.anonymous %}
         {% if ar.total > 0 %}
         {% set anon_badge = 'badge-green' if ar.resolve_rate > 80 else ('badge-amber' if ar.resolve_rate > 50 else 'badge-red') %}
@@ -166,17 +177,17 @@
             <span class="badge badge-blue">神秘人: {{ ar.mystic }}</span>
             <span class="badge badge-amber">dou前缀: {{ ar.dou_prefix }}</span>
             {% if ar.resolve_rate == 0 %}
-            <span style="color:#ef4444;margin-left:8px;">⚠️ 自动解析可能未生效，请检查 API 调用</span>
+            <span style="color:#ef4444;margin-left:8px;"><i class="ph ph-warning"></i> 自动解析可能未生效，请检查 API 调用</span>
             {% endif %}
         </div>
         {% else %}
-        <div class="text-muted" style="padding:12px 0;">✅ 无匿名用户数据</div>
+        <div class="text-muted" style="padding:12px 0;"><i class="ph ph-check-circle"></i> 无匿名用户数据</div>
         {% endif %}
     </div>
 
     <!-- 6. Per-Session Dedup Breakdown -->
     <div class="audit-section">
-        <h3>🔍 每场去重分析 <span class="badge badge-blue">最近20场</span></h3>
+        <h3><i class="ph ph-magnifying-glass"></i> 每场去重分析 <span class="badge badge-blue">最近20场</span></h3>
         <div class="table-wrap">
             <table class="mini-table">
                 <thead>
@@ -206,7 +217,7 @@
 
     <!-- 7. Corrupted Usernames -->
     <div class="audit-section">
-        <h3>⚠️ 异常用户名检测</h3>
+        <h3><i class="ph ph-warning"></i> 异常用户名检测</h3>
         {% if data.bad_usernames %}
         <div style="margin-bottom:10px;color:#ef4444;">检测到 {{ data.bad_usernames|length }} 个可能损坏的用户名</div>
         <table class="mini-table">
@@ -221,7 +232,7 @@
             </tbody>
         </table>
         {% else %}
-        <div class="text-muted" style="padding:12px 0;">✅ 未发现异常用户名</div>
+        <div class="text-muted" style="padding:12px 0;"><i class="ph ph-check-circle"></i> 未发现异常用户名</div>
         {% endif %}
     </div>
 </div>

@@ -104,7 +104,7 @@
 <div class="card">
     <div class="anon-header">
         <div>
-            <h2>🎭 神秘人查询</h2>
+            <h2><i class="ph ph-mask-happy"></i> 神秘人查询</h2>
             <div class="sub">
                 神秘人由抖音分配匿名名称，后台仍可追踪真实 <strong>user_id</strong>。
             </div>
@@ -113,7 +113,7 @@
 
     <div class="anon-search">
         <input type="text" id="anon-search-input" placeholder="搜索匿名名或真实ID..." autocomplete="off">
-        <button onclick="loadData()">🔍 搜索</button>
+        <button onclick="loadData()"><i class="ph ph-magnifying-glass"></i> 搜索</button>
         <button onclick="clearSearch()" class="btn-outline">✕ 清除</button>
         <button onclick="exportCSV()" style="background:var(--success);color:#fff;border-color:var(--success);font-weight:600;">&#x2B06; 导出CSV</button>
         <button onclick="batchResolve()" style="background:#8b5cf6;color:#fff;border-color:#8b5cf6;font-weight:600;">&#x26A1; 批量解析</button>
@@ -200,7 +200,7 @@ function batchResolve() {
             status.style.color = d.resolved > 0 ? '#065f46' : '#92400e';
             status.textContent = '✔ 解析完成: ' + d.resolved + ' 成功, ' + d.failed + ' 失败 (共 ' + d.total + ')';
             btn.disabled = false;
-            btn.textContent = '⚡ 批量解析';
+            btn.innerHTML = '<i class="ph ph-lightning"></i> 批量解析';
             loadData();
         })
         .catch(function(err) {
@@ -208,7 +208,7 @@ function batchResolve() {
             status.style.color = '#991b1b';
             status.textContent = '✖ 请求失败: ' + err.message;
             btn.disabled = false;
-            btn.textContent = '⚡ 批量解析';
+            btn.innerHTML = '<i class="ph ph-lightning"></i> 批量解析';
         });
 }
 

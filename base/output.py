@@ -245,7 +245,39 @@ class QueueHandler(logging.Handler):
             count = info.get('msg_count', 0)
             elapsed = info.get('elapsed', 0)
             rate = count / elapsed if elapsed > 0 else 0
-            text = f'{anchor} {count}条({rate:.1f}m/s)'
+            flow = info.get('flow', {})
+            pc = info.get('parsed_chat', 0)
+            pg = info.get('parsed_gift', 0)
+            pl = info.get('parsed_like', 0)
+            ps = info.get('parsed_social', 0)
+            pe = info.get('parsed_emoji', 0)
+            cbuf = info.get('combo_buf', 0)
+            ss = info.get('sub_seen', 0)
+            sd = info.get('sub_deduped', 0)
+            ft = info.get('frame_total', 0)
+            fg = info.get('frame_gaps', 0)
+            if flow:
+                ce = flow.get('chat_enqueued', 0)
+                ge = flow.get('gift_enqueued', 0)
+                cw = flow.get('chat_written', 0)
+                gw = flow.get('gift_written', 0)
+                cp = flow.get('combo_progress', 0)
+                text = f'{anchor} {count}条({rate:.1f}m/s) par[C:{pc} G:{pg} L:{pl}] enq[C:{ce} G:{ge}] db[C:{cw} G:{gw}]'
+                if ps:
+                    text = f'{anchor} {count}条({rate:.1f}m/s) par[C:{pc} G:{pg} S:{ps}] enq[C:{ce} G:{ge}] db[C:{cw} G:{gw}]'
+                if cp:
+                    text += f' prog:{cp}'
+                if cbuf:
+                    text += f' buf:{cbuf}'
+                if ss:
+                    text += f' sub:{ss}'
+                if sd:
+                    text += f' sub_dedup:{sd}'
+                if ft and fg:
+                    loss = fg / (ft + fg) * 100
+                    text += f' loss:{loss:.1f}%'
+            else:
+                text = f'{anchor} {count}条({rate:.1f}m/s) par[C:{pc} G:{pg}]'
         else:
             text = f'{anchor} {st}'
 

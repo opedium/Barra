@@ -1,0 +1,1343 @@
+{% extends "base.html" %}
+
+{% block title %}礼物价格管理{% endblock %}
+
+{% block content %}
+
+<style>
+
+/* ── Layout ── */
+
+.gp-header { display:flex; align-items:center; gap:14px; margin:0 0 20px; flex-wrap:wrap; }
+
+.gp-header h1 { font-size:20px; font-weight:700; }
+
+
+
+/* ── Stats Bar ── */
+
+.gp-stats { display:flex; gap:12px; margin-bottom:18px; flex-wrap:wrap; }
+
+.gp-stat {
+
+ display:flex; align-items:center; gap:12px;
+
+ padding:14px 20px; background:var(--card); border-radius:8px;
+
+ border:1px solid var(--border); min-width:110px; flex:1;
+
+}
+
+.gp-stat-icon {
+
+ width:36px; height:36px; border-radius:8px;
+
+ display:flex; align-items:center; justify-content:center;
+
+ font-size:16px; flex-shrink:0;
+
+}
+
+.gp-stat-icon.purple { background:#f3e8ff; color:#7c3aed; }
+
+.gp-stat-icon.green { background:#d1fae5; color:#059669; }
+
+.gp-stat-body .num { font-size:22px; font-weight:800; font-family:var(--font-mono); line-height:1.2; color:var(--text); }
+
+.gp-stat-body .label { font-size:11px; color:var(--text-muted); font-weight:600; text-transform:uppercase; letter-spacing:.03em; }
+
+
+
+/* ── Tabs ── */
+
+.gp-tabs { display:flex; gap:0; border-bottom:2px solid var(--border); margin-bottom:16px; }
+
+.gp-tab {
+
+ padding:9px 20px; font-size:13px; font-weight:600; cursor:pointer;
+
+ color:var(--text-muted); border-bottom:2px solid transparent;
+
+ margin-bottom:-2px; user-select:none; transition:all var(--transition-fast);
+
+}
+
+.gp-tab:hover { color:var(--text); }
+
+.gp-tab.active { color:var(--primary); border-bottom-color:var(--primary); }
+
+
+
+/* ── Toolbar ── */
+
+.gp-toolbar {
+
+ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:14px;
+
+}
+
+.gp-toolbar .search-wrap { position:relative; flex:1; min-width:180px; max-width:320px; }
+
+.gp-toolbar .search-wrap input {
+
+ width:100%; padding:7px 30px 7px 12px;
+
+ border:1px solid var(--border); border-radius:var(--radius-sm);
+
+ font-size:13px; background:var(--card); color:var(--text); outline:none;
+
+ transition:border-color var(--transition-fast), box-shadow var(--transition-fast);
+
+}
+
+.gp-toolbar .search-wrap input:focus { border-color:var(--primary); box-shadow:0 0 0 3px var(--primary-glow); }
+
+.gp-toolbar .search-wrap .clear-btn {
+
+ position:absolute; right:6px; top:50%; transform:translateY(-50%);
+
+ background:none; border:none; cursor:pointer; color:var(--text-soft);
+
+ font-size:15px; padding:2px 4px; display:none; line-height:1;
+
+}
+
+.gp-toolbar .search-wrap .clear-btn:hover { color:var(--text-muted); }
+
+.gp-toolbar select {
+
+ padding:7px 10px; border:1px solid var(--border); border-radius:var(--radius-sm);
+
+ font-size:13px; background:var(--card); color:var(--text); outline:none;
+
+ transition:border-color var(--transition-fast);
+
+}
+
+.gp-toolbar select:focus { border-color:var(--primary); }
+
+.gp-toolbar .btn {
+
+ padding:7px 16px; border:none; border-radius:var(--radius-sm);
+
+ font-size:12px; font-weight:600; cursor:pointer; white-space:nowrap;
+
+ transition:all var(--transition-fast);
+
+}
+
+.gp-toolbar .btn-primary { background:var(--primary); color:#fff; }
+
+.gp-toolbar .btn-primary:hover { background:var(--primary-dark); }
+
+.gp-toolbar .btn-green { background:var(--success); color:#fff; }
+
+.gp-toolbar .btn-green:hover { background:#059669; }
+
+.gp-toolbar .btn-outline { background:transparent; color:var(--text-muted); border:1px solid var(--border); }
+
+.gp-toolbar .btn-outline:hover { background:var(--bg); color:var(--text); }
+
+.gp-toolbar .count-label { font-size:12px; color:var(--text-soft); margin-left:auto; white-space:nowrap; }
+
+
+
+/* ── Table ── */
+
+.gp-table-wrap { overflow-x:auto; border:1px solid var(--border); border-radius:var(--radius); }
+
+.gp-table { width:100%; border-collapse:collapse; font-size:13px; }
+
+.gp-table thead { background:var(--bg); }
+
+.gp-table th {
+
+ padding:10px 12px; font-weight:600; font-size:11px;
+
+ text-transform:uppercase; letter-spacing:.04em; color:var(--text-muted);
+
+ border-bottom:2px solid var(--border); white-space:nowrap; text-align:left;
+
+}
+
+.gp-table td { padding:10px 12px; border-bottom:1px solid var(--border-light); vertical-align:middle; }
+
+.gp-table tbody tr:last-child td { border-bottom:none; }
+
+.gp-table tbody tr:nth-child(even) td { background:var(--bg-soft); }
+
+.gp-table tbody tr:hover td { background:var(--primary-light); }
+
+.gp-table .gift-name { font-weight:600; color:var(--text); }
+
+.gp-table .price-cell {
+
+ font-family:var(--font-mono); font-weight:700; font-size:13px;
+
+ text-align:right; padding-right:8px;
+
+}
+
+.gp-table .price-bar { display:inline-block; height:6px; border-radius:3px; min-width:2px; vertical-align:middle; margin-right:6px; }
+
+.gp-table .num-cell { font-family:var(--font-mono); font-size:12px; text-align:right; }
+
+.gp-table .action-cell { text-align:center; }
+
+.gp-table .action-cell button {
+
+ padding:4px 12px; border:1px solid var(--border); border-radius:var(--radius-sm);
+
+ background:var(--card); color:var(--text-muted); font-size:11px; font-weight:600;
+
+ cursor:pointer; transition:all var(--transition-fast);
+
+}
+
+.gp-table .action-cell button:hover { background:var(--primary); color:#fff; border-color:var(--primary); }
+
+
+
+/* ── Tier colors for price bar ── */
+
+.tier-1 { background:#86efac; } /* 1-9 */
+
+.tier-2 { background:#6ee7b7; } /* 10-99 */
+
+.tier-3 { background:#60a5fa; } /* 100-999 */
+
+.tier-4 { background:#fbbf24; } /* 1000-9999 */
+
+.tier-5 { background:#a78bfa; } /* 10000+ */
+
+
+
+/* ── Source badges ── */
+
+.source-badge {
+
+ display:inline-flex; align-items:center; gap:3px;
+
+ padding:2px 9px; border-radius:10px; font-size:10px; font-weight:700;
+
+ letter-spacing:.02em;
+
+}
+
+.source-badge.auto { background:var(--warning-bg); color:#92400e; }
+
+.source-badge.manual { background:#dbeafe; color:#1e40af; }
+
+.source-badge.verified { background:var(--success-bg); color:#065f46; }
+
+.source-badge.override { background:#fce7f3; color:#9d174d; }
+
+.source-badge.registry { background:#f3e8ff; color:#6d28d9; }
+
+.source-badge.official { background:#f3e8ff; color:#6d28d9; }
+
+.source-badge.unregistered { background:#fef3c7; color:#92400e; }
+
+.source-badge .src-dot { width:5px; height:5px; border-radius:50%; display:inline-block; }
+
+.source-badge.auto .src-dot { background:#d97706; }
+
+.source-badge.manual .src-dot { background:#2563eb; }
+
+.source-badge.verified .src-dot { background:#059669; }
+
+.source-badge.override .src-dot { background:#db2777; }
+
+.source-badge.registry .src-dot { background:#7c3aed; }
+
+
+
+.tag-limited {
+
+ display:inline-block; padding:1px 7px; border-radius:8px;
+
+ font-size:10px; font-weight:700; background:#fce7f3; color:#9d174d; margin-left:4px;
+
+}
+
+
+
+/* ── Pagination ── */
+
+.gp-pagination {
+
+ display:flex; align-items:center; justify-content:center; gap:4px; margin-top:14px;
+
+}
+
+.gp-pagination button {
+
+ padding:6px 12px; border:1px solid var(--border); border-radius:var(--radius-sm);
+
+ background:var(--card); color:var(--text); font-size:12px; cursor:pointer;
+
+ font-weight:500; transition:all var(--transition-fast);
+
+}
+
+.gp-pagination button:hover { background:var(--bg); }
+
+.gp-pagination button.active { background:var(--primary); color:#fff; border-color:var(--primary); }
+
+.gp-pagination button:disabled { opacity:.35; cursor:not-allowed; }
+
+
+
+/* ── Modal ── */
+
+.modal-scrim {
+
+ position:fixed; inset:0; background:rgba(15,23,42,0.6); z-index:1000;
+
+ display:none; align-items:center; justify-content:center;
+
+ backdrop-filter:blur(2px); -webkit-backdrop-filter:blur(2px);
+
+ animation:fadeIn .15s ease;
+
+}
+
+.modal-scrim.open { display:flex; }
+
+@keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+
+.modal-box {
+
+ background:var(--card); border-radius:var(--radius-lg);
+
+ padding:0; max-width:480px; width:92%; max-height:85vh;
+
+ box-shadow:0 25px 50px -12px rgba(0,0,0,.25);
+
+ animation:slideUp .2s ease;
+
+ overflow:hidden;
+
+}
+
+@keyframes slideUp { from { opacity:0; transform:translateY(16px) scale(.97); } to { opacity:1; transform:none; } }
+
+.modal-head {
+
+ display:flex; align-items:center; justify-content:space-between;
+
+ padding:18px 22px 14px; border-bottom:1px solid var(--border);
+
+}
+
+.modal-head h3 { margin:0; font-size:15px; font-weight:700; }
+
+.modal-head .close-btn {
+
+ background:none; border:none; font-size:22px; cursor:pointer;
+
+ color:var(--text-soft); padding:0 4px; line-height:1;
+
+ transition:color var(--transition-fast);
+
+}
+
+.modal-head .close-btn:hover { color:var(--danger); }
+
+.modal-body { padding:18px 22px 6px; }
+
+.modal-body .field { margin-bottom:14px; }
+
+.modal-body .field label {
+
+ display:block; font-size:11px; font-weight:600; color:var(--text-muted);
+
+ text-transform:uppercase; letter-spacing:.03em; margin-bottom:4px;
+
+}
+
+.modal-body .field input, .modal-body .field select {
+
+ width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:var(--radius-sm);
+
+ font-size:13px; background:var(--card); color:var(--text); box-sizing:border-box; outline:none;
+
+ transition:border-color var(--transition-fast), box-shadow var(--transition-fast);
+
+}
+
+.modal-body .field input:focus, .modal-body .field select:focus {
+
+ border-color:var(--primary); box-shadow:0 0 0 3px var(--primary-glow);
+
+}
+
+.modal-body .field .checkbox-row {
+
+ display:flex; align-items:center; gap:8px; padding:6px 0; cursor:pointer;
+
+}
+
+.modal-body .field .checkbox-row input[type="checkbox"] {
+
+ width:16px; height:16px; accent-color:var(--primary); cursor:pointer; flex-shrink:0;
+
+}
+
+.modal-body .field .checkbox-row label { text-transform:none; letter-spacing:0; cursor:pointer; font-size:13px; color:var(--text); margin:0; }
+
+.modal-foot {
+
+ display:flex; gap:8px; justify-content:flex-end;
+
+ padding:12px 22px 18px;
+
+}
+
+.modal-foot button {
+
+ padding:8px 20px; border:none; border-radius:var(--radius-sm);
+
+ font-size:13px; font-weight:600; cursor:pointer; transition:all var(--transition-fast);
+
+}
+
+.modal-foot .btn-cancel { background:var(--bg); color:var(--text-muted); }
+
+.modal-foot .btn-cancel:hover { background:var(--border); }
+
+.modal-foot .btn-save { background:var(--primary); color:#fff; }
+
+.modal-foot .btn-save:hover { background:var(--primary-dark); }
+
+
+
+/* ── Audit Cards ── */
+
+.audit-section { margin-bottom:20px; }
+
+.audit-section h3 {
+
+ font-size:14px; font-weight:700; margin:0 0 10px;
+
+ display:flex; align-items:center; gap:8px;
+
+}
+
+.audit-card {
+
+ background:var(--card); border:1px solid var(--border); border-radius:8px;
+
+ padding:16px 18px; margin-bottom:8px;
+
+}
+
+.audit-card:last-child { margin-bottom:0; }
+
+.audit-card .ac-title {
+
+ font-weight:600; font-size:13px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+
+}
+
+.audit-card .ac-detail { font-size:12px; color:var(--text-muted); margin-top:4px; }
+
+.audit-card .ac-detail .price-list { margin:4px 0; }
+
+.audit-card .ac-detail .price-list span { margin-right:12px; }
+
+.ac-price { font-family:var(--font-mono); font-weight:600; }
+
+.ac-price.old-price { color:var(--danger); }
+
+.ac-price.new-price { color:var(--success); }
+
+
+
+.history-empty, .disc-empty {
+
+ text-align:center; padding:30px 20px; color:var(--text-soft); font-size:13px;
+
+}
+
+
+
+/* ── Loading ── */
+
+.loading-skeleton {
+
+ text-align:center; padding:40px 20px; color:var(--text-soft); font-size:13px;
+
+}
+
+.loading-skeleton .spinner-sm {
+
+ display:inline-block; width:20px; height:20px;
+
+ border:2px solid var(--border); border-top-color:var(--primary); border-radius:50%;
+
+ animation:spin .6s linear infinite; margin-bottom:8px;
+
+}
+
+@keyframes spin { to { transform:rotate(360deg); } }
+
+
+
+/* ── Responsive ── */
+
+@media (max-width:768px) {
+
+ .gp-toolbar .search-wrap { max-width:none; width:100%; }
+
+ .gp-table { font-size:12px; }
+
+ .gp-table th, .gp-table td { padding:7px 8px; }
+
+ .gp-stat { min-width:80px; padding:10px 14px; }
+
+ .modal-box { max-width:96%; }
+
+}
+
+</style>
+
+
+
+<div class="gp-header">
+
+ <h1>礼物价格管理</h1>
+
+</div>
+
+
+
+<div class="gp-stats">
+
+ <div class="gp-stat">
+
+ <div class="gp-stat-icon purple">N</div>
+
+ <div class="gp-stat-body">
+
+ <div class="num" id="stat-total">0</div>
+
+ <div class="label">礼物种类</div>
+
+ </div>
+
+ </div>
+
+ <div class="gp-stat">
+
+ <div class="gp-stat-icon green">V</div>
+
+ <div class="gp-stat-body">
+
+ <div class="num" id="stat-confirmed">0</div>
+
+ <div class="label">已确认</div>
+
+ </div>
+
+ </div>
+
+</div>
+
+
+
+<div class="gp-tabs">
+
+ <span class="gp-tab active" data-tab="list" onclick="switchTab('list')"> 价格列表</span>
+
+ <span class="gp-tab" data-tab="audit" onclick="switchTab('audit')"> 审计</span>
+
+</div>
+
+
+
+<div id="tab-list">
+
+ <div class="gp-toolbar">
+
+ <div class="search-wrap">
+
+ <input type="text" id="gp-search" placeholder="搜索礼物名称..." oninput="onSearch()">
+
+ <button class="clear-btn" id="search-clear" onclick="clearSearch()">x</button>
+
+ </div>
+
+ <select id="source-filter" onchange="loadPrices()">
+
+ <option value="">全部来源</option>
+
+ <option value="auto"> 自动检测</option>
+
+ <option value="manual"> 手动设置</option>
+
+ <option value="verified"> 已验证</option>
+
+ <option value="registry"> 注册表</option>
+
+	 <option value="unregistered"> 未注册</option>
+
+ <option value="override"> 覆盖</option>
+
+ </select>
+
+ <button class="btn btn-outline" onclick="loadPrices()"> 刷新</button>
+
+ <button class="btn btn-green" onclick="openAdd()">+ 添加</button>
+
+ <span class="count-label" id="total-label">共 0 项</span>
+
+ </div>
+
+
+
+ <div class="gp-table-wrap">
+
+ <table class="gp-table">
+
+ <thead>
+
+ <tr>
+
+ <th>礼物名称</th>
+
+ <th style="text-align:right;">钻石价格</th>
+
+ <th>来源</th>
+
+ <th style="text-align:right;">日志数</th>
+
+ <th style="text-align:right;">钻石总额</th>
+
+ <th style="text-align:center;">操作</th>
+
+ </tr>
+
+ </thead>
+
+ <tbody id="price-list">
+
+ <tr><td colspan="7" class="loading-skeleton"><div class="spinner-sm"></div><div>加载中...</div></td></tr>
+
+ </tbody>
+
+ </table>
+
+ </div>
+
+
+
+ <div class="gp-pagination" id="pagination"></div>
+
+</div>
+
+
+
+<div id="tab-audit" style="display:none;">
+
+ <div id="audit-content">
+
+ <div class="loading-skeleton"><div class="spinner-sm"></div><div>加载中...</div></div>
+
+ </div>
+
+</div>
+
+
+
+<!-- Edit Modal -->
+
+<div class="modal-scrim" id="edit-modal">
+
+ <div class="modal-box">
+
+ <div class="modal-head">
+
+ <h3 id="modal-title">编辑礼物价格</h3>
+
+ <button class="close-btn" onclick="closeModal()">x</button>
+
+ </div>
+
+ <div class="modal-body">
+
+ <div class="field">
+
+ <label>礼物名称</label>
+
+ <input type="text" id="edit-name" readonly style="background:var(--bg);">
+
+ </div>
+
+ <div class="field">
+
+ <label>钻石价格</label>
+
+ <input type="number" id="edit-price" min="0" step="1" placeholder="输入钻石数量..." autofocus>
+
+ </div>
+
+ <div class="field">
+
+ <label>来源</label>
+
+ <select id="edit-source">
+
+ <option value="manual">手动设置</option>
+
+ <option value="verified">已验证</option>
+
+ <option value="auto">自动检测</option>
+
+ <option value="registry">注册表</option>
+
+ <option value="override">覆盖</option>
+
+ </select>
+
+ </div>
+
+ <div class="field">
+
+ <div class="checkbox-row">
+
+ <input type="checkbox" id="edit-limited">
+
+ <label for="edit-limited">限时皮肤礼物</label>
+
+ </div>
+
+ </div>
+
+ <div class="field">
+
+ <div class="checkbox-row">
+
+ <input type="checkbox" id="edit-recalculate" checked>
+
+ <label for="edit-recalculate">保存后重新计算历史数据</label>
+
+ </div>
+
+ </div>
+
+ </div>
+
+ <div class="modal-foot">
+
+ <button class="btn-cancel" onclick="closeModal()">取消</button>
+
+ <button class="btn-save" onclick="savePrice()"> 保存</button>
+
+ </div>
+
+ </div>
+
+</div>
+
+
+
+<script>
+
+let currentPage = 1;
+
+let editId = null;
+
+let searchTimer = null;
+
+
+
+function onSearch() {
+
+ clearTimeout(searchTimer);
+
+ var val = document.getElementById('gp-search').value;
+
+ document.getElementById('search-clear').style.display = val ? 'block' : 'none';
+
+ searchTimer = setTimeout(function() { currentPage=1; loadPrices(); }, 250);
+
+}
+
+
+
+function clearSearch() {
+
+ document.getElementById('gp-search').value = '';
+
+ document.getElementById('search-clear').style.display = 'none';
+
+ currentPage = 1;
+
+ loadPrices();
+
+}
+
+
+
+function switchTab(tab) {
+
+ document.querySelectorAll('.gp-tab').forEach(function(t) {
+
+ t.classList.toggle('active', t.dataset.tab === tab);
+
+ });
+
+ document.getElementById('tab-list').style.display = tab === 'list' ? 'block' : 'none';
+
+ document.getElementById('tab-audit').style.display = tab === 'audit' ? 'block' : 'none';
+
+ if (tab === 'audit') loadAudit();
+
+}
+
+
+
+function priceTier(dia) {
+
+ if (dia >= 10000) return 5;
+
+ if (dia >= 1000) return 4;
+
+ if (dia >= 100) return 3;
+
+ if (dia >= 10) return 2;
+
+ return 1;
+
+}
+
+
+
+function priceBarStyle(dia, maxDia) {
+
+ var pct = maxDia > 0 ? Math.min(dia / maxDia * 100, 100) : 0;
+
+ var cls = 'tier-' + priceTier(dia);
+
+ return '<span class="price-bar ' + cls + '" style="width:' + pct + 'px;max-width:60px;"></span>';
+
+}
+
+
+
+function loadPrices() {
+
+ var search = document.getElementById('gp-search').value;
+
+ var source = document.getElementById('source-filter').value;
+
+ var params = new URLSearchParams({ page: currentPage, size: 50, search: search, source: source });
+
+
+
+ var tbody = document.getElementById('price-list');
+
+ tbody.innerHTML = '<tr><td colspan="7" class="loading-skeleton"><div class="spinner-sm"></div><div>加载中...</div></td></tr>';
+
+
+
+ fetch('/api/gift-prices?' + params.toString())
+
+ .then(function(r) { return r.json(); })
+
+ .then(function(data) {
+
+ tbody.innerHTML = '';
+
+ document.getElementById('total-label').textContent = '共 ' + (data.total || 0) + ' 项';
+
+
+
+ if (!data.prices || data.prices.length === 0) {
+
+ tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:50px 20px;color:var(--text-soft);font-size:14px;">' +
+
+ (search ? ' 未找到匹配 "' + escapeHtml(search) + '" 的礼物' : ' 暂无礼物价格数据') + '</td></tr>';
+
+ updateStats(data);
+
+ document.getElementById('pagination').innerHTML = '';
+
+ return;
+
+ }
+
+
+
+ // Find max for price bar scaling
+
+ var maxDia = 0;
+
+ data.prices.forEach(function(p) { if (p.diamond_count > maxDia) maxDia = p.diamond_count; });
+
+
+
+ var sourceLabels = { auto:'自动检测', manual:'手动设置', verified:'已验证', override:'覆盖', official:'注册表', registry:'注册表', unregistered:'未注册' };
+
+
+
+ data.prices.forEach(function(p) {
+
+ var tr = document.createElement('tr');
+
+ var limited = p.is_limited_skin ? ' <span class="tag-limited"> 皮肤</span>' : '';
+
+ var srcLabel = sourceLabels[p.source] || p.source;
+	 if (p.id < 0 && p.source === 'auto') srcLabel = '未注册';
+
+ var isUnreg = p.source === 'unregistered';
+
+ var gidDisplay = p.gift_id > 0 ? '<code style="font-family:var(--font-mono);font-size:11px;">'+p.gift_id+'</code>' : '-';
+
+ var actionBtn = isUnreg
+
+   ? '<button onclick="quickRegister('+p.id+',\''+JSON.stringify(p.gift_name)+'\','+p.diamond_count+')" style="background:var(--warning-bg);color:#92400e;border-color:#d97706;">注册</button>'
+
+   : '<button onclick="openEdit('+p.id+')">编辑</button>';
+
+ tr.innerHTML = [
+
+ '<td><span class="gift-name">' + escapeHtml(p.gift_name) + '</span>' + limited + '</td>',
+
+	 '<td>' + gidDisplay + '</td>',
+
+ '<td><span class="price-cell">' + priceBarStyle(p.diamond_count, maxDia) + p.diamond_count.toLocaleString() + '</span></td>',
+
+ '<td><span class="source-badge ' + (p.id < 0 && p.source === 'auto' ? 'unregistered' : p.source) + '"><span class="src-dot"></span>' + srcLabel + '</span></td>',
+
+ '<td class="num-cell">' + (p.logs || 0).toLocaleString() + '</td>',
+
+ '<td class="num-cell">' + (p.total_dia || 0).toLocaleString() + '</td>',
+
+ '<td class="action-cell">' + actionBtn + '</td>',
+
+ ].join('');
+
+ tbody.appendChild(tr);
+
+ });
+
+
+
+ renderPagination(data.total, data.page);
+
+ updateStats(data);
+
+ })
+
+ .catch(function(e) {
+
+ tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:50px 20px;color:var(--danger);font-size:14px;"> 加载失败: ' + (e.message || '未知错误') + '</td></tr>';
+
+ });
+
+}
+
+
+
+function renderPagination(total, page) {
+
+ var el = document.getElementById('pagination');
+
+ var pages = Math.ceil(total / 50);
+
+ if (pages <= 1) { el.innerHTML = ''; return; }
+
+ var html = '';
+
+ html += '<button ' + (page <= 1 ? 'disabled' : '') + ' onclick="goPage(' + (page - 1) + ')" title="上一页"><</button>';
+
+ var start = Math.max(1, page - 2);
+
+ var end = Math.min(pages, page + 2);
+
+ if (start > 1) html += '<button onclick="goPage(1)">1</button>' + (start > 2 ? '<button disabled>...</button>' : '');
+
+ for (var i = start; i <= end; i++) {
+
+ html += '<button class="' + (i === page ? 'active' : '') + '" onclick="goPage(' + i + ')">' + i + '</button>';
+
+ }
+
+ if (end < pages) html += (end < pages - 1 ? '<button disabled>...</button>' : '') + '<button onclick="goPage(' + pages + ')">' + pages + '</button>';
+
+ html += '<button ' + (page >= pages ? 'disabled' : '') + ' onclick="goPage(' + (page + 1) + ')" title="下一页">></button>';
+
+ el.innerHTML = html;
+
+}
+
+
+
+function goPage(p) { currentPage = p; loadPrices(); }
+
+
+
+function updateStats(data) {
+
+ var total = data.total || 0;
+
+ var confirmed = 0;
+
+ if (data.prices) {
+
+ confirmed = data.prices.filter(function(p) { return p.source === 'manual' || p.source === 'verified' || p.source === 'override' || p.source === 'registry'; }).length;
+
+ }
+
+ document.getElementById('stat-total').textContent = total;
+
+ document.getElementById('stat-confirmed').textContent = confirmed + (confirmed < total ? '+' : '');
+
+}
+
+
+
+function openEdit(priceId) {
+
+ editId = priceId;
+
+ document.getElementById('edit-name').readOnly = true;
+
+ document.getElementById('edit-name').style.background = 'var(--bg)';
+
+ document.getElementById('modal-title').textContent = ' 编辑礼物价格';
+
+ fetch('/api/gift-prices/' + priceId)
+
+ .then(function(r) { return r.json(); })
+
+ .then(function(p) {
+
+ document.getElementById('edit-name').value = p.gift_name;
+
+ document.getElementById('edit-price').value = p.diamond_count;
+
+ document.getElementById('edit-source').value = p.source || 'manual';
+
+ document.getElementById('edit-limited').checked = !!p.is_limited_skin;
+
+ document.getElementById('edit-recalculate').checked = true;
+
+ document.getElementById('edit-modal').classList.add('open');
+
+ setTimeout(function() { document.getElementById('edit-price').focus(); document.getElementById('edit-price').select(); }, 100);
+
+ });
+
+}
+
+
+
+function openAdd() {
+
+ editId = null;
+
+ document.getElementById('edit-name').readOnly = false;
+
+ document.getElementById('edit-name').style.background = '';
+
+ document.getElementById('modal-title').textContent = '+ 添加礼物价格';
+
+ document.getElementById('edit-name').value = '';
+
+ document.getElementById('edit-price').value = '';
+
+ document.getElementById('edit-source').value = 'manual';
+
+ document.getElementById('edit-limited').checked = false;
+
+ document.getElementById('edit-recalculate').checked = false;
+
+ document.getElementById('edit-modal').classList.add('open');
+
+ setTimeout(function() { document.getElementById('edit-name').focus(); }, 100);
+
+}
+
+
+
+function closeModal() {
+
+ document.getElementById('edit-modal').classList.remove('open');
+
+ editId = null;
+
+}
+
+
+
+function quickRegister(id, name, price) {
+
+	 document.getElementById('edit-name').value = name;
+
+	 document.getElementById('edit-price').value = price;
+
+	 document.getElementById('edit-gift-id').value = Math.abs(id);
+
+	 document.getElementById('edit-source').value = 'manual';
+
+	 document.getElementById('edit-limited').checked = false;
+
+	 document.getElementById('edit-recalculate').checked = false;
+
+	 editId = null;
+
+	 document.getElementById('modal-title').textContent = ' 注册礼物: ' + name;
+
+	 document.getElementById('edit-name').readOnly = false;
+
+	 document.getElementById('edit-name').style.background = '';
+
+	 document.getElementById('edit-modal').classList.add('open');
+
+	 setTimeout(function() { document.getElementById('edit-price').focus(); }, 100);
+
+	}
+
+
+
+	function savePrice() {
+
+ var data = {
+
+ gift_name: document.getElementById('edit-name').value.trim(),
+
+ diamond_count: parseInt(document.getElementById('edit-price').value) || 0,
+
+ source: document.getElementById('edit-source').value,
+
+ is_limited_skin: document.getElementById('edit-limited').checked,
+
+ recalculate: document.getElementById('edit-recalculate').checked,
+
+ };
+
+ if (!data.gift_name) { showToast('请填写礼物名称', 'error'); return; }
+
+ if (data.diamond_count < 0) { showToast('价格不能为负数', 'error'); return; }
+
+
+
+ fetch(editId ? '/api/gift-prices/' + editId : '/api/gift-prices', {
+
+ method: 'POST',
+
+ headers: {'Content-Type': 'application/json'},
+
+ body: JSON.stringify(data),
+
+ })
+
+ .then(function(r) { return r.json(); })
+
+ .then(function(result) {
+
+ if (result.error) { showToast(result.error, 'error'); return; }
+
+ var msg = ' 已保存: ' + escapeHtml(result.gift_name) + ' = ' + result.new_price;
+
+ if (result.recalculated && result.recalc_result) {
+
+ msg += '（已重算 ' + result.recalc_result.affected_rows + ' 条记录）';
+
+ }
+
+ showToast(msg, 'success');
+
+ closeModal();
+
+ loadPrices();
+
+ })
+
+ .catch(function() { showToast('保存失败', 'error'); });
+
+}
+
+
+
+function loadAudit() {
+
+ var el = document.getElementById('audit-content');
+
+ el.innerHTML = '<div class="loading-skeleton"><div class="spinner-sm"></div><div>加载审计数据...</div></div>';
+
+
+
+ fetch('/api/gift-prices/audit')
+
+ .then(function(r) { return r.json(); })
+
+ .then(function(data) {
+
+ var html = '';
+
+
+
+ // Discrepancies section
+
+ html += '<div class="audit-section">';
+
+ html += '<h3> 价格冲突 <span style="font-weight:400;font-size:12px;color:var(--text-muted);">(' + (data.discrepancies || []).length + ')</span></h3>';
+
+ if (!data.discrepancies || data.discrepancies.length === 0) {
+
+ html += '<div class="audit-card" style="text-align:center;padding:24px;color:var(--text-soft);font-size:13px;"> 所有礼物价格一致，无冲突</div>';
+
+ } else {
+
+ data.discrepancies.forEach(function(d) {
+
+ html += '<div class="audit-card">';
+
+ html += '<div class="ac-title"><strong>' + escapeHtml(d.gift_name) + '</strong><span style="font-weight:400;font-size:11px;color:var(--text-muted);">（' + d.total_occurrences + ' 条记录）</span></div>';
+
+ html += '<div class="ac-detail"><div class="price-list">';
+
+ d.prices.forEach(function(p) {
+
+ var marker = p.unit_price !== d.db_price ? ' <span style="color:var(--danger);font-weight:700;"> 不一致</span>' : ' <span style="color:var(--success);"> 匹配</span>';
+
+ html += '<span class="ac-price' + (p.unit_price !== d.db_price ? ' old-price' : '') + '">' + p.unit_price + '</span> 钻石（' + p.occurrences + ' 次，' + p.sessions + ' 场）' + marker + '<br>';
+
+ });
+
+ html += 'DB 价格：<span class="ac-price new-price">' + (d.db_price !== null ? d.db_price : '未设置') + '</span>';
+
+ if (d.db_source) html += ' <span class="source-badge ' + d.db_source + '"><span class="src-dot"></span>' + d.db_source + '</span>';
+
+ html += '</div></div></div>';
+
+ });
+
+ }
+
+ html += '</div>';
+
+
+
+ // History section
+
+ html += '<div class="audit-section">';
+
+ html += '<h3> 变更历史 <span style="font-weight:400;font-size:12px;color:var(--text-muted);">(' + (data.history || []).length + ')</span></h3>';
+
+ if (!data.history || data.history.length === 0) {
+
+ html += '<div class="history-empty">暂无变更记录</div>';
+
+ } else {
+
+ data.history.forEach(function(h) {
+
+ html += '<div class="audit-card" style="display:flex;align-items:center;gap:12px;padding:10px 14px;">';
+
+ html += '<span style="font-weight:600;font-size:13px;min-width:90px;">' + escapeHtml(h.gift_name) + '</span>';
+
+ html += '<span style="font-family:var(--font-mono);font-size:12px;"><span class="ac-price old-price">' + h.old_price + '</span> &rarr; <span class="ac-price new-price">' + h.new_price + '</span></span>';
+
+ if (h.affected_rows) html += '<span style="font-size:11px;color:var(--text-muted);">(' + h.affected_rows + ' 行)</span>';
+
+ html += '<span style="font-size:11px;color:var(--text-soft);margin-left:auto;white-space:nowrap;">' + (h.created_at || '') + '</span>';
+
+ html += '</div>';
+
+ });
+
+ }
+
+ html += '</div>';
+
+
+
+ el.innerHTML = html;
+
+ })
+
+ .catch(function() {
+
+ el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--danger);font-size:14px;"> 审计数据加载失败</div>';
+
+ });
+
+}
+
+
+
+function escapeHtml(s) {
+
+ if (!s) return '';
+
+ return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+}
+
+
+
+function showToast(msg, type) {
+
+ // Use existing toast system from base.html
+
+ var container = document.getElementById('toast-container');
+
+ var t = document.createElement('div');
+
+ t.className = 'toast' + (type ? ' toast-' + type : '');
+
+ t.innerHTML = msg;
+
+ container.appendChild(t);
+
+ t.offsetHeight;
+
+ t.classList.add('show');
+
+ t._timer = setTimeout(function() {
+
+ t.classList.remove('show');
+
+ setTimeout(function() { if (t.parentNode) t.parentNode.removeChild(t); }, 400);
+
+ }, 3000);
+
+}
+
+
+
+// Keyboard: Escape closes modal, Enter saves
+
+document.addEventListener('keydown', function(e) {
+
+ if (e.key === 'Escape' && document.getElementById('edit-modal').classList.contains('open')) {
+
+ closeModal();
+
+ }
+
+ if (e.key === 'Enter' && document.getElementById('edit-modal').classList.contains('open')) {
+
+ var tag = document.activeElement ? document.activeElement.tagName : '';
+
+ if (tag !== 'SELECT') savePrice();
+
+ }
+
+});
+
+
+
+// Initial load
+
+loadPrices();
+
+</script>
+
+{% endblock %}
+

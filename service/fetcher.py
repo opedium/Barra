@@ -1,4 +1,4 @@
-﻿"""é‡‡é›†å™¨ä¸»ç±»ï¼šWebSocket è¿žæŽ¥ç®¡ç†ã€æ¶ˆæ¯åˆ†å‘ã€å¿ƒè·³ã€çœ‹é—¨ç‹—ã€ç­‰å¾…å¼€æ’­ã€‚
+"""é‡‡é›†å™¨ä¸»ç±»ï¼šWebSocket è¿žæŽ¥ç®¡ç†ã€æ¶ˆæ¯åˆ†å‘ã€å¿ƒè·³ã€çœ‹é—¨ç‹—ã€ç­‰å¾…å¼€æ’­ã€‚
 
 DouyinBarrage æ˜¯æ•´ä¸ªé‡‡é›†æµç¨‹çš„åè°ƒä¸­å¿ƒï¼Œç»„åˆä»¥ä¸‹æ¨¡å—ï¼š
     base.parser      æ¶ˆæ¯è§£æžä¸Žåˆ†å‘è¡¨
@@ -46,7 +46,7 @@ from base.utils import (
     rotate_ua, set_current_anchor, set_anchor_name,
 )
 from base.output import setup_logger, ThroughputCounter, BARRAGE, RoomLogFilter, display_width, is_ci_environment
-from base.parser import get_dedup_stats, init_db, create_session, end_session, flush_to_sqlite, flush_writes, record_chat, record_gift, upsert_user, _get_conn, flush_all_buffers, flush_combo_buffer, set_gift_finalize_callback, remove_gift_finalize_callback
+from base.parser import get_dedup_stats, get_flow_counters, get_combo_buffer_size, init_db, create_session, end_session, flush_to_sqlite, flush_writes, record_chat, record_gift, request_backfill_uid, upsert_user, _get_conn, flush_all_buffers, flush_combo_buffer, set_gift_finalize_callback, remove_gift_finalize_callback
 from service.network import (
     fetch_ttwid, enter_room_api, download_image,
     fetch_user_info,
@@ -54,9 +54,9 @@ from service.network import (
     build_websocket_url, build_ws_cookie,
 )
 from service.signer import generate_signature
+from base.dedup import LRUDedupCache, MergeTracker, _DEDUP_EXTRACTORS, _VALUE_EXTRACTORS, _key_to_hash, _fallback_key
 
 logger = logging.getLogger(__name__)
-
 
 class DouyinBarrage:
     """æŠ–éŸ³ç›´æ’­é—´å¼¹å¹•æ•°æ®é‡‡é›†å™¨ã€‚
@@ -79,7 +79,8 @@ class DouyinBarrage:
         'network': {
             'http_timeout': 15, 'ws_connect_timeout': 30, 'silence_timeout': 60,
             'user_msg_timeout': 120,
-            'heartbeat_interval': 10, 'rcvbuf_kb': 2048, 'proxy': None,
+            'heartbeat_interval': 10, 'rcvbuf_kb': 16384, 'proxy': None,
+            'dual_ws': False, 'dual_ws_identity': 'smart', 'ws_host2': None, 'ws_cookie2': None,
         },
         'max_reconnects': 0,
         'reconnect_base_delay': 2,
@@ -131,6 +132,13 @@ class DouyinBarrage:
         self._heartbeat_interval = net_cfg.get('heartbeat_interval', 10)
         self._proxy = net_cfg.get('proxy', None)
         self._rcvbuf = net_cfg.get('rcvbuf_kb', 256) * 1024
+        # ── dual WS ──
+        self._dual_ws = net_cfg.get('dual_ws', False)
+        self._dual_ws_identity = net_cfg.get('dual_ws_identity', 'smart')
+        self._ws_host2 = net_cfg.get('ws_host2', None)
+        self._ws_proxy2 = net_cfg.get('ws_proxy2', None)
+        _ws_ver = tuple(int(x) for x in websockets.__version__.split('.')[:2])
+        self._ws_use_additional_headers = _ws_ver >= (14, 0)
 
         # â”€â”€ HTTP Session â”€â”€
         self.session = requests.Session()
@@ -158,11 +166,25 @@ class DouyinBarrage:
         else:
             logger.info("[å¯åŠ¨] æœªåŠ è½½ cookie.txtï¼Œä»¥æ¸¸å®¢èº«ä»½é‡‡é›†ï¼ˆç¤¼ç‰©ç­‰ä¿¡æ¯å¯èƒ½å—é™ï¼‰")
 
+        # ── Dual WS Cookie2 ──
+        self._login_cookies2 = {}
+        ws_cookie2_path = net_cfg.get('ws_cookie2')
+        if ws_cookie2_path:
+            script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            resolved = os.path.join(script_dir, ws_cookie2_path)
+            resolved = os.path.normpath(resolved)
+            self._login_cookies2 = load_cookies(resolved)
+            if self._login_cookies2:
+                logger.info(f"[启动] 已加载次连接 Cookie（{len(self._login_cookies2)} 项）")
+        if not self._login_cookies2:
+            self._login_cookies2 = dict(self._login_cookies)  # fallback to primary
+
         # â”€â”€ ç›´æ’­é—´ â”€â”€
         self.live_id = live_id
 
         # â”€â”€ è¿žæŽ¥çŠ¶æ€ â”€â”€
         self._ws = None
+        self._ws2 = None  # secondary WebSocket connection
         self._connected_event = threading.Event()
         self._stop_event = threading.Event()
         self._started = False
@@ -173,11 +195,13 @@ class DouyinBarrage:
         self._loop = None
         self._loop_thread = None
 
-        # â”€â”€ å¥åº·æ£€æµ‹ â”€â”€
+        # â”€â”€ å ¥åº·æ£€æµ‹ â”€â”€
         self._last_msg_time = 0.0
         self._last_msg_time_lock = threading.Lock()
+        self._last_secondary_msg_time = 0.0
+        self._last_secondary_msg_time_lock = threading.Lock()
 
-        # â”€â”€ ä¸šåŠ¡æ¶ˆæ¯å¥åº·æ£€æµ‹ â”€â”€
+        # â”€â”€ ä¸šåŠ¡æ¶ˆæ ¯å ¥åº·æ£€æµ‹ â”€â”€
         self._last_business_msg_time = 0.0
         self._last_business_msg_time_lock = threading.Lock()
         self._last_user_msg_time = 0.0
@@ -202,7 +226,15 @@ class DouyinBarrage:
         # â”€â”€ åŒ¿åç”¨æˆ·è§£æžè·Ÿè¸ªï¼ˆé¿å…é‡å¤ API è°ƒç”¨ï¼‰â”€â”€
         self._resolving_anon = set()
         self._last_anon_resolve = 0
-        self._subscribe_dedup = {}  # sub_key -> timestampï¼Œè®¢é˜…æ¶ˆæ¯ 30s çª—å£åŽ»é‡
+        self._subscribe_dedup = {}
+        self._backfilled_users = set()  # (session_id, user_name) -> å·²å›žå¡« uidï¼Œé¿å…é‡å¤ API è°ƒç”¨
+        self._sub_seen = 0
+        self._sub_deduped = 0
+
+        # ── dual WS merge ──
+        self._dedup_cache = LRUDedupCache(max_size=100000)
+        self._merge_tracker = MergeTracker(max_pending=50000)
+        self._union_stats = {"primary": 0, "secondary": 0, "dup": 0}
 
         # â”€â”€ ç»Ÿè®¡å®šæ—¶æ‰“å° â”€â”€
         self._stats_interval = self.config.get('stats_interval', 60)
@@ -228,6 +260,8 @@ class DouyinBarrage:
 
         # â”€â”€ é¢„è®¡ç®— enable_outputs ç¼“å­˜ï¼ˆè¿žæŽ¥å»ºç«‹æ—¶æ›´æ–°ï¼‰â”€â”€
         self._eo_cached = dict(self._enable_outputs)
+        self._eo_cached['live_stop'] = self.config.get('live_stop', False)
+        self._dump_pk_raw = self._enable_outputs.get('dump_pk_raw', False)
 
         # â”€â”€ é¢æ¿åˆ·æ–°èŠ‚æµ â”€â”€
         self._panel_last = 0.0
@@ -236,7 +270,7 @@ class DouyinBarrage:
         self._executor = ThreadPoolExecutor(max_workers=2)
 
         # â”€â”€ æ¶ˆæ¯å¤„ç†é˜Ÿåˆ—ï¼ˆæ”¶/ç®—åˆ†ç¦»ï¼Œé˜²é«˜å³°æ‹¥å¡žï¼‰â”€â”€
-        self._msg_queue = queue.Queue(maxsize=20000)
+        self._msg_queue = queue.Queue(maxsize=50000)
         self._process_thread = None
         self._pending_signal = None  # å¤„ç†çº¿ç¨‹æ£€æµ‹åˆ°çš„æŽ§åˆ¶ä¿¡å·
 
@@ -284,6 +318,8 @@ class DouyinBarrage:
             info['status'] = 'connecting'
         elif self._room_info.get('status') == 4:
             info['status'] = 'waiting'  # æœªå¼€æ’­ï¼Œç­‰å¾…ä¸­
+        elif self._is_waiting_live():
+            info['status'] = 'waiting'
         else:
             info['status'] = 'connecting'
 
@@ -524,15 +560,11 @@ class DouyinBarrage:
     def room_id(self):
         if self._room_id:
             return self._room_id
-        try:
-            self._room_info = enter_room_api(
-                self.ttwid, self._ua, self._ua_version,
-                self.live_id, self._http_timeout, session=self.session,
-            )
-            self._room_id = self._room_info['room_id']
-        except Exception as e:
-            logger.warning(f"[å¯åŠ¨] HTTP é¢„è¯·æ±‚å¤±è´¥: {e}")
-            self._room_id = None
+        self._room_info = enter_room_api(
+            self.ttwid, self._ua, self._ua_version,
+            self.live_id, self._http_timeout, session=self.session,
+        )
+        self._room_id = self._room_info['room_id']
         set_anchor_name(self.live_id, self.anchor_name)
         status = self._room_info['status']
         status_text = {2: 'ç›´æ’­ä¸­', 4: 'æœªå¼€æ’­'}.get(status, f'æœªçŸ¥({status})')
@@ -584,8 +616,26 @@ class DouyinBarrage:
             if not self._stop_event.is_set():
                 logger.error(f"[æŽ§åˆ¶] äº‹ä»¶å¾ªçŽ¯å¼‚å¸¸: {e}")
         finally:
+            self._cancel_all_tasks()
             self._loop.run_until_complete(self._loop.shutdown_asyncgens())
             self._loop.close()
+
+    def _cancel_all_tasks(self):
+        """Cancel remaining asyncio tasks before loop close (prevents
+        SSL transport and 'Task was destroyed but pending' warnings
+        on Python 3.9 Windows ProactorEventLoop)."""
+        try:
+            pending = asyncio.all_tasks(self._loop)
+            current = asyncio.current_task(self._loop)
+            to_cancel = [t for t in pending if t is not current]
+            for t in to_cancel:
+                t.cancel()
+            if to_cancel:
+                self._loop.run_until_complete(
+                    asyncio.gather(*to_cancel, return_exceptions=True)
+                )
+        except Exception:
+            pass
 
     def stop(self):
         """åœæ­¢é‡‡é›†ï¼Œå…³é—­ WebSocketï¼Œç­‰å¾…äº‹ä»¶å¾ªçŽ¯é€€å‡ºã€‚"""
@@ -613,7 +663,13 @@ class DouyinBarrage:
 
         self._stop_processor()
 
-        # force flush write queue + combo buffers first
+        # æ³¨é”€å›žè°ƒï¼Œé¿å…å½±å“å…¶ä»–æˆ¿é—´
+        try:
+            remove_gift_finalize_callback(self._gift_callback_anchor)
+        except Exception:
+            pass
+
+        # å¼ºåˆ¶ commit å‰©ä½™æ‰¹é‡ + æ¸…ç©ºæ‰€æœ‰ç¼“å†²åŒº
         try:
             flush_writes()
         except Exception:
@@ -623,34 +679,11 @@ class DouyinBarrage:
         except Exception:
             pass
 
-        # flush pending combo writes to DB
-        try:
-            if hasattr(self, "_combo_pending") and self._combo_pending:
-                pending = self._combo_pending[:]
-                self._combo_pending.clear()
-                for data in pending:
-                    uid = data.get("user_id", "")
-                    if uid:
-                        record_gift(self._session_id, uid,
-                            data.get("user_name", ""),
-                            data.get("gift_name", ""),
-                            data.get("gift_count", 0),
-                            data.get("diamond_total", 0),
-                            data.get("grade", ""),
-                            data.get("fans_club", ""))
-                flush_writes()
-        except Exception:
-            pass
-
-        # unregister callback
-        try:
-            remove_gift_finalize_callback(self._gift_callback_anchor)
-        except Exception:
-            pass
+        # ç»“æŸ SQLite åœºæ¬¡ï¼ˆç©ºåœºæ¬¡è‡ªåŠ¨åˆ é™¤ï¼‰
         if self._session_id:
             try:
                 from base.parser import _get_conn as _gc, delete_session as _ds
-                cnt = _gc().execute('SELECT COUNT(*) FROM gift_logs WHERE session_id = %s', (self._session_id,)).fetchone()['count']
+                cnt = _gc().execute('SELECT COUNT(*) FROM gift_logs WHERE session_id = ?', (self._session_id,)).fetchone()[0]
                 if cnt == 0:
                     _ds(self._session_id)
                     logger.info(f"[DB] ç©ºåœºæ¬¡ #{self._session_id} å·²åˆ é™¤")
@@ -708,6 +741,9 @@ class DouyinBarrage:
             except Exception:
                 pass
 
+        # æ¸…é™¤è¿žæŽ¥çŠ¶æ€ï¼Œé²æ­¢ get_status() è¿”å›ž 'collecting'
+        self._connected_event.clear()
+
         poll_interval = self.config.get('live_check_interval', 30)
         label = self.display_name
         logger.info(f'[æŽ§åˆ¶] {label} ç›‘æµ‹ä¸­ï¼ˆé—´éš” {poll_interval}sï¼‰')
@@ -741,6 +777,13 @@ class DouyinBarrage:
         self._output_dir = None
         self._resolving_anon.clear()
         self._subscribe_dedup.clear()
+        self._backfilled_users.clear()
+        self._sub_seen = 0
+        self._sub_deduped = 0
+        # 重置 dual WS 合并跟踪器（等待开播→重新开播场景）
+        if self._dual_ws:
+            self._merge_tracker = MergeTracker(max_pending=50000)
+            self._union_stats = {'primary': 0, 'secondary': 0, 'dup': 0}
 
     def _start_monitor_loop(self):
         if self._monitor_stop is not None:
@@ -856,49 +899,107 @@ class DouyinBarrage:
     # â”€â”€ å¼‚æ­¥ WebSocket è¿žæŽ¥å¾ªçŽ¯ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _connect_loop(self):
-        """å¼‚æ­¥ WebSocket è¿žæŽ¥ä¸»å¾ªçŽ¯ï¼ˆå«é‡è¿žé€»è¾‘ï¼‰ã€‚"""
+        """å¼æ­¥ WebSocket è¿æ¥ä¸»å¾ªç¯ï¼å«éè¿é»è¾ï¼ã
+
+        ç®¡çä¸»è¿æ¥çéè¿å¾ªç¯ãæ¬¡è¿æ¥ï¼secondary WSï¼ä½ä¸ºç¬ç«çåå°ä»»å¡
+        æç»­è¿è¡ï¼ä¸åä¸»è¿æ¥éè¿å½±åã
+        """
         max_reconnects = self.config.get('max_reconnects', 0)
         base_delay = self.config.get('reconnect_base_delay', 2)
         max_delay = self.config.get('reconnect_max_delay', 120)
         self._reconnect_count = 0
 
-        while not self._stop_event.is_set():
-            try:
-                logger.info(f"[è¿žæŽ¥] ç¬¬ {self._reconnect_count + 1} æ¬¡è¿žæŽ¥")
+        # å¯å¨ secondary WS ä½ä¸ºè¿ç»­çåå°ä»»å¡
+        # å¨ while å¾ªç¯ä¹å¤ï¼ä½¿å¶ä¸åä¸»è¿æ¥éè¿å½±å
+        _secondary_task = None
+        if self._dual_ws:
+            _secondary_task = asyncio.create_task(self._secondary_ws())
 
-                # â”€â”€ çŠ¶æ€æ„ŸçŸ¥ï¼ˆHTTP APIï¼Œåœ¨çº¿ç¨‹æ± æ‰§è¡Œï¼‰â”€â”€
-                # é‡è¿žæ—¶å¤ç”¨ç¼“å­˜çš„ room_idï¼Œè·³è¿‡ enter_room_api ä»¥é¿å…
-                # åŒä¸€ cookie å¤šæ¬¡"è¿›å…¥æˆ¿é—´"è§¦å‘æœåŠ¡ç«¯ session å†²çªï¼ˆå¯¼è‡´æ‰‹æœºè¢«è¸¢ï¼‰
-                if self._reconnect_count == 1 and self._room_id:
-                    logger.info(f"[è¿žæŽ¥] é‡è¿žå¤ç”¨ room_id={self._room_id}ï¼Œè·³è¿‡ enter_room_api")
-                    status = 2
-                else:
-                    self._room_id = None
-                    info = await asyncio.get_event_loop().run_in_executor(
-                        self._executor,
-                        lambda: enter_room_api(
-                            self.ttwid, self._ua, self._ua_version,
-                            self.live_id, self._http_timeout, session=self.session,
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    logger.info(f"[è¿žæŽ¥] ç¬¬ {self._reconnect_count + 1} æ¬¡è¿žæŽ¥")
+            
+                    # â”€â”€ çŠ¶æ€æ„ŸçŸ¥ï¼ˆHTTP APIï¼Œåœ¨çº¿ç¨‹æ± æ‰§è¡Œï¼‰â”€â”€
+                    # é‡è¿žæ—¶å¤ç”¨ç¼“å­˜çš„ room_idï¼Œè·³è¿‡ enter_room_api ä»¥é¿å…
+                    # åŒä¸€ cookie å¤šæ¬¡"è¿›å…¥æˆ¿é—´"è§¦å‘æœåŠ¡ç«¯ session å†²çªï¼ˆå¯¼è‡´æ‰‹æœºè¢«è¸¢ï¼‰
+                    if self._reconnect_count == 1 and self._room_id:
+                        logger.info(f"[è¿žæŽ¥] é‡è¿žå¤ç”¨ room_id={self._room_id}ï¼Œè·³è¿‡ enter_room_api")
+                        status = 2
+                    else:
+                        self._room_id = None
+                        info = await asyncio.get_event_loop().run_in_executor(
+                            self._executor,
+                            lambda: enter_room_api(
+                                self.ttwid, self._ua, self._ua_version,
+                                self.live_id, self._http_timeout, session=self.session,
+                            )
                         )
-                    )
-                    self._room_id = info['room_id']
-                    self._room_info = info
-                    set_anchor_name(self.live_id, info.get('anchor_name', ''))
-
-                    anchor = info.get('anchor_name', '')
-                    if anchor:
-                        RoomLogFilter.update_anchor(self.live_id, anchor)
-
-                    if self._on_room_info and self._reconnect_count == 0:
-                        try:
-                            self._on_room_info(self.live_id, info.get('anchor_name', ''))
-                        except Exception:
-                            pass
-
-                    status = info['status']
-
-                if status != 2:
-                    poll_interval = self.config.get('live_check_interval', 30)
+                        self._room_id = info['room_id']
+                        self._room_info = info
+                        set_anchor_name(self.live_id, info.get('anchor_name', ''))
+            
+                        anchor = info.get('anchor_name', '')
+                        if anchor:
+                            RoomLogFilter.update_anchor(self.live_id, anchor)
+            
+                        if self._on_room_info and self._reconnect_count == 0:
+                            try:
+                                self._on_room_info(self.live_id, info.get('anchor_name', ''))
+                            except Exception:
+                                pass
+            
+                        status = info['status']
+            
+                    if status != 2:
+                        poll_interval = self.config.get('live_check_interval', 30)
+                        if self._ttwid_refresh_needed:
+                            self._ttwid_refresh_needed = False
+                            self._ttwid = None
+                            try:
+                                _ = self.ttwid
+                                logger.info("[æˆ¿é—´] ttwid åˆ·æ–°æˆåŠŸ")
+                            except RuntimeError as e:
+                                logger.error(f"[æˆ¿é—´] ttwid åˆ·æ–°å¤±è´¥: {e}ï¼Œæ— æ³•ç»§ç»­è¿žæŽ¥ï¼Œè¯·æ£€æŸ¥ç½‘ç»œ")
+                                break
+                        if status == 4:
+                            # ä¸»æ’­ä¸‹æ’­ï¼Œè¿›å…¥ç­‰å¾…å¼€æ’­
+                            if not self._is_waiting_live():
+                                self._enter_wait_mode()
+                        else:
+                            # ä¸´æ—¶é”™è¯¯ï¼ˆ30003 ç­‰ï¼‰ï¼Œä¸ç»“æŸåœºæ¬¡
+                            logger.debug(f"[ç›‘æŽ§] API è¿”å›žçŠ¶æ€ {status}ï¼Œæš‚ä¸ç»“æŸåœºæ¬¡")
+                        while not self._stop_event.is_set():
+                            if self._live_event.is_set():
+                                self._live_event.clear()
+                                break
+                            await asyncio.sleep(1.0)
+                        if self._stop_event.is_set():
+                            break
+                        self._reconnect_count = 0
+                        continue
+                    else:
+                        if self._is_waiting_live():
+                            self._on_live_started(source='reconnect')
+                            logger.info("[è¿žæŽ¥] æ£€æµ‹åˆ°å¼€æ’­ï¼Œç­‰å¾… 5 ç§’åŽå»ºç«‹ WebSocketï¼ˆè®©æœåŠ¡ç«¯è·¯ç”±å°±ç»ªï¼‰")
+                            await asyncio.sleep(5)
+                            self._ttwid = None
+                            try:
+                                _ = self.ttwid
+                                logger.info("[è¿žæŽ¥] ttwid å·²åˆ·æ–°")
+                            except RuntimeError as e:
+                                logger.warning(f"[è¿žæŽ¥] ttwid åˆ·æ–°å¤±è´¥: {e}ï¼Œä½¿ç”¨çŽ°æœ‰å€¼ç»§ç»­")
+                        label = self.display_name
+                        logger.info(f'[æˆ¿é—´] {label} ç›´æ’­ä¸­')
+                        if not self._is_waiting_live():
+                            self._queue_handler.set_room_status(
+                                self.live_id, 'collecting',
+                                anchor=self.display_name,
+                                msg_count=0,
+                                elapsed=0,
+                            )
+            
+                    # ttwid ç­¾åæ ¡éªŒå¤±è´¥æ—¶è‡ªåŠ¨åˆ·æ–°
                     if self._ttwid_refresh_needed:
                         self._ttwid_refresh_needed = False
                         self._ttwid = None
@@ -908,311 +1009,259 @@ class DouyinBarrage:
                         except RuntimeError as e:
                             logger.error(f"[æˆ¿é—´] ttwid åˆ·æ–°å¤±è´¥: {e}ï¼Œæ— æ³•ç»§ç»­è¿žæŽ¥ï¼Œè¯·æ£€æŸ¥ç½‘ç»œ")
                             break
-                    if status == 4:
-                        # ä¸»æ’­ä¸‹æ’­ï¼Œè¿›å…¥ç­‰å¾…å¼€æ’­
-                        if not self._is_waiting_live():
-                            self._enter_wait_mode()
-                    else:
-                        # ä¸´æ—¶é”™è¯¯ï¼ˆ30003 ç­‰ï¼‰ï¼Œä¸ç»“æŸåœºæ¬¡
-                        logger.debug(f"[ç›‘æŽ§] API è¿”å›žçŠ¶æ€ {status}ï¼Œæš‚ä¸ç»“æŸåœºæ¬¡")
-                    while not self._stop_event.is_set():
-                        if self._live_event.is_set():
-                            self._live_event.clear()
-                            break
-                        await asyncio.sleep(1.0)
-                    if self._stop_event.is_set():
-                        break
-                    self._reconnect_count = 0
-                    continue
-                else:
-                    if self._is_waiting_live():
-                        self._on_live_started(source='reconnect')
-                        logger.info("[è¿žæŽ¥] æ£€æµ‹åˆ°å¼€æ’­ï¼Œç­‰å¾… 5 ç§’åŽå»ºç«‹ WebSocketï¼ˆè®©æœåŠ¡ç«¯è·¯ç”±å°±ç»ªï¼‰")
-                        await asyncio.sleep(5)
-                        self._ttwid = None
+            
+                    # åˆå§‹åŒ– SQLite + åˆ›å»ºåœºæ¬¡ï¼ˆä»…é¦–æ¬¡ï¼‰
+                    if not self._db_inited:
                         try:
-                            _ = self.ttwid
-                            logger.info("[è¿žæŽ¥] ttwid å·²åˆ·æ–°")
-                        except RuntimeError as e:
-                            logger.warning(f"[è¿žæŽ¥] ttwid åˆ·æ–°å¤±è´¥: {e}ï¼Œä½¿ç”¨çŽ°æœ‰å€¼ç»§ç»­")
-                    label = self.display_name
-                    logger.info(f'[æˆ¿é—´] {label} ç›´æ’­ä¸­')
-                    if not self._is_waiting_live():
-                        self._queue_handler.set_room_status(
-                            self.live_id, 'collecting',
-                            anchor=self.display_name,
-                            msg_count=0,
-                            elapsed=0,
-                        )
-
-                # ttwid ç­¾åæ ¡éªŒå¤±è´¥æ—¶è‡ªåŠ¨åˆ·æ–°
-                if self._ttwid_refresh_needed:
-                    self._ttwid_refresh_needed = False
-                    self._ttwid = None
-                    try:
-                        _ = self.ttwid
-                        logger.info("[æˆ¿é—´] ttwid åˆ·æ–°æˆåŠŸ")
-                    except RuntimeError as e:
-                        logger.error(f"[æˆ¿é—´] ttwid åˆ·æ–°å¤±è´¥: {e}ï¼Œæ— æ³•ç»§ç»­è¿žæŽ¥ï¼Œè¯·æ£€æŸ¥ç½‘ç»œ")
-                        break
-
-                # åˆå§‹åŒ– SQLite + åˆ›å»ºåœºæ¬¡ï¼ˆä»…é¦–æ¬¡ï¼‰
-                if not self._db_inited:
-                    try:
-                        init_db()
-                        if not self._db_inited:
-                            self._batch_resolve_anonymous()
-                        self._db_inited = True
-                    except Exception as e:
-                        logger.warning(f"[DB] åˆå§‹åŒ–å¤±è´¥: {e}")
-
-                if self._session_id is None:
-                    try:
-                        self._session_id = create_session(self.live_id, self.anchor_name)
-                    except Exception as e:
-                        logger.warning(f"[DB] åˆ›å»ºåœºæ¬¡å¤±è´¥: {e}")
-                else:
-                    # å¦‚æžœå·²æœ‰åœºæ¬¡ä½†å·²ç»“æŸï¼Œå»ºæ–°åœºæ¬¡ï¼ˆæ­£å¸¸æµç¨‹ï¼šç›´æ’­ç»“æŸâ†’é‡å¼€æ’­ï¼‰
-                    try:
-                        cur = _get_conn().execute('SELECT status FROM sessions WHERE id = %s', (self._session_id,))
-                        row = cur.fetchone()
-                        if row and row['status'] == 'ended':
-                            # æ£€æŸ¥ä¸Šä¸€åœºæ¬¡æ˜¯å¦ä¸ºè™šæµ®åœºæ¬¡ï¼ˆæžå°‘æ•°æ® -> ç›´æ’­å·²ç»“æŸï¼ŒAPI æœªåŠæ—¶æ›´æ–°ï¼‰
-                            cur2 = _get_conn().execute(
-                                'SELECT (SELECT COUNT(*) FROM gift_logs WHERE session_id = ?) as gc, (SELECT COUNT(*) FROM chat_logs WHERE session_id = ?) as cc',
-                                (self._session_id, self._session_id)
-                            )
-                            r2 = cur2.fetchone()
-                            if r2 and r2['gc'] < 5 and r2['cc'] < 10:
-                                logger.info(f"[æŽ§åˆ¶] ä¸Šä¸€åœºæ¬¡ #{self._session_id} ä¸ºè™šæµ®åœºæ¬¡ (ç¤¼ç‰©={r2['gc']} å¼¹å¹•={r2['cc']})ï¼Œè¿›å…¥ç­‰å¾…æ¨¡å¼")
-                                self._enter_wait_mode()
-                                continue  # é‡æ–°æ£€æŸ¥ API çŠ¶æ€
-                            else:
+                            init_db()
+                            if not self._db_inited:
+                                self._batch_resolve_anonymous()
+                            self._db_inited = True
+                        except Exception as e:
+                            logger.warning(f"[DB] åˆå§‹åŒ–å¤±è´¥: {e}")
+            
+                    if self._session_id is None:
+                        try:
+                            self._session_id = create_session(self.live_id, self.anchor_name)
+                        except Exception as e:
+                            logger.warning(f"[DB] åˆ›å»ºåœºæ¬¡å¤±è´¥: {e}")
+                    else:
+                        # å¦‚æžœå·²æœ‰åœºæ¬¡ä½†å·²ç»“æŸï¼Œå»ºæ–°åœºæ¬¡ï¼ˆæ­£å¸¸æµç¨‹ï¼šç›´æ’­ç»“æŸâ†’é‡å¼€æ’­ï¼‰
+                        try:
+                            cur = _get_conn().execute('SELECT status FROM sessions WHERE id = ?', (self._session_id,))
+                            row = cur.fetchone()
+                            if row and row['status'] == 'ended':
                                 self._session_id = create_session(self.live_id, self.anchor_name)
-                    except Exception:
-                        pass
-
-                # combo æœ€ç»ˆåŒ–å›žè°ƒï¼šåªæŽ¨å…¥é˜Ÿåˆ—ï¼Œä¸ç›´æŽ¥å†™DB (ç”± _process_thread çº¿ç¨‹ç»Ÿä¸€å†™å…¥ï¼Œé¿å…çº¿ç¨‹ç´¢)
-                if not hasattr(self, '_combo_pending'):
-                    self._combo_pending = []
-                self._gift_callback_anchor = self.anchor_name or self.live_id
-                # re-register on reconnect (stop removes it)
-                def _on_gift_finalize(data):
-                    if data:
-                        self._combo_pending.append(dict(data))
-                set_gift_finalize_callback(self._gift_callback_anchor, _on_gift_finalize)
-
-                # å°†ä¸»æ’­ä¿¡æ¯å†™å…¥ users è¡¨ï¼ˆsec_uidã€å¤´åƒï¼‰ï¼Œç¡®ä¿ä¸»æ’­åœ¨æ¦œå•/ç”¨æˆ·é¡µå¯è§
-                if self._room_info:
-                    try:
-                        anchor_uid = self._room_info.get('anchor_user_id', '')
-                        if anchor_uid:
-                            upsert_user(
+                        except Exception:
+                            pass
+            
+                    # combo æœ€ç»ˆåŒ–å›žè°ƒï¼šåªæŽ¨å…¥é˜Ÿåˆ—ï¼Œä¸ç›´æŽ¥å†™DB (ç”± _process_thread çº¿ç¨‹ç»Ÿä¸€å†™å…¥ï¼Œé¿å…çº¿ç¨‹ç´¢)
+                    if not hasattr(self, '_combo_pending'):
+                        self._combo_pending = []
+                    def _on_gift_finalize(data):
+                        if data:
+                            self._combo_pending.append(dict(data))
+                    set_gift_finalize_callback(self.anchor_name or self.live_id, _on_gift_finalize)
+                    self._gift_callback_anchor = self.anchor_name or self.live_id
+            
+                    # å°†ä¸»æ’­ä¿¡æ¯å†™å…¥ users è¡¨ï¼ˆsec_uidã€å¤´åƒï¼‰ï¼Œç¡®ä¿ä¸»æ’­åœ¨æ¦œå•/ç”¨æˆ·é¡µå¯è§
+                    if self._room_info:
+                        try:
+                            anchor_uid = self._room_info.get('anchor_user_id', '')
+                            if anchor_uid:
+                                upsert_user(
                                 anchor_uid,
                                 self._room_info.get('anchor_name', ''),
                                 sec_uid=self._room_info.get('sec_uid', ''),
                                 avatar_url=self._room_info.get('anchor_avatar', ''),
-                            )
-                    except Exception:
-                        pass
-
-                # æ¯æ¬¡ WebSocket è¿žæŽ¥å‰é‡æ–°ç”Ÿæˆ user_unique_id
-                old_uid = self._user_unique_id
-                self._user_unique_id = generate_user_unique_id()
-                logger.info(f"[è¿žæŽ¥] user_unique_id å·²åˆ·æ–°: {old_uid} â†’ {self._user_unique_id}")
-
-                # æž„å»º WebSocket URL å¹¶ç­¾å
-                wss = build_websocket_url(self._room_id, self._user_unique_id, self._ua_version, self._ws_host, self._ws_path)
-                signature = generate_signature(self._room_id, self._user_unique_id)
-                if not signature:
-                    self._last_error = "X-Bogus ç­¾åç”Ÿæˆå¤±è´¥ï¼Œè¯·ç¡®è®¤ Node.js å·²å®‰è£…"
-                    logger.error(f"[ç­¾å] {self._last_error}ï¼Œåœæ­¢é‡‡é›†")
-                    break
-                wss += f"&signature={signature}"
-                logger.debug(f"[ç­¾å] ç”Ÿæˆ: signature='{signature}', é•¿åº¦={len(signature)}, "
+                                )
+                        except Exception:
+                            pass
+            
+                    # æ¯æ¬¡ WebSocket è¿žæŽ¥å‰é‡æ–°ç”Ÿæˆ user_unique_id
+                    old_uid = self._user_unique_id
+                    self._user_unique_id = generate_user_unique_id()
+                    logger.info(f"[è¿žæŽ¥] user_unique_id å·²åˆ·æ–°: {old_uid} â†’ {self._user_unique_id}")
+            
+                    # æž„å»º WebSocket URL å¹¶ç­¾å
+                    wss = build_websocket_url(self._room_id, self._user_unique_id, self._ua_version, self._ws_host, self._ws_path)
+                    signature = generate_signature(self._room_id, self._user_unique_id)
+                    if not signature:
+                        self._last_error = "X-Bogus ç­¾åç”Ÿæˆå¤±è´¥ï¼Œè¯·ç¡®è®¤ Node.js å·²å®‰è£…"
+                        logger.error(f"[ç­¾å] {self._last_error}ï¼Œåœæ­¢é‡‡é›†")
+                        break
+                    wss += f"&signature={signature}"
+                    logger.debug(f"[ç­¾å] ç”Ÿæˆ: signature='{signature}', é•¿åº¦={len(signature)}, "
                              f"user_unique_id={self._user_unique_id}, room_id={self._room_id}")
-
-                additional_headers = [
-                    ("Cookie", build_ws_cookie(self.ttwid, self._login_cookies)),
-                    ("User-Agent", self._ua),
-                ]
-                logger.debug(f"[è¿žæŽ¥] WS Cookie å‰ 80 å­—ç¬¦: {additional_headers[0][1][:80]}...")
-
-                # â”€â”€ è¿žæŽ¥ WebSocket â”€â”€
-                # websockets v10- ç”¨ extra_headers, v14+ ç”¨ additional_headers
-                _ws_ver = tuple(int(x) for x in websockets.__version__.split('.')[:2])
-                _headers_kw = 'additional_headers' if _ws_ver >= (14, 0) else 'extra_headers'
-                connect_kwargs = {
-                    _headers_kw: additional_headers,
-                    'ping_interval': 30,
-                    'ping_timeout': 10,
-                    'max_size': 2 ** 23,
-                    'max_queue': None,
-                    'compression': None,
-                    'open_timeout': self._ws_connect_timeout,
-                    'origin': 'https://live.douyin.com',
-                }
-                if self._bind_ip:
-                    connect_kwargs['local_addr'] = (self._bind_ip, 0)
-                    logger.info(f"[è¿žæŽ¥] ç»‘å®šæº IP: {self._bind_ip}")
-                async with websockets.connect(wss, **connect_kwargs) as ws:
-                    self._ws = ws
-
-                    # ç›´æ’­é‡‡é›†æœŸé—´å…³é—­è‡ªåŠ¨ GCï¼Œé¿å…é«˜å¹¶å‘æ—¶ GC æš‚åœé˜»å¡žäº‹ä»¶å¾ªçŽ¯
-                    gc.disable()
-
-                    # è®¾ç½®æŽ¥æ”¶ç¼“å†²åŒº
-                    sock = ws.transport.get_extra_info('socket')
-                    if sock is not None:
-                        try:
-                            sock.setsockopt(SOL_SOCKET, SO_RCVBUF, self._rcvbuf)
-                        except Exception as e:
-                            logger.debug(f"[è¿žæŽ¥] rcvbuf è®¾ç½®å¤±è´¥: {e}")
-
-                    # â”€â”€ è¿žæŽ¥çŠ¶æ€åˆå§‹åŒ– â”€â”€
-                    self._connected_event.set()
-                    self._connected_at = time.monotonic()
-                    self._last_error = ''
-                    with self._last_msg_time_lock:
-                        self._last_msg_time = time.time()
-                    self._ws_connected_at = time.time()
-                    self._last_seq_id = 0
-                    self._frame_gaps = 0
-                    self._frame_total = 0
-
-                    # é¢„è®¡ç®— enable_outputs
-                    self._eo_cached = dict(self._enable_outputs)
-                    self._eo_cached['live_stop'] = self.config.get('live_stop', False)
-                    self._dump_pk_raw = self._enable_outputs.get('dump_pk_raw', False)
-
-                    # åˆ›å»ºè¾“å‡ºç›®å½•ï¼ˆç”¨äºŽ raw frame ç­‰æ–‡ä»¶ï¼‰
-                    if self._output_dir is None:
-                        file_dir = self.config.get('output', {}).get('file_dir', 'data')
-                        ts = time.strftime('%Y%m%d_%H%M')
-                        self._output_dir = os.path.join(file_dir, self.live_id, f"{ts}_{self.room_id}")
-                    os.makedirs(self._output_dir, exist_ok=True)
-                    self._save_room_info()
-
-                    if self._dump_raw:
-                        raw_path = os.path.join(self._output_dir, 'raw_frames.bin.gz')
-                        import gzip as _gz
-                        self._raw_file = _gz.open(raw_path, 'ab', compresslevel=6)
-                        logger.info(f"[è½ç›˜] {raw_path}")
-
-                    logger.info("[è¿žæŽ¥] WebSocket å·²å»ºç«‹")
-
-                    # â”€â”€ å¯åŠ¨æ¶ˆæ¯å¤„ç†çº¿ç¨‹ â”€â”€
-                    self._start_processor()
-
-                    # â”€â”€ å¯åŠ¨ç›‘æŽ§ä»»åŠ¡ â”€â”€
-                    tasks = []
-                    if self._heartbeat_interval > 0:
-                        tasks.append(asyncio.create_task(self._heartbeat_task()))
-                    tasks.append(asyncio.create_task(self._watchdog_task()))
-                    tasks.append(asyncio.create_task(self._stats_task()))
-
-                    try:
-                        # â”€â”€ æ¶ˆæ¯æŽ¥æ”¶å¾ªçŽ¯ â”€â”€
-                        async for message in ws:
-                            if self._stop_event.is_set():
-                                break
-                            with self._last_msg_time_lock:
-                                self._last_msg_time = time.time()
+            
+                    additional_headers = [
+                        ("Cookie", build_ws_cookie(self.ttwid, self._login_cookies)),
+                        ("User-Agent", self._ua),
+                    ]
+                    logger.debug(f"[è¿žæŽ¥] WS Cookie å‰ 80 å­—ç¬¦: {additional_headers[0][1][:80]}...")
+            
+                    # â”€â”€ è¿žæŽ¥ WebSocket â”€â”€
+                    # websockets v10- ç”¨ extra_headers, v14+ ç”¨ additional_headers
+                    _headers_kw = "additional_headers" if self._ws_use_additional_headers else "extra_headers"
+                    connect_kwargs = {
+                        _headers_kw: additional_headers,
+                        'ping_interval': 30,
+                        'ping_timeout': 10,
+                        'max_size': 2 ** 23,
+                        'max_queue': None,
+                        'compression': None,
+                        'open_timeout': self._ws_connect_timeout,
+                        'origin': 'https://live.douyin.com',
+                    }
+                    if self._bind_ip:
+                        connect_kwargs['local_addr'] = (self._bind_ip, 0)
+                        logger.info(f"[è¿žæŽ¥] ç»‘å®šæº IP: {self._bind_ip}")
+                    async with websockets.connect(wss, **connect_kwargs) as ws:
+                        self._ws = ws
+            
+                        # ç›´æ’­é‡‡é›†æœŸé—´å…³é—­è‡ªåŠ¨ GCï¼Œé¿å…é«˜å¹¶å‘æ—¶ GC æš‚åœé˜»å¡žäº‹ä»¶å¾ªçŽ¯
+                        gc.disable()
+            
+                        # è®¾ç½®æŽ¥æ”¶ç¼“å†²åŒº
+                        sock = ws.transport.get_extra_info('socket')
+                        if sock is not None:
                             try:
-                                await self._handle_message(message)
-                            except _WaitLiveSignal:
-                                await ws.close()
-                                break
-                            except _StopSignal:
-                                await ws.close()
-                                break
-                    finally:
-                        for t in tasks:
-                            t.cancel()
-                        await asyncio.gather(*tasks, return_exceptions=True)
-                        # åœæ­¢æ¶ˆæ¯å¤„ç†çº¿ç¨‹
-                        self._stop_processor()
-                        # é‡‡é›†ç»“æŸåŽæ‰‹åŠ¨å›žæ”¶å†…å­˜å¹¶æ¢å¤è‡ªåŠ¨ GC
-                        gc.collect()
-                        gc.enable()
-
-                # æ­£å¸¸é€€å‡ºï¼ˆws context manager å·²å…³é—­è¿žæŽ¥ï¼‰
-                # é‡è¿žå‰åˆ·æ–° combo ç¼“å†²ï¼Œé¿å… PK/é«˜å³°æœŸé‡è¿žå¤±åŽ»æœªå®Œæˆçš„è¿žå‡»ç¤¼ç‰©
-                flush_combo_buffer()
-                flush_writes()
-                self._connected_event.clear()
-
-            except asyncio.CancelledError:
-                break
-            except (ConnectionClosedOK, ConnectionClosed) as e:
-                logger.info(f"[è¿žæŽ¥] WebSocket å·²å…³é—­ (code={e.code if hasattr(e, 'code') else '?'})")
-                self._connected_event.clear()
-            except RuntimeError as e:
-                logger.error(f"[è¿žæŽ¥] WebSocket ä¸å¯æ¢å¤é”™è¯¯ï¼Œåœæ­¢é‡‡é›†: {e}")
-                break
-            except ValueError as e:
-                err_str = str(e)
-                if '4001038' in err_str or 'API å“åº”éž JSON' in err_str:
-                    logger.error(f"[æˆ¿é—´] ç›´æ’­é—´æ— æ•ˆï¼ˆlive_id={self.live_id}ï¼‰ï¼Œåœæ­¢é‡‡é›†: {e}")
+                                sock.setsockopt(SOL_SOCKET, SO_RCVBUF, self._rcvbuf)
+                            except Exception as e:
+                                logger.debug(f"[è¿žæŽ¥] rcvbuf è®¾ç½®å¤±è´¥: {e}")
+            
+                        # â”€â”€ è¿žæŽ¥çŠ¶æ€åˆå§‹åŒ– â”€â”€
+                        self._connected_event.set()
+                        self._connected_at = time.monotonic()
+                        self._last_error = ''
+                        with self._last_msg_time_lock:
+                            self._last_msg_time = time.time()
+                        self._ws_connected_at = time.time()
+                        self._last_seq_id = 0
+                        self._frame_gaps = 0
+                        self._frame_total = 0
+            
+                        # é¢„è®¡ç®— enable_outputs
+                        self._eo_cached = dict(self._enable_outputs)
+                        self._eo_cached['live_stop'] = self.config.get('live_stop', False)
+                        self._dump_pk_raw = self._enable_outputs.get('dump_pk_raw', False)
+            
+                        # åˆ›å»ºè¾“å‡ºç›®å½•ï¼ˆç”¨äºŽ raw frame ç­‰æ–‡ä»¶ï¼‰
+                        if self._output_dir is None:
+                            file_dir = self.config.get('output', {}).get('file_dir', 'data')
+                            ts = time.strftime('%Y%m%d_%H%M')
+                            self._output_dir = os.path.join(file_dir, self.live_id, f"{ts}_{self.room_id}")
+                        os.makedirs(self._output_dir, exist_ok=True)
+                        self._save_room_info()
+            
+                        if self._dump_raw:
+                            raw_path = os.path.join(self._output_dir, 'raw_frames.bin.gz')
+                            import gzip as _gz
+                            self._raw_file = _gz.open(raw_path, 'ab', compresslevel=6)
+                            logger.info(f"[è½ç›˜] {raw_path}")
+            
+                        logger.info("[è¿žæŽ¥] WebSocket å·²å»ºç«‹")
+            
+                        # â”€â”€ å¯åŠ¨æ¶ˆæ¯å¤„ç†çº¿ç¨‹ â”€â”€
+                        self._start_processor()
+            
+                        # â”€â”€ å¯åŠ¨ç›‘æŽ§ä»»åŠ¡ â”€â”€
+                        tasks = []
+                        if self._heartbeat_interval > 0:
+                            tasks.append(asyncio.create_task(self._heartbeat_task()))
+                        tasks.append(asyncio.create_task(self._watchdog_task()))
+                        tasks.append(asyncio.create_task(self._stats_task()))
+            
+                        try:
+                            # â”€â”€ æ¶ˆæ¯æŽ¥æ”¶å¾ªçŽ¯ â”€â”€
+                            async for message in ws:
+                                if self._stop_event.is_set():
+                                    break
+                                with self._last_msg_time_lock:
+                                    self._last_msg_time = time.time()
+                                try:
+                                    await self._handle_message(message)
+                                except _WaitLiveSignal:
+                                    await ws.close()
+                                    break
+                                except _StopSignal:
+                                    await ws.close()
+                                    break
+                        finally:
+                            for t in tasks:
+                                t.cancel()
+                            await asyncio.gather(*tasks, return_exceptions=True)
+                            # åœæ­¢æ¶ˆæ¯å¤„ç†çº¿ç¨‹
+                            self._stop_processor()
+                            # é‡‡é›†ç»“æŸåŽæ‰‹åŠ¨å›žæ”¶å†…å­˜å¹¶æ¢å¤è‡ªåŠ¨ GC
+                            gc.collect()
+                            gc.enable()
+            
+                    # æ­£å¸¸é€€å‡ºï¼ˆws context manager å·²å…³é—­è¿žæŽ¥ï¼‰
+                    # é‡è¿žå‰åˆ·æ–° combo ç¼“å†²ï¼Œé¿å… PK/é«˜å³°æœŸé‡è¿žå¤±åŽ»æœªå®Œæˆçš„è¿žå‡»ç¤¼ç‰©
+                    flush_combo_buffer()
+                    flush_writes()
+                    self._connected_event.clear()
+            
+                except asyncio.CancelledError:
                     break
-                logger.error(f"[ç½‘ç»œ] API å¼‚å¸¸: {e}")
-            except Exception as e:
-                err_str = str(e)
-                # è¿‡æ»¤ä¼˜é›…å…³é—­æ—¶çš„å™ªéŸ³æ—¥å¿—
-                if self._stop_event.is_set() and (err_str == '0' or not err_str or err_str == 'None'):
-                    pass
-                elif 'sign check' in err_str or 'signature' in err_str:
-                    logger.warning("[ç­¾å] ttwid ç­¾åæ ¡éªŒå¤±è´¥ï¼Œå°†åœ¨é‡è¿žå‰å°è¯•åˆ·æ–° ttwid")
-                    self._ttwid_refresh_needed = True
-                elif 'DEVICE_BLOCKED' in err_str:
-                    def _extract(key):
-                        m = re.search(rf"['\"]?{re.escape(key)}['\"]?\s*[:=]\s*['\"]([^'\"]+)['\"]", err_str)
-                        return m.group(1) if m else '(æœªçŸ¥)'
-                    handshake_status = _extract('handshake-status')
-                    handshake_msg = _extract('handshake-msg')
-                    trace_id = _extract('x-tt-trace-id')
-                    logger.error(
-                        f"[ç­¾å] DEVICE_BLOCKEDï¼Œæ¡æ‰‹è¢«æ‹’ï¼Œç­¾åæˆ–ç«¯ç‚¹ä¸å¯ç”¨ï¼Œåœæ­¢é‡‡é›†\n"
-                        f"  handshake-status={handshake_status}, msg={handshake_msg}, trace-id={trace_id}\n"
-                        f"  è¯·æ£€æŸ¥ sign.js æ˜¯å¦è¿‡æœŸæˆ–å°è¯•å…¶ä»–ç«¯ç‚¹"
-                    )
-                    self._last_error = f"DEVICE_BLOCKED: {handshake_msg or 'ç­¾åæˆ–ç«¯ç‚¹ä¸å¯ç”¨'}"
-                    self._stop_event.set()
-                else:
-                    self._last_error = f"WebSocket è¿žæŽ¥å¤±è´¥: {str(e)[:200]}"
-                    logger.error(f"[è¿žæŽ¥] WebSocket å¼‚å¸¸: {e}")
-                self._connected_event.clear()
-
-            if self._stop_event.is_set():
-                break
-
-            self._reconnect_count += 1
-            if max_reconnects > 0 and self._reconnect_count >= max_reconnects:
-                self._last_error = f"è¾¾åˆ°æœ€å¤§é‡è¿žæ¬¡æ•° ({max_reconnects})"
-                logger.error(f"[é‡è¿ž] {self._last_error}ï¼Œåœæ­¢")
-                break
-
-            # é‡è¿žå‰åˆ‡æ¢ UA
-            old_ua = self._ua
-            self._ua, self._ua_version = rotate_ua(self._ua)
-            if self._ua != old_ua:
-                logger.debug(f"[é‡è¿ž] åˆ·æ–° UA: {old_ua[:50]}... â†’ {self._ua[:50]}...")
-                self.session.headers.update(build_http_headers(self._ua, self._ua_version))
-
-            delay = min(base_delay * (2 ** min(self._reconnect_count - 1, 6)), max_delay)
-            delay += random.uniform(0, 2)
-            logger.warning(f"[é‡è¿ž] æ–­å¼€ï¼Œ{delay:.1f}s åŽé‡è¿ž ({self._reconnect_count}"
+                except (ConnectionClosedOK, ConnectionClosed) as e:
+                    logger.info(f"[è¿žæŽ¥] WebSocket å·²å…³é—­ (code={e.code if hasattr(e, 'code') else '?'})")
+                    self._connected_event.clear()
+                except RuntimeError as e:
+                    logger.error(f"[è¿žæŽ¥] WebSocket ä¸å¯æ¢å¤é”™è¯¯ï¼Œåœæ­¢é‡‡é›†: {e}")
+                    break
+                except ValueError as e:
+                    err_str = str(e)
+                    if '4001038' in err_str or 'API å“åº”éž JSON' in err_str:
+                        logger.error(f"[æˆ¿é—´] ç›´æ’­é—´æ— æ•ˆï¼ˆlive_id={self.live_id}ï¼‰ï¼Œåœæ­¢é‡‡é›†: {e}")
+                        break
+                    logger.error(f"[ç½‘ç»œ] API å¼‚å¸¸: {e}")
+                except Exception as e:
+                    err_str = str(e)
+                    # è¿‡æ»¤ä¼˜é›…å…³é—­æ—¶çš„å™ªéŸ³æ—¥å¿—
+                    if self._stop_event.is_set() and (err_str == '0' or not err_str or err_str == 'None'):
+                        pass
+                    elif 'sign check' in err_str or 'signature' in err_str:
+                        logger.warning("[ç­¾å] ttwid ç­¾åæ ¡éªŒå¤±è´¥ï¼Œå°†åœ¨é‡è¿žå‰å°è¯•åˆ·æ–° ttwid")
+                        self._ttwid_refresh_needed = True
+                    elif 'DEVICE_BLOCKED' in err_str:
+                        def _extract(key):
+                            m = re.search(rf"['\"]?{re.escape(key)}['\"]?\s*[:=]\s*['\"]([^'\"]+)['\"]", err_str)
+                            return m.group(1) if m else '(æœªçŸ¥)'
+                        handshake_status = _extract('handshake-status')
+                        handshake_msg = _extract('handshake-msg')
+                        trace_id = _extract('x-tt-trace-id')
+                        logger.error(
+                            f"[ç­¾å] DEVICE_BLOCKEDï¼Œæ¡æ‰‹è¢«æ‹’ï¼Œç­¾åæˆ–ç«¯ç‚¹ä¸å¯ç”¨ï¼Œåœæ­¢é‡‡é›†\n"
+                            f"  handshake-status={handshake_status}, msg={handshake_msg}, trace-id={trace_id}\n"
+                            f"  è¯·æ£€æŸ¥ sign.js æ˜¯å¦è¿‡æœŸæˆ–å°è¯•å…¶ä»–ç«¯ç‚¹"
+                        )
+                        self._last_error = f"DEVICE_BLOCKED: {handshake_msg or 'ç­¾åæˆ–ç«¯ç‚¹ä¸å¯ç”¨'}"
+                        self._stop_event.set()
+                    else:
+                        self._last_error = f"WebSocket è¿žæŽ¥å¤±è´¥: {str(e)[:200]}"
+                        logger.error(f"[è¿žæŽ¥] WebSocket å¼‚å¸¸: {e}")
+                    self._connected_event.clear()
+            
+                if self._stop_event.is_set():
+                    break
+            
+                self._reconnect_count += 1
+                if max_reconnects > 0 and self._reconnect_count >= max_reconnects:
+                    self._last_error = f"è¾¾åˆ°æœ€å¤§é‡è¿žæ¬¡æ•° ({max_reconnects})"
+                    logger.error(f"[é‡è¿ž] {self._last_error}ï¼Œåœæ­¢")
+                    break
+            
+                # é‡è¿žå‰åˆ‡æ¢ UA
+                old_ua = self._ua
+                self._ua, self._ua_version = rotate_ua(self._ua)
+                if self._ua != old_ua:
+                    logger.debug(f"[é‡è¿ž] åˆ·æ–° UA: {old_ua[:50]}... â†’ {self._ua[:50]}...")
+                    self.session.headers.update(build_http_headers(self._ua, self._ua_version))
+            
+                delay = min(base_delay * (2 ** min(self._reconnect_count - 1, 6)), max_delay)
+                delay += random.uniform(0, 2)
+                logger.warning(f"[é‡è¿ž] æ–­å¼€ï¼Œ{delay:.1f}s åŽé‡è¿ž ({self._reconnect_count}"
                            f"{'/' + str(max_reconnects) if max_reconnects > 0 else ''})")
-            await asyncio.sleep(delay)
+                await asyncio.sleep(delay)
 
-        logger.info("[æŽ§åˆ¶] é‡‡é›†ä¸»å¾ªçŽ¯é€€å‡º")
+        finally:
+            if _secondary_task is not None:
+                _secondary_task.cancel()
+                try:
+                    await _secondary_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        logger.info("[控制] 采集主循环退出")
         if self._queue_handler.multi_room:
             self._queue_handler.clear_room_status(self.live_id)
 
-    # â”€â”€ æ¶ˆæ¯å¤„ç† worker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 消息处理 worker ──────────────────────────
 
     def _start_processor(self):
-        """å¯åŠ¨æ¶ˆæ¯å¤„ç†çº¿ç¨‹ã€‚"""
+        """启动消息处理线程。"""
         if self._process_thread and self._process_thread.is_alive():
             return
         self._pending_signal = None
@@ -1273,27 +1322,6 @@ class DouyinBarrage:
         if drained:
             logger.info(f"[å¤„ç†] é€€å‡ºå‰æŽ’ç©º {drained} æ¡")
 
-    def _fill_subscription_uid(self, user_name, real_uid):
-        """ç”¨æˆ·èº«ä»½ç¡®è®¤åŽï¼Œè¡¥å¡«ç­‰å¾…ä¸­çš„è®¢é˜…è®°å½• user_idã€‚
-
-        å½“è®¢é˜…æ¶ˆæ¯åˆ°è¾¾æ—¶ï¼Œå¦‚æžœ users è¡¨ä¸­å°šæ— è¯¥ç”¨æˆ·è®°å½•ï¼Œä¼šä»¥ç©º user_id å†™å…¥ gift_logsã€‚
-        åŽç»­è¯¥ç”¨æˆ·å‘æ¶ˆæ¯/é€ ç‰©æ—¶ï¼Œé€šè¿‡æ­¤æ–¹æ³•è¡¥å¡« user_idã€‚
-        """
-        if not user_name or not real_uid:
-            return
-        conn = _get_conn()
-        try:
-            conn.execute(
-                'UPDATE gift_logs SET user_id = %s WHERE user_id = \'\' AND user_name = %s',
-                (real_uid, user_name)
-            )
-            conn.commit()
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-
     def _process_item(self, item):
         """å¤„ç†å•æ¡æ¶ˆæ¯ç»„ï¼ˆä¸€ä¸ª Response åŒ…ä¸­çš„æ‰€æœ‰å†…éƒ¨æ¶ˆæ¯ï¼‰ã€‚"""
         messages_list, eo_cached, dump_pk_raw = item
@@ -1315,7 +1343,12 @@ class DouyinBarrage:
                             sec_uid=data.get('sec_uid',''), avatar_url=data.get('avatar_url',''))
                     record_gift(self._session_id, uid, uname,
                         data.get('gift_name',''), data.get('gift_count',0),
-                        data.get('diamond_total',0), data.get('grade',''), data.get('fans_club',''))
+                        data.get('diamond_total',0), data.get('grade',''), data.get('fans_club',''),
+                        group_id=data.get('group_id',''), gift_id=data.get('gift_id',0),
+                        to_user_id=data.get('to_user_id', ''),
+                        to_user_name=data.get('to_user_name', ''),
+                        badge_url=data.get('badge_url', ''),
+                        fansclub_badge=data.get('fansclub_badge', ''))
                 except Exception as e:
                     logger.error(f"[DB] combo finalize write failed: {e}")
 
@@ -1327,6 +1360,8 @@ class DouyinBarrage:
                 try:
                     kwargs = {'enable_outputs': eo_cached or {}}
                     results = handler(msg.payload, **kwargs)
+                    if results is None:
+                        results = []
                     config_key = METHOD_TO_CONFIG.get(msg.method)
                     is_enabled = eo_cached.get(config_key, True) if config_key else True
                     short_name = msg.method.replace('Webcast', '').replace('Message', '').lower()
@@ -1349,11 +1384,25 @@ class DouyinBarrage:
                     if now - self._panel_last >= 3.0:
                         self._panel_last = now
                         elapsed = now - self._counter._start
+                        flow = get_flow_counters(self._session_id)
+                        bt = self._counter._by_type
+                        cbuf = get_combo_buffer_size()
                         self._queue_handler.set_room_status(
                             self.live_id, 'collecting',
                             anchor=self.display_name,
                             msg_count=self._counter._count,
                             elapsed=elapsed,
+                            flow=flow,
+                            parsed_chat=bt.get('chat', 0),
+                            parsed_gift=bt.get('gift', 0),
+                            parsed_like=bt.get('like', 0),
+                            parsed_social=bt.get('social', 0),
+                            parsed_emoji=bt.get('emoji', 0),
+                            combo_buf=cbuf,
+                            sub_seen=self._sub_seen,
+                            sub_deduped=self._sub_deduped,
+                            frame_total=self._frame_total,
+                            frame_gaps=self._frame_gaps,
                         )
 
                     for r in results:
@@ -1392,13 +1441,14 @@ class DouyinBarrage:
                                 uclub = rec_data.get('fans_club', '')
                                 usec_uid = rec_data.get('sec_uid', '')
                                 uavatar = rec_data.get('avatar_url', '')
+                                udisplay_id = rec_data.get('display_id', '')
                                 # åªè¦æœ‰ç”¨æˆ·ä¿¡æ¯å°±æ›´æ–° users è¡¨ï¼ˆè®°å½•è´¢å¯Œç­‰çº§ã€ç²‰ä¸å›¢ã€sec_uidã€å¤´åƒï¼‰
                                 if uid:
                                     # 升级检测前从 DB 读取旧值（upsert_user 会覆盖为新值）
                                     _old_lv_saved = 0
                                     _old_fc_saved = 0
                                     try:
-                                        _row = _get_conn().execute("SELECT grade, fans_club FROM users WHERE user_id = %s", (uid,)).fetchone()
+                                        _row = _get_conn().execute("SELECT grade, fans_club FROM users WHERE user_id = ?", (uid,)).fetchone()
                                         if _row:
                                             _m = re.search(r"(\d+)", _row["grade"] or "")
                                             if _m:
@@ -1409,8 +1459,7 @@ class DouyinBarrage:
                                     except Exception:
                                         _old_lv_saved = 0
                                         _old_fc_saved = 0
-                                    upsert_user(uid, uname, ugrade, uclub, usec_uid, uavatar)
-                                    # è¡¥å……ç­‰å¾…ä¸­çš„è®¢é˜… user_idï¼ˆç”¨æˆ·ç¡®è®¤èº«ä»½åŽå¡«å……ï¼‰
+                                    upsert_user(uid, uname, ugrade, uclub, usec_uid, uavatar, udisplay_id)
                                     if uid:
                                         self._fill_subscription_uid(uname, uid)
                                     # åŒ¿åç”¨æˆ·ï¼ˆç¥žç§˜äºº/douå‰ç¼€ï¼‰è‡ªåŠ¨è§£æžçœŸå®žæ˜µç§°
@@ -1418,7 +1467,7 @@ class DouyinBarrage:
                                     if _is_anon:
                                         # å…ˆæŸ¥ DBï¼šå¦‚æžœå·²ç»è§£æžè¿‡äº†ï¼ˆåå­—ä¸å†åŒ¿åï¼‰ï¼Œè·³è¿‡
                                         try:
-                                            cur = _get_conn().execute('SELECT user_name FROM users WHERE user_id = %s', (uid,))
+                                            cur = _get_conn().execute('SELECT user_name FROM users WHERE user_id = ?', (uid,))
                                             db_name = (cur.fetchone() or {}).get('user_name', '')
                                             if db_name and not (db_name.startswith('ç¥žç§˜äºº') or re.match(r'dou\d+$', db_name, re.IGNORECASE)):
                                                 _is_anon = False
@@ -1455,18 +1504,26 @@ class DouyinBarrage:
                                                     logger.info(f"[åŒ¿å] å·²è§£æž {uid}: {uname} â†’ {resolved}")
                                             except Exception:
                                                 logger.debug(f"[åŒ¿å] è§£æž {uid} å¤±è´¥ï¼Œä¿ç•™åŽŸåç§°")
-                                if rec_type in ('chat', 'lucky_bag') and rec_data.get('content'):
+                                if rec_type == 'chat' and rec_data.get('content'):
                                     record_chat(self._session_id,
                                         uid, uname,
                                         rec_data.get('content', ''),
-                                        ugrade, uclub)
+                                        ugrade, uclub,
+                                        badge_url=rec_data.get('badge_url', ''),
+                                        fansclub_badge=rec_data.get('fansclub_badge', ''))
                                 elif rec_type == 'gift' and rec_data.get('gift_name'):
                                     record_gift(self._session_id,
                                         uid, uname,
                                         rec_data.get('gift_name', ''),
                                         rec_data.get('gift_count', 0),
                                         rec_data.get('diamond_total', 0),
-                                        ugrade, uclub)
+                                        ugrade, uclub,
+                                        group_id=rec_data.get('group_id', ''),
+                                        gift_id=rec_data.get('gift_id', 0),
+                                        to_user_id=rec_data.get('to_user_id', ''),
+                                        to_user_name=rec_data.get('to_user_name', ''),
+                                        badge_url=rec_data.get('badge_url', ''),
+                                        fansclub_badge=rec_data.get('fansclub_badge', ''))
                                 # â”€â”€ å‡çº§æ£€æµ‹ â”€â”€
                                 if uid and rec_type in ('gift', 'chat', 'fansclub'):
                                     try:
@@ -1495,104 +1552,68 @@ class DouyinBarrage:
                                     except Exception as _upgrade_err:
                                         logger.error(f"[升级] 检测异常: {_upgrade_err}")
                                 elif rec_type == 'subscribe' and rec_data.get('diamond'):
-                                    # ä¼šå‘˜/æ˜Ÿå®ˆæŠ¤è®¢é˜…ï¼šä¼˜å…ˆç”¨ protobuf User å¯¹è±¡çš„çœŸå®žä¿¡æ¯
+                                    self._sub_seen += 1
                                     sub_name = rec_data.get('event', '') + rec_data.get('sub_type', '')
-                                    sub_douyin_id = rec_data.get('douyin_id', '')  # display_id (10-12ä½)
                                     sub_uname = rec_data.get('user_name', '')
-                                    # sub_uid: ä¼˜å…ˆ protobuf è§£æžçš„ user_idï¼Œå…¶æ¬¡å­—èŠ‚æ‰«æçš„ user_id
-                                    proto_uid = rec_data.get('user_id', '')
-                                    sub_uid = proto_uid if (proto_uid and re.match(r'^\d+$', str(proto_uid))) else (sub_douyin_id or uid)
-                                    sub_grade = rec_data.get('grade', '')
-                                    sub_club = rec_data.get('fans_club', '')
-                                    sub_sec_uid = rec_data.get('sec_uid', '')
-                                    sub_avatar = rec_data.get('avatar_url', '')
-
-                                    # ç”¨æˆ·åå®½æ¾éªŒè¯ï¼Œæ— æ•ˆæ—¶ç”Ÿæˆå…šåº•åä½†ä¸è·³è¿‡
-                                    if not sub_uname or len(sub_uname.strip()) < 1:
-                                        logger.warning(f"[è®¢é˜…] ç”¨æˆ·åè¯†åˆ«å¤±è´¥ (douyin_id={sub_douyin_id}, uid={sub_uid})ï¼Œä½¿ç”¨å…šåº•å")
-                                        sub_uname = ''
-
-                                    # åŽ»é‡ + ä¿å­˜ï¼ˆä»…åœ¨æ²¡æœ‰ä»»ä½•èº«ä»½æ ‡è¯†æ—¶è·³è¿‡ï¼‰
-                                    dedup_key = sub_douyin_id or sub_uid or ''
-                                    if not dedup_key and not sub_uname:
-                                        logger.warning(f"[è®¢é˜…] å®Œå…¨æ— æ³•è¯†åˆ«ç”¨æˆ·ï¼Œè·³è¿‡è®°å½• (douyin_id={sub_douyin_id}, uid={sub_uid})")
-                                    else:
-                                        now_ts = time.time()
-                                        # éªŒè¯ sub_douyin_idï¼šæ’é™¤æ—¶é—´æˆ³å’Œ room_id
-                                        def _is_valid_sub_id(did):
-                                            if not did or not re.match(r'^\d+$', str(did)):
-                                                return False
-                                            try:
-                                                d = int(did)
-                                                if (1500000000 < d < 2000000000) or (1500000000000 < d < 2000000000000):
-                                                    return False
-                                                return True
-                                            except ValueError:
-                                                return False
-                                        if _is_valid_sub_id(sub_douyin_id):
-                                            sub_key = (str(sub_douyin_id), str(sub_name))
-                                        else:
-                                            # douyin_id æ— æ•ˆï¼ˆä¾‹å¦‚æ—¶é—´æˆ³ï¼‰ï¼Œç”¨ç”¨æˆ·åä½œä¸ºåŽ»é‡key
-                                            sub_key = (str(sub_uname), str(sub_name))
-                                        if sub_key in self._subscribe_dedup and now_ts - self._subscribe_dedup[sub_key] < 120:
-                                            logger.debug(f"[è®¢é˜…] åŽ»é‡è·³è¿‡ {sub_key}")
-                                        else:
-                                            self._subscribe_dedup[sub_key] = now_ts
-                                            stale = [k for k, t in list(self._subscribe_dedup.items()) if now_ts - t > 180]
-                                            for k in stale: del self._subscribe_dedup[k]
-
-                                            # ç¡®å®šæœ€ç»ˆ user_id
-                                            final_uid = sub_uid if re.match(r'^\d+$', str(sub_uid)) else ''
-                                            final_name = sub_uname or ('ç”¨æˆ·' + str(sub_douyin_id or sub_uid)[-6:])
-
-                                            # ç”¨æˆ·åæ˜¯å”¯ä¸€å¯é çš„ç¼–è¯†ï¼Œé¿å…ç”¨ msg_id å½“ user_id æŸ¥
-                                            if not final_uid or final_uid == '0':
-                                                if sub_uname:
-                                                    found = _get_conn().execute(
-                                                        'SELECT user_id FROM users WHERE user_name = %s LIMIT 1',
-                                                        (sub_uname,)
-                                                    ).fetchone()
-                                                    if found:
-                                                        final_uid = found['user_id']
-                                                        logger.debug(f"[subscribe] found user by name: {final_uid}")
-
-                                            if final_uid and final_uid != '0':
-                                                upsert_user(final_uid, final_name, sub_grade, sub_club, sub_sec_uid, sub_avatar)
-                                                record_gift(self._session_id, final_uid, final_name, sub_name or 'è®¢é˜…',
-                                                    1, rec_data.get('diamond', 0), sub_grade, sub_club)
+                                    def _is_valid_name(n):
+                                        return n and len(n) >= 2 and any(c.isalpha() or ord(c) > 127 for c in n)
+                                    if not _is_valid_name(sub_uname):
+                                        logger.debug(f"[订阅] 无效用户名，跳过: user_name={sub_uname}")
+                                        continue
+                                    now_ts = time.time()
+                                    sub_key = (sub_uname, str(sub_name))
+                                    if sub_key in self._subscribe_dedup and now_ts - self._subscribe_dedup[sub_key] < 120:
+                                        logger.debug(f"[订阅] 去重跳过 {sub_key}")
+                                        self._sub_deduped += 1
+                                        continue
+                                    self._subscribe_dedup[sub_key] = now_ts
+                                    stale = [k for k, t in list(self._subscribe_dedup.items()) if now_ts - t > 180]
+                                    for k in stale:
+                                        del self._subscribe_dedup[k]
+                                    final_uid = ""
+                                    final_grade = ""
+                                    final_club = ""
+                                    final_sec_uid = ""
+                                    final_avatar = ""
+                                    if not final_uid:
+                                        try:
+                                            found = _get_conn().execute(
+                                                'SELECT user_id, grade, fans_club, sec_uid, avatar_url FROM users WHERE user_name = ? LIMIT 1',
+                                                (sub_uname,)
+                                            ).fetchone()
+                                            if found:
+                                                final_uid = found['user_id']
+                                                final_grade = found['grade'] or ''
+                                                final_club = found['fans_club'] or ''
+                                                final_sec_uid = found['sec_uid'] or ''
+                                                final_avatar = found['avatar_url'] or ''
+                                                logger.info(f"[订阅] 用户名 '{sub_uname}' -> user_id={final_uid}")
                                             else:
-                                                # ç­å¾…ç”¨æˆ·èº«ä»½ï¼šå…ˆç”¨ç©º user_id è®°å½•ï¼ŒåŽç»­ top up å¡«å…… real_uid
-                                                if sub_uname:
-                                                    record_gift(self._session_id, '', sub_uname, sub_name or 'è®¢é˜…',
-                                                                1, rec_data.get('diamond', 0), sub_grade, sub_club)
-                                                    logger.info(f"[subscribe] pending user: {sub_uname} (waiting for real_uid)")
-                                            final_uid = sub_uid if re.match(r'^\d+$', str(sub_uid)) else sub_douyin_id
-                                            final_name = sub_uname or ('ç”¨æˆ·' + str(sub_douyin_id)[-6:])
-                                            # å½“ final_uid ä¸ºç©º/æ— æ•ˆæ—¶ï¼Œè¯•é€šè¿‡ç”¨æˆ·åæŸ¥ DB
-                                            if not final_uid or final_uid == '0':
-                                                candidate_ids = []
-                                                for cid in (sub_douyin_id, sub_uid, proto_uid):
-                                                    if cid and re.match(r'^\d+$', str(cid)) and str(cid) not in candidate_ids:
-                                                        candidate_ids.append(str(cid))
-                                                if candidate_ids:
-                                                    placeholders = ' OR user_id = '.join(['%s'] * len(candidate_ids))
-                                                    query = f'SELECT user_id FROM users WHERE user_name = %s OR user_id = {placeholders} LIMIT 1'
-                                                    params = [sub_uname] + candidate_ids
-                                                else:
-                                                    query = 'SELECT user_id FROM users WHERE user_name = %s LIMIT 1'
-                                                    params = [sub_uname]
-                                                found = _get_conn().execute(query, params).fetchone()
+                                                # 用户可能还未建立 DB 记录，尝试从 gift_logs/chat_logs 反向找
+                                                found = _get_conn().execute(
+                                                    'SELECT user_id FROM gift_logs WHERE user_name = ? AND session_id = ? LIMIT 1',
+                                                    (sub_uname, self._session_id)
+                                                ).fetchone()
+                                                if not found:
+                                                    found = _get_conn().execute(
+                                                        'SELECT user_id FROM chat_logs WHERE user_name = ? AND session_id = ? LIMIT 1',
+                                                        (sub_uname, self._session_id)
+                                                    ).fetchone()
                                                 if found:
                                                     final_uid = found['user_id']
-                                            if final_uid and final_uid != '0':
-                                                if sub_sec_uid or sub_avatar:
-                                                    upsert_user(final_uid, final_name, sub_grade, sub_club, sub_sec_uid, sub_avatar)
-                                                elif sub_douyin_id and sub_uname:
-                                                    upsert_user(final_uid, final_name, sub_grade, sub_club, '', '')
+                                                    logger.info(f"[订阅] 从会话日志反查 '{sub_uname}' -> user_id={final_uid}")
                                                 else:
-                                                    upsert_user(final_uid, 'ç”¨æˆ·' + str(sub_douyin_id)[-6:], '', '', '', '')
-                                                record_gift(self._session_id, final_uid, final_name, sub_name or 'è®¢é˜…',
-                                                    1, rec_data.get('diamond', 0), sub_grade, sub_club)
+                                                    logger.info(f"[订阅] 用户名 '{sub_uname}' 未在 DB 中找到，留空 uid 等待补填")
+                                        except Exception as e:
+                                            logger.debug(f"[订阅] DB 查询失败: {e}")
+                                    if final_uid:
+                                        upsert_user(final_uid, sub_uname, final_grade, final_club, final_sec_uid, final_avatar, udisplay_id)
+                                    record_gift(self._session_id, final_uid or '', sub_uname, sub_name or '订阅',
+                                                1, rec_data.get('diamond', 0), final_grade, final_club)
+                                    if final_uid:
+                                        logger.info(f"[订阅] {sub_uname} {sub_name} ({rec_data.get('diamond',0)}钻石) uid={final_uid}")
+                                    else:
+                                        logger.info(f"[订阅] {sub_uname} {sub_name} ({rec_data.get('diamond',0)}钻石) uid=待定（后续自动补填）")
                             except Exception as e:
                                 logger.error(f"[DB] SQLite write failed in _process_item: {e} | type={rec_type} user={uid}")
 
@@ -1627,6 +1648,251 @@ class DouyinBarrage:
                 pass
 
     # â”€â”€ æ¶ˆæ¯å¤„ç† â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    def _fill_subscription_uid(self, user_name, real_uid):
+        if not user_name or not real_uid or not self._session_id:
+            return
+        bak_key = (self._session_id, user_name)
+        if bak_key in self._backfilled_users:
+            return
+        self._backfilled_users.add(bak_key)
+        request_backfill_uid(self._session_id, user_name, real_uid)
+
+    def _merge_filter(self, msgs, source='primary'):
+        """Filter a batch of messages against the dedup cache.
+
+        First arrival of an event → enqueue and record source.
+        Second arrival (same key) → cross-validate, record confidence,
+        do NOT enqueue. The existing parser gift dedup would reject the
+        duplicate anyway, so we save processor thread cycles by catching
+        it here.
+
+        Args:
+            msgs: List of Response.MessagesList entries.
+            source: 'primary' or 'secondary'.
+
+        Returns:
+            List of messages that are new (unique).
+        """
+        if not self._dual_ws or not msgs:
+            return msgs
+
+        filtered = []
+        deduped = 0
+        for msg in msgs:
+            method = msg.method
+            payload = msg.payload
+            extractor = _DEDUP_EXTRACTORS.get(method)
+
+            if extractor is None:
+                # Unknown type — use fallback (MD5 + 30s window)
+                extractor = _fallback_key
+                use_fallback = True
+            else:
+                use_fallback = False
+
+            try:
+                if use_fallback:
+                    key = extractor(payload, method, time.time())
+                else:
+                    key = extractor(payload)
+                key_hash = _key_to_hash(key)
+            except Exception:
+                # Parse failure — pass through as new (false negative > false positive)
+                filtered.append(msg)
+                continue
+
+            # Extract value for cross-validation (hoisted)
+            value_extractor = _VALUE_EXTRACTORS.get(method)
+            if value_extractor:
+                try:
+                    value_json = value_extractor(payload)
+                except Exception:
+                    value_json = '{}'
+            else:
+                value_json = '{}'
+
+            if self._dedup_cache.is_new(key):
+                # First arrival — enqueue normally
+                filtered.append(msg)
+                self._merge_tracker.record_first_seen(key_hash, method, source, value_json)
+                self._union_stats[source] += 1
+            else:
+                # Second arrival — cross-validate
+                conflict = self._merge_tracker.record_confirmation(key_hash, source, value_json)
+                deduped += 1
+                if conflict:
+                    logger.info(f"[merge] ⚠ discrepancy {method}: {conflict.description}")
+
+        self._union_stats['dup'] += deduped
+        return filtered
+
+    async def _secondary_ws(self):
+        """Independent secondary WS connection, sibling to the primary.
+
+        Self-contained reconnect loop. Shares _dedup_cache, _merge_tracker,
+        and _msg_queue with the primary (via _merge_filter). Never nested
+        inside primary's connection context — survives primary reconnects.
+
+        Uses the same user_unique_id as the primary when dual_ws_identity
+        is 'same' or 'smart' (ensuring Douyin routes overlapping data).
+        """
+        if not self._dual_ws:
+            return
+        logger.info("[dual-ws] secondary background task started")
+
+        while not self._stop_event.is_set():
+            try:
+                # Use same user_unique_id for overlap (when configured)
+                if self._dual_ws_identity in ('same', 'smart'):
+                    uid2 = self._user_unique_id
+                else:
+                    uid2 = generate_user_unique_id()
+
+                if not self._room_id:
+                    await asyncio.sleep(1)
+                    continue
+
+                # Don't try to connect if stream is not live
+                if self._room_info and self._room_info.get('status', 0) != 2:
+                    await asyncio.sleep(30)
+                    continue
+
+                ws_url = build_websocket_url(
+                    self._room_id, uid2, self._ua_version, ws_host=self._ws_host2,
+                )
+                sig = await asyncio.get_event_loop().run_in_executor(
+                    self._executor, generate_signature, self._room_id, uid2,
+                )
+                if not sig:
+                    logger.warning("[dual-ws] secondary: signature generation failed, retrying...")
+                    await asyncio.sleep(5)
+                    continue
+                ws_url = f"{ws_url}&signature={sig}"
+
+                secondary_headers = [
+                    ("Cookie", build_ws_cookie(self.ttwid, self._login_cookies2 or {})),
+                    ("User-Agent", self._ua),
+                ]
+                _headers_kw = 'additional_headers' if self._ws_use_additional_headers else 'extra_headers'
+
+                connect_kwargs_secondary = {
+                    _headers_kw: secondary_headers,
+                    'max_size': 10 * 1024 * 1024,
+                    'ping_interval': 30,
+                    'ping_timeout': 10,
+                    'compression': None,
+                    'open_timeout': self._ws_connect_timeout,
+                    'origin': 'https://live.douyin.com',
+                }
+                if self._bind_ip:
+                    connect_kwargs_secondary['local_addr'] = (self._bind_ip, 0)
+                if self._ws_proxy2:
+                    if self._ws_use_additional_headers:
+                        # proxy 可以是字符串 URL 或 True（使用环境变量）
+                        # YAML 解析后如果是 dict，提取 http key 的值
+                        proxy_val = self._ws_proxy2
+                        if isinstance(proxy_val, dict):
+                            proxy_val = proxy_val.get('http') or proxy_val.get('https') or ''
+                        if isinstance(proxy_val, str) and proxy_val:
+                            connect_kwargs_secondary['proxy'] = proxy_val
+                            logger.info(f"[dual-ws] secondary: 使用独立代理")
+                        else:
+                            logger.warning(f"[dual-ws] secondary: 无效代理配置，跳过")
+                    else:
+                        logger.warning(f"[dual-ws] secondary: 代理需要 websockets>=14.0（当前为 {websockets.__version__}），已跳过")
+                async with websockets.connect(
+                    ws_url,
+                    **connect_kwargs_secondary,
+                ) as ws2:
+                    self._ws2 = ws2
+                    with self._last_secondary_msg_time_lock:
+                        self._last_secondary_msg_time = time.time()
+                    sock2 = ws2.transport.get_extra_info('socket')
+                    if sock2 is not None:
+                        try:
+                            sock2.setsockopt(SOL_SOCKET, SO_RCVBUF, self._rcvbuf)
+                        except Exception:
+                            pass
+                    uid_preview = uid2[:8] if isinstance(uid2, str) else str(uid2)[:8]
+                    logger.info("[dual-ws] secondary online (identity=%s uid=%s...)",
+                                self._dual_ws_identity, uid_preview)
+
+                    async for raw in ws2:
+                        if self._stop_event.is_set():
+                            break
+                        with self._last_secondary_msg_time_lock:
+                            self._last_secondary_msg_time = time.time()
+
+                        try:
+                            pkg = parse_proto(PushFrame, raw)
+                        except Exception:
+                            continue
+
+                        if pkg.payload_type == 'hb':
+                            continue
+
+                        try:
+                            raw_payload = gzip.decompress(pkg.payload)
+                        except Exception:
+                            continue
+
+                        try:
+                            resp = parse_proto(Response, raw_payload)
+                        except Exception:
+                            continue
+
+                        # Check for stream-end signal (secondary ignores lifecycle)
+                        for ctrl_msg in resp.messages_list:
+                            if ctrl_msg.method == 'WebcastControlMessage':
+                                try:
+                                    from base.messages import ControlMessage as _CM
+                                    ctrl = parse_proto(_CM, ctrl_msg.payload)
+                                    if ctrl.status == 3:
+                                        logger.info("[dual-ws] secondary: stream ended, stopping")
+                                        self._stop_event.set()
+                                        break
+                                except Exception:
+                                    pass
+                        if self._stop_event.is_set():
+                            break
+
+                        # ACK (fire-and-forget)
+                        if resp.need_ack and resp.internal_ext:
+                            try:
+                                ack = PushFrame(
+                                    log_id=pkg.log_id, payload_type='ack',
+                                    payload=resp.internal_ext.encode('utf-8'),
+                                )._pb.SerializeToString()
+                                async def _safe_ack2():
+                                    try:
+                                        await ws2.send(ack)
+                                    except Exception:
+                                        pass
+                                asyncio.create_task(_safe_ack2())
+                            except Exception:
+                                pass
+
+                        if resp.messages_list:
+                            filtered = self._merge_filter(list(resp.messages_list), 'secondary')
+                            if filtered:
+                                try:
+                                    self._msg_queue.put_nowait(
+                                        (list(filtered), self._eo_cached, self._dump_pk_raw)
+                                    )
+                                except queue.Full:
+                                    self._counter.inc('dropped_queue')
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if self._stop_event.is_set():
+                    break
+                logger.warning("[dual-ws] secondary error: %s, reconnecting in 5s", e)
+                await asyncio.sleep(5)
+                continue  # skip the delay below — already slept
+
+            await asyncio.sleep(5)  # delay between reconnect attempts
 
     async def _handle_message(self, message):
         """å¤„ç†å•æ¡ WebSocket æ¶ˆæ¯ã€‚"""
@@ -1691,10 +1957,14 @@ class DouyinBarrage:
                 pass
 
         # æ¶ˆæ¯åˆ†å‘ â†’ æŽ¨å…¥å¤„ç†é˜Ÿåˆ—ï¼ˆæ”¶/ç®—åˆ†ç¦»ï¼Œé˜²é«˜å³°æ‹¥å¡žï¼‰
+        # Union dedup across dual WS connections (primary stream)
+        msgs_to_enqueue = self._merge_filter(list(response.messages_list), 'primary')
+
         try:
-            self._msg_queue.put_nowait(
-                (list(response.messages_list), self._eo_cached, self._dump_pk_raw)
-            )
+            if msgs_to_enqueue:
+                self._msg_queue.put_nowait(
+                    (msgs_to_enqueue, self._eo_cached, self._dump_pk_raw)
+                )
         except queue.Full:
             self._counter.inc('dropped_queue')
             if not getattr(self, '_queue_full_warned', False):
@@ -1728,10 +1998,10 @@ class DouyinBarrage:
                     break
 
     async def _watchdog_task(self):
-        """å¼‚æ­¥çœ‹é—¨ç‹—ï¼šæ£€æµ‹é™é»˜æ–­è¿žã€‚"""
+        """异步看门狗：检测静默断连。"""
         check_interval = max(min(self._silence_timeout // 3, 10), 3)
         first_check_done = False
-        first_check_timeout = check_interval + 10   # å¿…é¡» > check_intervalï¼Œå¦åˆ™é¦–æ¬¡æ£€æŸ¥å¿…è§¦å‘
+        first_check_timeout = check_interval + 10   # 必须 > check_interval，否则首次检查必触发
         normal_check_timeout = 180.0
 
         while not self._stop_event.is_set():
@@ -1742,12 +2012,23 @@ class DouyinBarrage:
             with self._last_msg_time_lock:
                 silence = time.time() - self._last_msg_time
             if silence > self._silence_timeout:
-                logger.warning(f"[çœ‹é—¨ç‹—] {silence:.0f}s æ— æ•°æ® (é˜ˆå€¼={self._silence_timeout}s)ï¼Œè§¦å‘é‡è¿ž")
+                logger.warning(f"[看门狗] 主 WS {silence:.0f}s 无数据 (阈值={self._silence_timeout}s)，触发重连")
                 try:
                     await self._ws.close()
                 except Exception:
                     pass
                 break
+
+            # 副 WS 看门狗：如果副 WS 存在但太长时间没收到任何包，主动断连触发其重连
+            if self._dual_ws and self._ws2:
+                with self._last_secondary_msg_time_lock:
+                    sec_silence = time.time() - self._last_secondary_msg_time if self._last_secondary_msg_time > 0 else time.time() - self._ws_connected_at
+                if sec_silence > self._silence_timeout:
+                    logger.warning(f"[看门狗] 副 WS {sec_silence:.0f}s 无数据 (阈值={self._silence_timeout}s)，触发重连")
+                    try:
+                        await self._ws2.close()
+                    except Exception:
+                        pass
 
             if self._last_business_msg_time > 0:
                 with self._last_business_msg_time_lock:
@@ -1757,40 +2038,36 @@ class DouyinBarrage:
 
             if not first_check_done:
                 if business_silence > first_check_timeout:
-                    logger.info(f"[çœ‹é—¨ç‹—] é¦–æ¬¡æ£€æµ‹ {business_silence:.0f}s æ— ä¸šåŠ¡æ¶ˆæ¯ï¼Œå é™¤ç©ºåœºæ¬¡")
+                    logger.info(f"[看门狗] 首次检测 {business_silence:.0f}s 无业务消息，快速重连")
                     first_check_done = True
-                    # å é™¤æ­¤æ¬¡å»ºç«‹çš„ç©ºåœºæ¬¡ï¼ˆé¿å…èšæµ®åœºæ¬¡ç§¯ç´¯ï¼‰
                     try:
-                        from base.parser import delete_session as _ds
-                        if self._session_id:
-                            _ds(self._session_id)
-                            self._session_id = None
+                        await self._ws.close()
                     except Exception:
                         pass
-                    self._enter_wait_mode()
                     break
                 elif self._last_business_msg_time > 0:
                     first_check_done = True
-                    logger.debug("[çœ‹é—¨ç‹—] é¦–æ¬¡æ£€æµ‹é€šè¿‡ï¼Œå·²æ”¶åˆ°ä¸šåŠ¡æ¶ˆæ¯")
+                    logger.debug("[看门狗] 首次检测通过，已收到业务消息")
             else:
                 if business_silence > normal_check_timeout:
-                    logger.info(f"[çœ‹é—¨ç‹—] {business_silence:.0f}s æ— ä¸šåŠ¡æ¶ˆæ¯ (ä»…æœ‰ä½Žä»·å€¼æ¶ˆæ¯)ï¼Œè§¦å‘é‡è¿ž")
+                    logger.info(f"[看门狗] {business_silence:.0f}s 无业务消息 (仅有低价值消息)，触发重连")
                     try:
                         await self._ws.close()
                     except Exception:
                         pass
                     break
 
-            # ç”¨æˆ·äº’åŠ¨æ¶ˆæ¯é™é»˜æ£€æµ‹ï¼ˆroomstats ä¸åœä½†ç”¨æˆ·æ— æ“ä½œæ—¶é‡è¿žï¼‰
-            with self._last_user_msg_time_lock:
-                user_silence = time.time() - self._last_user_msg_time if self._last_user_msg_time > 0 else time.time() - self._ws_connected_at
-            if user_silence > self._user_msg_timeout:
-                logger.info(f"[çœ‹é—¨ç‹—] {user_silence:.0f}s æ— ç”¨æˆ·äº’åŠ¨æ¶ˆæ¯ (é˜ˆå€¼={self._user_msg_timeout}s)ï¼Œè§¦å‘é‡è¿ž")
-                try:
-                    await self._ws.close()
-                except Exception:
-                    pass
-                break
+            # 用户互动消息静默检测（仅在已收到过至少一条互动消息时触发，防止因无活跃观众导致误判断连）
+            if self._last_user_msg_time > 0:
+                with self._last_user_msg_time_lock:
+                    user_silence = time.time() - self._last_user_msg_time
+                if user_silence > self._user_msg_timeout:
+                    logger.info(f"[看门狗] {user_silence:.0f}s 无用户互动消息 (阈值={self._user_msg_timeout}s)，触发重连")
+                    try:
+                        await self._ws.close()
+                    except Exception:
+                        pass
+                    break
 
     async def _stats_task(self):
         """å¼‚æ­¥ç»Ÿè®¡ï¼šæ¯ N ç§’æ‰“å°åžåé‡æŠ¥å‘Šã€‚"""
@@ -1808,6 +2085,35 @@ class DouyinBarrage:
                 if self._frame_total > 0:
                     gap_pct = self._frame_gaps / (self._frame_total + self._frame_gaps) * 100
                     logger.info(f"[å¸§åº] frames={self._frame_total} gaps={self._frame_gaps} loss={gap_pct:.2f}%")
+        # ── dual WS merge stats ──
+                if self._dual_ws:
+                    from base.parser import _get_conn as _gc
+                    try:
+                        stats = self._merge_tracker.flush_to_db(
+                            self._session_id, _gc()
+                        )
+                    except Exception:
+                        stats = None
+                    if stats:
+                        logger.info(
+                            f'[merge] cache={self._dedup_cache.size} '
+                            f'confirmed={stats.confirmed} '
+                            f'single={stats.single_source} '
+                            f'disc={stats.discrepancies}'
+                        )
+                        if stats.discrepancies > 0:
+                            logger.warning(
+                                f'[merge] {stats.discrepancies} discrepancies '
+                                f'in last 60s — check event_confidence table'
+                            )
+                    else:
+                        logger.info(
+                            f'[merge] cache={self._dedup_cache.size} '
+                            f'pending={self._merge_tracker.size} '
+                            f'primary={self._union_stats.get("primary", 0)} '
+                            f'secondary={self._union_stats.get("secondary", 0)} '
+                            f'dup={self._union_stats.get("dup", 0)}'
+                        )
                 # â”€â”€ fd çŠ¶æ€ç›‘æŽ§ï¼ˆé¿å… fd æ³„æ¼å¯¼è‡´ crashï¼‰â”€â”€
                 import os as _os
                 try:
@@ -1845,7 +2151,6 @@ class DouyinBarrage:
                         pass
 
 
-
     # â”€â”€ è¾…åŠ©æ–¹æ³• â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _save_room_info(self):
@@ -1874,7 +2179,6 @@ class DouyinBarrage:
                 logger.info(f"[æ•°æ®] ç›´æ’­é—´å°é¢å·²ä¸‹è½½")
         except Exception as e:
             logger.warning(f"[æ•°æ®] ä¿å­˜ä¸»æ’­ä¿¡æ¯å¤±è´¥: {e}")
-
 
     # â”€â”€ æ‰¹é‡åŒ¿åç”¨æˆ·è§£æž â”€â”€
 
@@ -1909,12 +2213,12 @@ class DouyinBarrage:
                             sec = info.get('sec_uid', '')
                             avatar = info.get('avatar_url', '')
                             conn.execute(
-                                'UPDATE users SET user_name = %s, sec_uid = CASE WHEN %s != \'\' THEN %s ELSE sec_uid END, avatar_url = CASE WHEN %s != \'\' THEN %s ELSE avatar_url END, is_anonymous = 0 WHERE user_id = %s',
+                                'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0 WHERE user_id = ?',
                                 (nick, sec, sec, avatar, avatar, uid)
                             )
                             if rid and rid != uid:
                                 conn.execute(
-                                    'UPDATE users SET user_name = %s, sec_uid = CASE WHEN %s != \'\' THEN %s ELSE sec_uid END, avatar_url = CASE WHEN %s != \'\' THEN %s ELSE avatar_url END, is_anonymous = 0 WHERE user_id = %s',
+                                    'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0 WHERE user_id = ?',
                                     (nick, sec, sec, avatar, avatar, rid)
                                 )
                             conn.commit()
@@ -1923,9 +2227,9 @@ class DouyinBarrage:
                             time.sleep(2.5)
                             continue
                     # API è¿”å›žç©º + æ— è´¡çŒ® â†’ å‡ç”¨æˆ·ï¼Œç§»å‡ºåŒ¿åç»Ÿè®¡
-                    has_c = conn.execute('SELECT COUNT(*) FROM contributions WHERE user_id = %s', (uid,)).fetchone()[0]
+                    has_c = conn.execute('SELECT COUNT(*) FROM contributions WHERE user_id = ?', (uid,)).fetchone()[0]
                     if has_c == 0:
-                        conn.execute('UPDATE users SET is_anonymous = 0, anonymous_label = "fake" WHERE user_id = %s', (uid,))
+                        conn.execute('UPDATE users SET is_anonymous = 0, anonymous_label = "fake" WHERE user_id = ?', (uid,))
                         conn.commit()
                         done += 1
                     import time
@@ -1937,29 +2241,15 @@ class DouyinBarrage:
         t = threading.Thread(target=_resolve, daemon=True, name='anon-resolve')
         t.start()
 
-    def _fill_subscription_uid(self, user_name, real_uid):
-        """当用户身份确认后，补填等待中的订阅记录 user_id。"""
-        if not user_name or not real_uid:
-            return
-        try:
-            cur = _get_conn().execute(
-                'UPDATE gift_logs SET user_id = ?, user_name = ? WHERE user_id = \'\' AND user_name = ? AND (gift_name LIKE \'%会员%\' OR gift_name LIKE \'%星守护%\')',
-                (real_uid, user_name, user_name)
-            )
-            if cur.rowcount > 0:
-                logger.info(f"[è®¢é˜…] å¡«è¡¥ user_id: {user_name} â†’ {real_uid} (å…± {cur.rowcount} æ¡)")
-        except Exception:
-            pass
-
-
 # â”€â”€ å†…éƒ¨ä¿¡å·å¼‚å¸¸ï¼ˆä¸åœ¨æ¨¡å—çº§æš´éœ²ï¼‰â”€â”€
 
 class _WaitLiveSignal(Exception):
     """ç›´æ’­ç»“æŸï¼Œè¿›å…¥ç­‰å¾…æ¨¡å¼ã€‚"""
     pass
 
-
 class _StopSignal(Exception):
     """ç›´æ’­é—´ç»“æŸï¼Œåœæ­¢é‡‡é›†ã€‚"""
     pass
+
+
 

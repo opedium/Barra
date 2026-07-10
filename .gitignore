@@ -27,7 +27,7 @@ ENV/
 env.bak/
 venv/bak/
 
-cookie*.txt
+cookie.txt
 # 弹幕数据（本地存储）
 data/
 docs/data/
@@ -37,4 +37,3 @@ logs/
 node_modules/
 browser_profile/
 deploy/
-.claude/
