@@ -2987,7 +2987,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
             FROM contributions c
             JOIN sessions s ON c.session_id = s.id AND strftime('%Y-%m', s.start_time) = ?
             LEFT JOIN users u ON u.user_id = c.user_id
-            WHERE c.consume > 0 {anchor_filter}
+            WHERE {valid_user_filter}c.consume > 0 {anchor_filter}
             GROUP BY c.user_id {having}
             {order_clause} LIMIT ? OFFSET ?
         ''', params).fetchall()
@@ -2995,7 +2995,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
             SELECT COUNT(*) FROM (
                 SELECT c.user_id FROM contributions c
                 JOIN sessions s ON c.session_id = s.id AND strftime('%Y-%m', s.start_time) = ?
-                WHERE c.consume > 0 {anchor_filter}
+                WHERE {valid_user_filter}c.consume > 0 {anchor_filter}
                 GROUP BY c.user_id {having}
             )
         ''', total_params).fetchone()[0]
@@ -3038,7 +3038,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
             JOIN sessions s ON c.session_id = s.id
             LEFT JOIN users u ON u.user_id = c.user_id
             WHERE s.start_time >= datetime('now', '-30 days')
-              AND c.consume > 0 {anchor_filter}
+              AND {valid_user_filter}c.consume > 0 {anchor_filter}
             GROUP BY c.user_id
             HAVING SUM(c.consume) > 0 {where_extra_30}
             {order_clause} LIMIT ? OFFSET ?
@@ -3048,7 +3048,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
                 SELECT c.user_id, SUM(c.consume) AS total_consume
                 FROM contributions c
                 JOIN sessions s ON c.session_id = s.id
-                WHERE s.start_time >= datetime('now', '-30 days') AND c.consume > 0 {anchor_filter}
+                WHERE s.start_time >= datetime('now', '-30 days') AND {valid_user_filter}c.consume > 0 {anchor_filter}
                 GROUP BY c.user_id
                 {total_extra_30}
             )
@@ -3100,7 +3100,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
             JOIN sessions s ON c.session_id = s.id
             LEFT JOIN users u ON u.user_id = c.user_id
             WHERE s.start_time >= ? AND (s.end_time <= ? OR (s.end_time IS NULL AND s.start_time <= ?))
-              AND c.consume > 0 {anchor_filter}
+              AND {valid_user_filter}c.consume > 0 {anchor_filter}
             GROUP BY c.user_id
             HAVING SUM(c.consume) > 0 {where_extra_custom}
             {order_clause} LIMIT ? OFFSET ?
@@ -3110,7 +3110,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
                 SELECT c.user_id, SUM(c.consume) AS total_consume
                 FROM contributions c
                 JOIN sessions s ON c.session_id = s.id
-                WHERE s.start_time >= ? AND (s.end_time <= ? OR (s.end_time IS NULL AND s.start_time <= ?)) AND c.consume > 0 {anchor_filter}
+                WHERE s.start_time >= ? AND (s.end_time <= ? OR (s.end_time IS NULL AND s.start_time <= ?)) AND {valid_user_filter}c.consume > 0 {anchor_filter}
                 GROUP BY c.user_id
                 {total_extra_custom}
             )
@@ -3130,7 +3130,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
                        {sessions_col} AS sessions_count
                 FROM contributions c
                 JOIN sessions s ON c.session_id = s.id
-                WHERE s.start_time >= ? AND (s.end_time <= ? OR (s.end_time IS NULL AND s.start_time <= ?)) AND c.consume > 0 {anchor_filter}
+                WHERE s.start_time >= ? AND (s.end_time <= ? OR (s.end_time IS NULL AND s.start_time <= ?)) AND {valid_user_filter}c.consume > 0 {anchor_filter}
                 GROUP BY c.user_id
                 HAVING SUM(c.consume) > 0 {where_extra_custom}
             ) sub
@@ -3164,7 +3164,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
                 FROM contributions c
                 JOIN sessions s ON c.session_id = s.id AND strftime('%Y-%m', s.start_time) = ?
                 LEFT JOIN users u ON u.user_id = c.user_id
-                WHERE c.consume > 0 {anchor_filter}
+                WHERE {valid_user_filter}c.consume > 0 {anchor_filter}
                 GROUP BY c.user_id {having}
                 {order_clause} LIMIT ? OFFSET ?
             ''', params_all).fetchall()
@@ -3172,7 +3172,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
                 SELECT COUNT(*) FROM (
                     SELECT c.user_id FROM contributions c
                     JOIN sessions s ON c.session_id = s.id AND strftime('%Y-%m', s.start_time) = ?
-                    WHERE c.consume > 0 {anchor_filter}
+                    WHERE {valid_user_filter}c.consume > 0 {anchor_filter}
                     GROUP BY c.user_id {having}
                 )
             ''', total_params).fetchone()[0]
@@ -3197,7 +3197,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
                 FROM contributions c
                 {sessions_join_all}
                 LEFT JOIN users u ON u.user_id = c.user_id
-                WHERE c.consume > 0 {anchor_filter}
+                WHERE {valid_user_filter}c.consume > 0 {anchor_filter}
                 GROUP BY c.user_id {having}
                 {order_clause} LIMIT ? OFFSET ?
             ''', params_all).fetchall()
@@ -3205,7 +3205,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
                 SELECT COUNT(*) FROM (
                     SELECT c.user_id FROM contributions c
                     {sessions_join_all}
-                    WHERE c.consume > 0 {anchor_filter}
+                    WHERE {valid_user_filter}c.consume > 0 {anchor_filter}
                     GROUP BY c.user_id {having}
                 )
             ''', total_params).fetchone()[0]

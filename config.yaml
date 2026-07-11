@@ -27,8 +27,8 @@ network:
   heartbeat_interval: 10
   rcvbuf_kb: 1024
   proxy: null
-  ws_proxy2: {"http": "http://8a102d60cee10e7a08aa__cr.cn:bbb6490d4e689be8@gw.dataimpulse.com:10000"}  # ws2 独立代理（不同出口IP）
-  dual_ws: true
+  ws_proxy2: null
+  dual_ws: false
   dual_ws_identity: unique
   ws_host2: webcast5-ws-web-hl.douyin.com
   ws_cookie2: cookie2.txt
