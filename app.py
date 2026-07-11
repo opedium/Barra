@@ -1223,11 +1223,7 @@ def api_leaderboard():
             # No live session and no explicit session_id — return empty
             return jsonify({'users': [], 'total': 0, 'page': 1})
 
-    data = query_leaderboard(threshold, period, page, size, session_id, year_month, min_consume, anchor_name=streamer, room_id=room_id, start_date=start_date, end_date=end_date)
-    if sort_by == 'sessions' and data.get('users'):
-        data['users'].sort(key=lambda u: (-u.get('sessions_count', 0), -u.get('consume', 0)))
-        for i, u in enumerate(data['users']):
-            u['rank'] = i + 1
+    data = query_leaderboard(threshold, period, page, size, session_id, year_month, min_consume, anchor_name=streamer, room_id=room_id, start_date=start_date, end_date=end_date, sort_by=sort_by)
     return jsonify(data)
 
 
@@ -1897,13 +1893,8 @@ def api_leaderboard_csv():
             return _make_csv_response([], ['user_id', 'user_name', 'consume'], 'leaderboard.csv')
 
     # Fetch ALL pages (size=999999)
-    data = query_leaderboard(threshold, period, 1, 999999, session_id, year_month, min_consume, anchor_name=streamer, room_id=room_id, start_date=start_date, end_date=end_date)
+    data = query_leaderboard(threshold, period, 1, 999999, session_id, year_month, min_consume, anchor_name=streamer, room_id=room_id, start_date=start_date, end_date=end_date, sort_by=sort_by)
     users = data.get('users', [])
-
-    if sort_by == 'sessions' and users:
-        users.sort(key=lambda u: (-u.get('sessions_count', 0), -u.get('consume', 0)))
-        for i, u in enumerate(users):
-            u['rank'] = i + 1
 
     filename = f'leaderboard_{period}_{year_month or "all"}.csv'
     fieldnames = ['rank', 'user_id', 'user_name', 'grade', 'fans_club', 'consume', 'sessions_count',

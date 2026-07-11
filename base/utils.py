@@ -732,8 +732,9 @@ def make_badge_fallback(grade_text="", fans_club_text=""):
         m = _re.search(r'等级(\d+)', grade_text)
         if m:
             level = int(m.group(1))
-            # Level badge: use the old PNG format. Shining webp variants exist for levels >= 40
-            # but are less reliable for lower levels.
+            # Level badge: use the PNG format which works across all levels (verified Lv1-Lv35+).
+            # The webp "shining" format (new_shining_level_{level}.webp) only works for Lv35+
+            # and returns 404 for lower levels.
             badges.append({
                 'url': f'https://p3-webcast.douyinpic.com/img/webcast/new_user_grade_level_v1_{level}.png~tplv-obj.image',
                 'level': level,
@@ -741,15 +742,8 @@ def make_badge_fallback(grade_text="", fans_club_text=""):
             })
             # League icon is ONLY from real Douyin data (pay_grade.recent_consume_badge).
             # For fallback records without websocket data, do NOT generate it — the
-            # actual league level per-user is unknown.
-
-            # Membership V badge — monthly by default, yearly if text contains 年度
-            is_yearly = grade_text and '年度' in grade_text
-            membership_url = 'https://p11-webcast.douyinpic.com/img/webcast/31231321Vnian.png~tplv-obj.image' if is_yearly else 'https://p3-webcast.douyinpic.com/img/webcast/1231241211V.png~tplv-obj.image'
-            badges.append({
-                'url': membership_url,
-                'alt': '年度会员' if is_yearly else '会员',
-            })
+            # actual league level per-user is unknown. Membership V badge is also
+            # excluded from fallback — it only comes from real protobuf data.
 
     # Extract fans club name + level from text like "逸楠💫 Lv20" or "[粉丝团:香奈儿 Lv20]"
     if fans_club_text:
@@ -767,28 +761,12 @@ def make_badge_fallback(grade_text="", fans_club_text=""):
 
 
 def _merge_badges(existing_json, grade_text='', fans_club_text=''):
-    """Augment existing badge_url JSON with missing badges (league, membership V)
-    that the websocket protobuf often omits. Returns JSON string or None if no merge needed."""
-    import json as _json, re as _re
-    try:
-        existing = _json.loads(existing_json) if isinstance(existing_json, str) else existing_json
-        if not isinstance(existing, list):
-            return None
-    except Exception:
-        return None
-    existing_urls = set()
-    for b in existing:
-        if b.get('url'):
-            existing_urls.add(b['url'].split('~tplv')[0])
-    added = False
-    if grade_text:
-        m = _re.search(r'等级(\d+)', grade_text)
-        if m:
-            level = int(m.group(1))
-            # League icon is ONLY from real Douyin data. Skip here.
-            pass
-    v_url = 'https://p3-webcast.douyinpic.com/img/webcast/1231241211V.png~tplv-obj.image'
-    if v_url.split('~tplv')[0] not in existing_urls:
-        existing.append({'url': v_url, 'alt': '会员'})
-        added = True
-    return _json.dumps(existing, ensure_ascii=False) if added else None
+    """No-op — badge merging is no longer needed.
+
+    Previously added synthetic league/membership V badges for protobuf data
+    that omitted them. Now all badge types are reliably captured from the
+    real protobuf in get_badge_urls(), so no merge is required.
+
+    Returns None (no merge needed).
+    """
+    return None

@@ -2870,11 +2870,18 @@ def _resolve_tier(threshold):
     return None
 
 
-def query_leaderboard(threshold=1000, period='session', page=1, size=100, session_id=None, year_month='', min_consume=0, anchor_name='', room_id='', start_date='', end_date=''):
+def query_leaderboard(threshold=1000, period='session', page=1, size=100, session_id=None, year_month='', min_consume=0, anchor_name='', room_id='', start_date='', end_date='', sort_by='consume'):
     conn = _get_conn()
     offset = (page - 1) * size
     tier = _resolve_tier(threshold)
     summary_dict = None
+
+    # Determine ORDER BY clause based on sort mode
+    # For cross-session periods, sort by sessions_count first when sort_by='sessions'
+    if sort_by == 'sessions':
+        order_clause = 'ORDER BY sessions_count DESC, consume DESC'
+    else:
+        order_clause = 'ORDER BY consume DESC'
 
     # 主播筛选（session 级别已锁定单场，无需重复过滤）
     # 优先按 room_id 过滤（稳定数字 ID，避免 anchor_name 字符串编码问题）
@@ -2886,6 +2893,9 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
     elif anchor_name and period != 'session':
         anchor_filter = 'AND TRIM(s.anchor_name) = ?'
         anchor_params = (anchor_name.strip(),)
+
+    # Exclude empty user_id records (anonymous/malformed data from star_guard events)
+    valid_user_filter = 'c.user_id != "" AND c.user_id IS NOT NULL AND '
 
     if period == 'session' and session_id:
         if tier is not None:
@@ -2933,6 +2943,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
             params_today.append(min_consume)
             total_params = total_params + (min_consume,)
         params_today.extend([size, offset])
+        # For session-level, sessions_count is always 1 — sort doesn't change order
         rows = conn.execute(f'''
             SELECT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name, SUM(c.consume) AS consume,
                    COALESCE(u.fans_club, '') AS fans_club,
@@ -2942,15 +2953,15 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
             FROM contributions c
             JOIN sessions s ON c.session_id = s.id AND date(s.start_time) = ?
             LEFT JOIN users u ON u.user_id = c.user_id
-            WHERE c.consume > 0 {anchor_filter}
+            {valid_user_filter} AND c.consume > 0 {anchor_filter}
             GROUP BY c.user_id {having}
-            ORDER BY consume DESC LIMIT ? OFFSET ?
+            {order_clause} LIMIT ? OFFSET ?
         ''', params_today).fetchall()
         total = conn.execute(f'''
             SELECT COUNT(*) FROM (
                 SELECT c.user_id FROM contributions c
                 JOIN sessions s ON c.session_id = s.id AND date(s.start_time) = ?
-                WHERE c.consume > 0 {anchor_filter}
+                WHERE {valid_user_filter[4:]} AND c.consume > 0 {anchor_filter}
                 GROUP BY c.user_id {having}
             )
         ''', total_params).fetchone()[0]
@@ -2978,7 +2989,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
             LEFT JOIN users u ON u.user_id = c.user_id
             WHERE c.consume > 0 {anchor_filter}
             GROUP BY c.user_id {having}
-            ORDER BY consume DESC LIMIT ? OFFSET ?
+            {order_clause} LIMIT ? OFFSET ?
         ''', params).fetchall()
         total = conn.execute(f'''
             SELECT COUNT(*) FROM (
@@ -3030,7 +3041,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
               AND c.consume > 0 {anchor_filter}
             GROUP BY c.user_id
             HAVING SUM(c.consume) > 0 {where_extra_30}
-            ORDER BY consume DESC LIMIT ? OFFSET ?
+            {order_clause} LIMIT ? OFFSET ?
         ''', params_30).fetchall()
         total = conn.execute(f'''
             SELECT COUNT(*) FROM (
@@ -3092,7 +3103,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
               AND c.consume > 0 {anchor_filter}
             GROUP BY c.user_id
             HAVING SUM(c.consume) > 0 {where_extra_custom}
-            ORDER BY consume DESC LIMIT ? OFFSET ?
+            {order_clause} LIMIT ? OFFSET ?
         ''', params_custom).fetchall()
         total = conn.execute(f'''
             SELECT COUNT(*) FROM (
@@ -3104,20 +3115,26 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
                 {total_extra_custom}
             )
         ''', total_params_custom).fetchone()[0]
-        # 自定义日期范围的汇总统计
+        # 自定义日期范围的汇总统计（使用与主查询相同的最小消费条件）
+        summary_params = [start_date, end_date, end_date]
+        if anchor_params:
+            summary_params.extend(anchor_params)
+        if min_consume > 0:
+            summary_params.append(min_consume)
         summary = conn.execute(f'''
             SELECT COALESCE(SUM(sub.total_consume), 0) AS total_consume,
                    COALESCE(SUM(sub.sessions_count), 0) AS total_sessions,
                    COUNT(*) AS total_users
             FROM (
                 SELECT c.user_id, SUM(c.consume) AS total_consume,
-                       COUNT(DISTINCT c.session_id) AS sessions_count
+                       {sessions_col} AS sessions_count
                 FROM contributions c
                 JOIN sessions s ON c.session_id = s.id
                 WHERE s.start_time >= ? AND (s.end_time <= ? OR (s.end_time IS NULL AND s.start_time <= ?)) AND c.consume > 0 {anchor_filter}
                 GROUP BY c.user_id
+                HAVING SUM(c.consume) > 0 {where_extra_custom}
             ) sub
-        ''', total_params_custom).fetchone()
+        ''', summary_params).fetchone()
         summary_dict = dict(summary) if summary else {'total_consume': 0, 'total_sessions': 0, 'total_users': 0}
     else:
         # 全部 / 指定月份：从 contributions 聚合
@@ -3149,7 +3166,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
                 LEFT JOIN users u ON u.user_id = c.user_id
                 WHERE c.consume > 0 {anchor_filter}
                 GROUP BY c.user_id {having}
-                ORDER BY consume DESC LIMIT ? OFFSET ?
+                {order_clause} LIMIT ? OFFSET ?
             ''', params_all).fetchall()
             total = conn.execute(f'''
                 SELECT COUNT(*) FROM (
@@ -3182,7 +3199,7 @@ def query_leaderboard(threshold=1000, period='session', page=1, size=100, sessio
                 LEFT JOIN users u ON u.user_id = c.user_id
                 WHERE c.consume > 0 {anchor_filter}
                 GROUP BY c.user_id {having}
-                ORDER BY consume DESC LIMIT ? OFFSET ?
+                {order_clause} LIMIT ? OFFSET ?
             ''', params_all).fetchall()
             total = conn.execute(f'''
                 SELECT COUNT(*) FROM (

@@ -318,8 +318,8 @@ function toggleControls(period) {
     var showMinConsume = period === 'recent' || period === 'month' || period === '30d' || period === 'all' || isCustom;
     document.getElementById('min-consume-input').style.display = showMinConsume ? '' : 'none';
 
-    // 排序按钮: session, today, month, all (not 30d, not million, not custom)
-    var showSort = period === 'session' || period === 'recent' || period === 'month' || period === 'all';
+    // 排序按钮: available for cross-session periods + custom
+    var showSort = period === 'session' || period === 'recent' || period === 'month' || period === 'all' || period === 'custom' || period === '30d';
     document.getElementById('sort-btn').style.display = showSort ? '' : 'none';
 
     // Top N: today, month, 30d, all, custom (not session, not million)
