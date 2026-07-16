@@ -555,7 +555,7 @@ def parse_chat_msg(payload, enable_outputs=None):
     uid = get_user_id(user)
     uname = get_user_name(user)
     badge_url = get_badge_urls(user)
-    fansclub_badge = get_badge_urls(user)
+    fansclub_badge = ''  # extracted inline from protobuf; web panel falls back to badge_url
     common = {
         'time': time.strftime('%H:%M:%S'),
         'user_id': uid,
@@ -651,13 +651,40 @@ def parse_gift_msg(payload, enable_outputs=None):
             else:
                 _auto_register_gift_id(gft_id, gift_name=gift.name or '', diamond_count=gift.diamond_count or 0)
 
+    # ── 订阅礼物检测（会员/星守护）──
+    if hasattr(gift, 'sub_type') and gift.sub_type == 2:
+        desc = msg.common.describe if msg.common else ''
+        if not desc or not any(w in desc for w in ('会员', '星守护')):
+            return []
+        action = next((w for w in ('开通', '续费') if w in desc), '')
+        sub_type = next((w for w in ('月度', '季度', '年度') if w in desc), '')
+        if not action or not sub_type:
+            return []
+        event = '星守护' if '星守护' in desc else '会员'
+        user_display_name = get_user_name(user)
+        douyin_id = getattr(user, 'display_id', '') or ''
+        price = gift.diamond_count or 0
+        logger.info(f"[订阅] GiftMessage {user_display_name}[{uid}] {action}{sub_type}{event} ({price}钻石)")
+        return [{
+            'type': 'subscribe',
+            'msg': f'[订阅] {user_display_name} {action}{sub_type}{event} ({price}钻石)',
+            'data': {
+                'time': time.strftime('%H:%M:%S'),
+                'user_name': user_display_name,
+                'user_id': uid,
+                'douyin_id': douyin_id,
+                'event': event, 'action': action, 'sub_type': sub_type,
+                'diamond': price,
+            },
+        }]
+
     user_display_name = get_user_name(user)
     douyin_id = getattr(user, 'display_id', '') or ''
     fans_club_anchor_id = get_fans_club_anchor_id(user)
 
     # Extract badge images from user protobuf — must be before combo buffer path
     badge_json = get_badge_urls(user)
-    fansclub_json = get_badge_urls(user)
+    fansclub_json = ''  # web panel falls back to badge_url
 
     # ── 提取关键字段 ──
     combo_cnt = msg.combo_count or 0
@@ -1146,6 +1173,7 @@ def _extract_subscribe(payload):
     user_obj = room_msg.common.user
     uid = str(get_user_id(user_obj)) if user_obj else ''
     uname = get_user_name(user_obj) if user_obj else ''
+    douyin_id = getattr(user_obj, 'display_id', '') or uid
     if not uname:
         # Fallback: extract from describe text like "xxx 开通了会员月度"
         import re as _re
@@ -1159,7 +1187,7 @@ def _extract_subscribe(payload):
         'type': sub_type,
         'user': uname or uid,
         'user_id': uid,
-        'douyin_id': uid,
+        'douyin_id': douyin_id,
     }
 
 
@@ -1173,6 +1201,8 @@ _SUBSCRIBE_PRICES = {
     ('会员', '续费', '年度'): 11760,
     ('星守护', '开通', '月度'): 1280,
     ('星守护', '续费', '月度'): 1280,
+    ('星守护', '开通', '季度'): 3840,
+    ('星守护', '续费', '季度'): 3840,
     ('星守护', '开通', '年度'): 15360,
     ('星守护', '续费', '年度'): 15360,
 }
@@ -1189,6 +1219,14 @@ def parse_room_msg(payload, enable_outputs=None):
         结果字典列表。类型为 'room' 和/或 'subscribe'。
     """
     results = []
+
+    # ── 保护：空 room_id 的 RoomMessage 不处理 ──
+    try:
+        room_check = parse_proto(RoomMessage, payload)
+        if room_check.common and not str(room_check.common.room_id or '').strip():
+            return results
+    except Exception:
+        pass
 
     # ── 订阅检测 ──
     sub_info = _extract_subscribe(payload)
@@ -1207,6 +1245,7 @@ def parse_room_msg(payload, enable_outputs=None):
                 'time': time.strftime('%H:%M:%S'),
                 'user_name': user,
                 'user_id': uid,
+                'douyin_id': sub_info.get('douyin_id', uid),
                 'event': event,
                 'action': action,
                 'sub_type': sub_type,
@@ -1214,7 +1253,9 @@ def parse_room_msg(payload, enable_outputs=None):
             },
         })
 
-    # ── 原有 room 解析 ──
+    # Skip room-level output — this message is a subscription event, not a room announcement
+    if sub_info:
+        return results
     if not enable_outputs.get('room', True):
         return results
 
@@ -1275,18 +1316,21 @@ def parse_asset_effect_util_msg(payload, enable_outputs=None):
 
     try:
         uname = get_user_name(msg.common.user) if msg.common and msg.common.user else uid
+        douyin_id = getattr(msg.common.user, 'display_id', '') or uid
     except Exception:
         uname = uid
+        douyin_id = uid
 
-    price = _SUBSCRIBE_PRICES.get(('星守护', '开通', '月度'), 0)
+    price = 0  # entry effect, not a purchase — real price comes from GiftMessage
 
     return [{
         'type': 'subscribe',
-        'msg': f'[订阅] {uname} 开通星守护 ({price}钻石)',
+        'msg': f'[订阅] {uname} 开通星守护 (进场特效)',
         'data': {
             'time': time.strftime('%H:%M:%S'),
             'user_name': uname,
             'user_id': uid,
+            'douyin_id': douyin_id,
             'event': '星守护',
             'action': '开通',
             'sub_type': '月度',
@@ -2151,6 +2195,23 @@ def init_db():
         conn.execute('ALTER TABLE gift_prices DROP COLUMN notes')
     except Exception:
         pass
+    # 迁移：补充 badge_url / fansclub_badge 列
+    try:
+        conn.execute('ALTER TABLE chat_logs ADD COLUMN badge_url TEXT DEFAULT ""')
+    except Exception:
+        pass
+    try:
+        conn.execute('ALTER TABLE chat_logs ADD COLUMN fansclub_badge TEXT DEFAULT ""')
+    except Exception:
+        pass
+    try:
+        conn.execute('ALTER TABLE gift_logs ADD COLUMN badge_url TEXT DEFAULT ""')
+    except Exception:
+        pass
+    try:
+        conn.execute('ALTER TABLE gift_logs ADD COLUMN fansclub_badge TEXT DEFAULT ""')
+    except Exception:
+        pass
     # 清理僵尸场次：结束标记为"直播中"但开始时间超过 12 小时前的场次
     conn.execute("""
         UPDATE sessions SET end_time = start_time, status = 'ended'
@@ -2502,9 +2563,9 @@ def upsert_user(user_id, user_name, grade='', fans_club='', sec_uid='', avatar_u
     except queue.Full:
         logger.warning(f"[DB] upsert queue full: uid={user_id}")
 
-def flush_to_sqlite(session_id):
-    """从 gift_logs 聚合贡献数据写入 contributions / daily_stats / monthly_stats。"""
-    conn = _get_conn()
+def flush_to_sqlite(conn, session_id):
+    """从 gift_logs 聚合贡献数据写入 contributions / daily_stats / monthly_stats。
+    必须在写者线程调用（conn 为写者线程连接）。"""
     today = datetime.now().strftime('%Y-%m-%d')
     month = datetime.now().strftime('%Y-%m')
 
@@ -2513,98 +2574,93 @@ def flush_to_sqlite(session_id):
         FROM gift_logs WHERE session_id = ?
         GROUP BY user_id
     ''', (session_id,)).fetchall()
-
     if not rows:
         return
 
-    with _flush_lock:
-        for r in rows:
-            uid = r['user_id']
-            nick = r['user_name']
-            consume = r['consume']
+    for r in rows:
+        uid = r['user_id']
+        nick = r['user_name']
+        consume = r['consume']
 
-            # 获取粉丝团和财富等级
-            info = conn.execute(
-                "SELECT fans_club, grade FROM chat_logs WHERE user_id = ? AND (fans_club != '' OR grade != '') ORDER BY id DESC LIMIT 1",
-                (uid,)
-            ).fetchone()
-            fans_club = info['fans_club'] if info else ''
-            grade = info['grade'] if info else ''
-    
-            # 同步 users 表
-            conn.execute('''
-                INSERT INTO users (user_id, user_name, fans_club, grade, last_seen)
-                VALUES (?, ?, ?, ?, datetime("now", "+8 hours"))
-                ON CONFLICT(user_id) DO UPDATE SET
-                    fans_club = CASE WHEN ? != '' THEN ? ELSE fans_club END,
-                    grade = CASE WHEN ? != '' THEN ? ELSE grade END,
-                    last_seen = datetime("now", "+8 hours")
-            ''', (uid, nick, fans_club, grade, fans_club, fans_club, grade, grade))
-    
-            prev = conn.execute(
-                'SELECT qualified_1000, qualified_3000, qualified_10000, qualified_100000 FROM contributions WHERE session_id=? AND user_id=?',
-                (session_id, uid)
-            ).fetchone()
-    
-            pq_1000 = prev['qualified_1000'] if prev else 0
-            pq_3000 = prev['qualified_3000'] if prev else 0
-            pq_10000 = prev['qualified_10000'] if prev else 0
-            pq_100000 = prev['qualified_100000'] if prev else 0
-            q_1000 = 1 if consume >= 1000 else 0
-            q_3000 = 1 if consume >= 3000 else 0
-            q_10000 = 1 if consume >= 10000 else 0
-            q_100000 = 1 if consume >= 100000 else 0
-    
-            conn.execute('''
-                INSERT INTO contributions
-                    (session_id, user_id, user_name, consume, rank, fans_club, source,
-                     qualified_1000, qualified_3000, qualified_10000, qualified_100000)
-                VALUES (?, ?, ?, ?, 0, ?, 'websocket', ?, ?, ?, ?)
-                ON CONFLICT(session_id, user_id) DO UPDATE SET
-                    consume = excluded.consume,
-                    qualified_1000 = MAX(qualified_1000, excluded.qualified_1000),
-                    qualified_3000 = MAX(qualified_3000, excluded.qualified_3000),
-                    qualified_10000 = MAX(qualified_10000, excluded.qualified_10000),
-                    qualified_100000 = MAX(qualified_100000, excluded.qualified_100000)
-            ''', (session_id, uid, nick, consume, fans_club,
-                  q_1000, q_3000, q_10000, q_100000))
-    
-            # 每日/每月达标次数（仅在首次达标时 +1）
-            if q_1000 and not pq_1000:
-                conn.execute('INSERT INTO daily_stats (user_id, user_name, date, sessions_1000, total_consume) VALUES (?, ?, ?, 1, 0) ON CONFLICT(user_id, date) DO UPDATE SET sessions_1000 = sessions_1000 + 1', (uid, nick, today))
-                conn.execute('INSERT INTO monthly_stats (user_id, user_name, year_month, sessions_1000, total_consume) VALUES (?, ?, ?, 1, 0) ON CONFLICT(user_id, year_month) DO UPDATE SET sessions_1000 = sessions_1000 + 1', (uid, nick, month))
-            if q_3000 and not pq_3000:
-                conn.execute('UPDATE daily_stats SET sessions_3000 = sessions_3000 + 1 WHERE user_id = ? AND date = ?', (uid, today))
-                conn.execute('UPDATE monthly_stats SET sessions_3000 = sessions_3000 + 1 WHERE user_id = ? AND year_month = ?', (uid, month))
-            if q_10000 and not pq_10000:
-                conn.execute('UPDATE daily_stats SET sessions_10000 = sessions_10000 + 1 WHERE user_id = ? AND date = ?', (uid, today))
-                conn.execute('UPDATE monthly_stats SET sessions_10000 = sessions_10000 + 1 WHERE user_id = ? AND year_month = ?', (uid, month))
-            if q_100000 and not pq_100000:
-                conn.execute('UPDATE daily_stats SET sessions_100000 = sessions_100000 + 1 WHERE user_id = ? AND date = ?', (uid, today))
-                conn.execute('UPDATE monthly_stats SET sessions_100000 = sessions_100000 + 1 WHERE user_id = ? AND year_month = ?', (uid, month))
-    
-            # 每日/每月总消费：从 contributions 重新计算（始终为实际总和）
-            total_day = conn.execute(
-                "SELECT COALESCE(SUM(c.consume), 0) FROM contributions c JOIN sessions s ON c.session_id = s.id WHERE c.user_id = ? AND date(s.start_time) = ?",
-                (uid, today)
-            ).fetchone()[0]
-            total_month = conn.execute(
-                "SELECT COALESCE(SUM(c.consume), 0) FROM contributions c JOIN sessions s ON c.session_id = s.id WHERE c.user_id = ? AND strftime('%Y-%m', s.start_time) = ?",
-                (uid, month)
-            ).fetchone()[0]
-            conn.execute('UPDATE daily_stats SET total_consume = ?, user_name = ? WHERE user_id = ? AND date = ?',
-                         (total_day, nick, uid, today))
-            conn.execute('UPDATE monthly_stats SET total_consume = ?, user_name = ? WHERE user_id = ? AND year_month = ?',
-                         (total_month, nick, uid, month))
+        # 获取粉丝团和财富等级
+        info = conn.execute(
+            "SELECT fans_club, grade FROM chat_logs WHERE user_id = ? AND (fans_club != '' OR grade != '') ORDER BY id DESC LIMIT 1",
+            (uid,)
+        ).fetchone()
+        fans_club = info['fans_club'] if info else ''
+        grade = info['grade'] if info else ''
+
+        # 同步 users 表
+        conn.execute('''
+            INSERT INTO users (user_id, user_name, fans_club, grade, last_seen)
+            VALUES (?, ?, ?, ?, datetime("now", "+8 hours"))
+            ON CONFLICT(user_id) DO UPDATE SET
+                fans_club = CASE WHEN ? != '' THEN ? ELSE fans_club END,
+                grade = CASE WHEN ? != '' THEN ? ELSE grade END,
+                last_seen = datetime("now", "+8 hours")
+        ''', (uid, nick, fans_club, grade, fans_club, fans_club, grade, grade))
+
+        prev = conn.execute(
+            'SELECT qualified_1000, qualified_3000, qualified_10000, qualified_100000 FROM contributions WHERE session_id=? AND user_id=?',
+            (session_id, uid)
+        ).fetchone()
+
+        pq_1000 = prev['qualified_1000'] if prev else 0
+        pq_3000 = prev['qualified_3000'] if prev else 0
+        pq_10000 = prev['qualified_10000'] if prev else 0
+        pq_100000 = prev['qualified_100000'] if prev else 0
+        q_1000 = 1 if consume >= 1000 else 0
+        q_3000 = 1 if consume >= 3000 else 0
+        q_10000 = 1 if consume >= 10000 else 0
+        q_100000 = 1 if consume >= 100000 else 0
+
+        conn.execute('''
+            INSERT INTO contributions
+                (session_id, user_id, user_name, consume, rank, fans_club, source,
+                 qualified_1000, qualified_3000, qualified_10000, qualified_100000)
+            VALUES (?, ?, ?, ?, 0, ?, 'websocket', ?, ?, ?, ?)
+            ON CONFLICT(session_id, user_id) DO UPDATE SET
+                consume = excluded.consume,
+                qualified_1000 = MAX(qualified_1000, excluded.qualified_1000),
+                qualified_3000 = MAX(qualified_3000, excluded.qualified_3000),
+                qualified_10000 = MAX(qualified_10000, excluded.qualified_10000),
+                qualified_100000 = MAX(qualified_100000, excluded.qualified_100000)
+        ''', (session_id, uid, nick, consume, fans_club,
+              q_1000, q_3000, q_10000, q_100000))
+
+        # 每日/每月达标次数（仅在首次达标时 +1）
+        if q_1000 and not pq_1000:
+            conn.execute('INSERT INTO daily_stats (user_id, user_name, date, sessions_1000, total_consume) VALUES (?, ?, ?, 1, 0) ON CONFLICT(user_id, date) DO UPDATE SET sessions_1000 = sessions_1000 + 1', (uid, nick, today))
+            conn.execute('INSERT INTO monthly_stats (user_id, user_name, year_month, sessions_1000, total_consume) VALUES (?, ?, ?, 1, 0) ON CONFLICT(user_id, year_month) DO UPDATE SET sessions_1000 = sessions_1000 + 1', (uid, nick, month))
+        if q_3000 and not pq_3000:
+            conn.execute('UPDATE daily_stats SET sessions_3000 = sessions_3000 + 1 WHERE user_id = ? AND date = ?', (uid, today))
+            conn.execute('UPDATE monthly_stats SET sessions_3000 = sessions_3000 + 1 WHERE user_id = ? AND year_month = ?', (uid, month))
+        if q_10000 and not pq_10000:
+            conn.execute('UPDATE daily_stats SET sessions_10000 = sessions_10000 + 1 WHERE user_id = ? AND date = ?', (uid, today))
+            conn.execute('UPDATE monthly_stats SET sessions_10000 = sessions_10000 + 1 WHERE user_id = ? AND year_month = ?', (uid, month))
+        if q_100000 and not pq_100000:
+            conn.execute('UPDATE daily_stats SET sessions_100000 = sessions_100000 + 1 WHERE user_id = ? AND date = ?', (uid, today))
+            conn.execute('UPDATE monthly_stats SET sessions_100000 = sessions_100000 + 1 WHERE user_id = ? AND year_month = ?', (uid, month))
+
+        # 每日/每月总消费：从 contributions 重新计算（始终为实际总和）
+        total_day = conn.execute(
+            "SELECT COALESCE(SUM(c.consume), 0) FROM contributions c JOIN sessions s ON c.session_id = s.id WHERE c.user_id = ? AND date(s.start_time) = ?",
+            (uid, today)
+        ).fetchone()[0]
+        total_month = conn.execute(
+            "SELECT COALESCE(SUM(c.consume), 0) FROM contributions c JOIN sessions s ON c.session_id = s.id WHERE c.user_id = ? AND strftime('%Y-%m', s.start_time) = ?",
+            (uid, month)
+        ).fetchone()[0]
+        conn.execute('UPDATE daily_stats SET total_consume = ?, user_name = ? WHERE user_id = ? AND date = ?',
+                     (total_day, nick, uid, today))
+        conn.execute('UPDATE monthly_stats SET total_consume = ?, user_name = ? WHERE user_id = ? AND year_month = ?',
+                     (total_month, nick, uid, month))
 
         conn.commit()
-
-
-# ── 单写者线程队列（所有线程推送写入操作，写者单线程处理，消除多线程锁争抢）──
+# ── 单写者线程队列（所有写入操作经同一队列串行化，消除多线程写冲突）──
 _write_queue = queue.Queue(maxsize=50000)
 _WRITER_BATCH_SIZE = 50
 _WRITER_FLUSH_INTERVAL = 0.5
-_flush_lock = threading.Lock()  # 用于 flush_to_sqlite 等直接写操作
 
 
 def _writer_loop():
@@ -2619,6 +2675,18 @@ def _writer_loop():
                 _flush_write_batch(conn, buf) if buf else None
                 conn.commit()
                 break
+            if item[0] == 'flush_stats':
+                # 先提交当前批次，再执行聚合
+                if buf:
+                    _flush_write_batch(conn, buf)
+                    for _ in buf:
+                        _write_queue.task_done()
+                    buf = []
+                conn.commit()
+                flush_to_sqlite(conn, item[1])
+                conn.commit()
+                _write_queue.task_done()
+                continue
             buf.append(item)
             now = time.time()
             if len(buf) >= _WRITER_BATCH_SIZE or now - last_flush > _WRITER_FLUSH_INTERVAL:
@@ -2636,6 +2704,13 @@ def _writer_loop():
                 last_flush = time.time()
         except Exception as _we:
             logger.error(f"[DB] 写者线程异常: {_we}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            for _ in buf:
+                _write_queue.task_done()
+            buf = []
 
 
 def _flush_write_batch(conn, batch):
@@ -2712,6 +2787,12 @@ def _flush_write_batch(conn, batch):
                 if r.rowcount:
                     logger.info(f"[DB] 补填 uid: user_name={uname} uid={ruid} sid={sid} 影响{r.rowcount}行")
                     logger.info(f"[DB] 补填 {r.rowcount} 条订阅记录: {uname} -> {ruid}")
+            elif op == 'upgrade':
+                _, sid, uid, uname, up_type, from_lv, to_lv, anchor = item
+                conn.execute(
+                    'INSERT OR IGNORE INTO upgrade_logs (session_id, user_id, user_name, upgrade_type, from_level, to_level, anchor_name) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                    (sid, uid, uname, up_type, from_lv, to_lv, anchor)
+                )
         except Exception as e:
             logger.warning(f"[DB] writer batch op failed: {op} {e}")
     conn.commit()
@@ -2769,15 +2850,16 @@ def request_backfill_uid(session_id, user_name, real_uid):
         logger.warning(f"[DB] 写入队列已满，丢弃 backfill: {user_name} -> {real_uid}")
 
 
+_gift_dedup_lock = threading.Lock()
 _gift_dedup_cache = {}  # (user_id, gift_name) → timestamp
 _GIFT_DEDUP_WINDOW = 10.0  # same user+gift within 10s = dedup (catches timer race + single dupes)
 
 
 def _prune_gift_dedup_cache():
     now = time.time()
-    stale = [k for k, ts in list(_gift_dedup_cache.items()) if now - ts > _GIFT_DEDUP_WINDOW * 2]
-    for k in stale:
-        _gift_dedup_cache.pop(k, None)
+    cutoff = now - _GIFT_DEDUP_WINDOW * 2
+    global _gift_dedup_cache
+    _gift_dedup_cache = {k: ts for k, ts in _gift_dedup_cache.items() if ts > cutoff}
 
 
 def record_gift(session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade='', fans_club='', group_id='', gift_id=0, to_user_id='', to_user_name='',
@@ -2792,15 +2874,18 @@ def record_gift(session_id, user_id, user_name, gift_name, gift_count, diamond_t
     if user_id and gift_name:
         dk = (user_id, gift_name, group_id) if group_id else (user_id, gift_name)
         now = time.time()
-        last_ts = _gift_dedup_cache.get(dk)
-        # 连送礼物（有 group_id）保持 10s 去重窗口；单发礼物（无 group_id）仅使用 0.5s 窗口以防止误杀用户连续点击
-        win = _GIFT_DEDUP_WINDOW if group_id else 0.5
-        if last_ts and now - last_ts < win:
-            logger.debug(f"[DB] record_gift mem-dedup: sid={session_id} uid={user_id} gift={gift_name} x{gift_count} dia={diamond_total}")
-            return
-        _gift_dedup_cache[dk] = now
-        if len(_gift_dedup_cache) > 5000:
-            _prune_gift_dedup_cache()
+        with _gift_dedup_lock:
+            last_ts = _gift_dedup_cache.get(dk)
+            # 连送礼物（有 group_id）保持 10s 去重窗口；单发礼物（无 group_id）仅使用 0.5s 窗口以防止误杀用户连续点击
+            win = _GIFT_DEDUP_WINDOW if group_id else 0.5
+            if last_ts and now - last_ts < win:
+                logger.debug(
+                    f"[DB] record_gift mem-dedup: sid={session_id} uid={user_id} gift={gift_name} x{gift_count} dia={diamond_total}"
+                )
+                return
+            _gift_dedup_cache[dk] = now
+            if len(_gift_dedup_cache) > 5000:
+                _prune_gift_dedup_cache()
     try:
         global _gift_enqueued; _gift_enqueued[session_id] = _gift_enqueued.get(session_id, 0) + 1
         _write_queue.put_nowait(('gift', session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club, group_id, gift_id, to_user_id, to_user_name, badge_url, fansclub_badge))
@@ -2810,19 +2895,13 @@ _VALID_TIERS = {1000, 3000, 10000, 100000}
 
 
 def record_upgrade(session_id, user_id, user_name, upgrade_type, from_level, to_level, anchor_name=''):
-    """记录用户升级事件（财富等级/粉丝团），使用 INSERT OR IGNORE 防重复。
-    仅记录 from_level > 0 的真实升级（首次检测到的高等级不计为升级事件）。"""
+    """记录用户升级事件，通过写者队列串行化。"""
     if not user_id or not upgrade_type or to_level <= 0 or from_level <= 0:
         return
     try:
-        conn = _get_conn()
-        conn.execute(
-            'INSERT OR IGNORE INTO upgrade_logs (session_id, user_id, user_name, upgrade_type, from_level, to_level, anchor_name) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            (session_id or 0, user_id, user_name, upgrade_type, from_level, to_level, anchor_name)
-        )
-        conn.commit()
-    except Exception as e:
-        logger.debug(f"[DB] record_upgrade failed: {e}")
+        _write_queue.put_nowait(('upgrade', session_id or 0, user_id, user_name, upgrade_type, from_level, to_level, anchor_name or ''))
+    except queue.Full:
+        logger.warning(f"[DB] 写入队列已满，丢弃升级记录: {user_id} {upgrade_type}")
 
 
 def query_upgrades(upgrade_type='', session_id=None, min_level=0, anchor_name='', room_id='', page=1, size=100):

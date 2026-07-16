@@ -491,6 +491,7 @@ class GiftStruct(proto.Message):
     for_custom = proto.Field(proto.BOOL, number=19)
     icon = proto.Field(Image, number=21)
     action_type = proto.Field(proto.UINT32, number=22)
+    sub_type = proto.Field(proto.UINT32, number=63)  # 1=normal, 2=subscription
 
 
 class GiftIMPriority(proto.Message):

@@ -46,7 +46,7 @@ from base.utils import (
     rotate_ua, set_current_anchor, set_anchor_name,
 )
 from base.output import setup_logger, ThroughputCounter, BARRAGE, RoomLogFilter, display_width, is_ci_environment
-from base.parser import get_dedup_stats, get_flow_counters, get_combo_buffer_size, init_db, create_session, end_session, flush_to_sqlite, flush_writes, record_chat, record_gift, request_backfill_uid, upsert_user, _get_conn, flush_all_buffers, flush_combo_buffer, set_gift_finalize_callback, remove_gift_finalize_callback
+from base.parser import get_dedup_stats, get_flow_counters, get_combo_buffer_size, init_db, create_session, end_session, flush_writes, record_chat, record_gift, request_backfill_uid, upsert_user, _get_conn, flush_all_buffers, flush_combo_buffer, set_gift_finalize_callback, remove_gift_finalize_callback
 from service.network import (
     fetch_ttwid, enter_room_api, download_image,
     fetch_user_info,
@@ -1567,9 +1567,13 @@ class DouyinBarrage:
                                         self._sub_deduped += 1
                                         continue
                                     self._subscribe_dedup[sub_key] = now_ts
-                                    stale = [k for k, t in list(self._subscribe_dedup.items()) if now_ts - t > 180]
-                                    for k in stale:
-                                        del self._subscribe_dedup[k]
+                                    if len(self._subscribe_dedup) > 5000:
+                                        cutoff = now_ts - 180
+                                        self._subscribe_dedup = {k: t for k, t in self._subscribe_dedup.items() if t > cutoff}
+                                    else:
+                                        stale = [k for k, t in list(self._subscribe_dedup.items()) if now_ts - t > 180]
+                                        for k in stale:
+                                            del self._subscribe_dedup[k]
                                     final_uid = ""
                                     final_grade = ""
                                     final_club = ""
@@ -1639,11 +1643,12 @@ class DouyinBarrage:
                         payload_preview = msg.payload[:80].hex() if isinstance(msg.payload, bytes) else str(msg.payload)[:80]
                         logger.info(f"[æ•°æ®] æœªæ³¨å†Œæ¶ˆæ¯ç±»åž‹: {msg.method} | payload_len={len(msg.payload)} | preview={payload_preview}")
 
-        # æ¯ 100 æ¡æ¶ˆæ¯è§¦å‘ä¸€æ¬¡ç»Ÿè®¡å†™å…¥ï¼ˆåœ¨å¤„ç†çº¿ç¨‹æ‰§è¡Œï¼Œå…äº‰æ‰§ï¼‰
+        # every 100 messages: enqueue aggregation (serialized through writer queue)
         self._proc_count = getattr(self, '_proc_count', 0) + 1
         if self._proc_count % 100 == 0 and self._session_id:
             try:
-                flush_to_sqlite(self._session_id)
+                from base.parser import _write_queue
+                _write_queue.put_nowait(('flush_stats', self._session_id))
             except Exception:
                 pass
 
@@ -2057,17 +2062,17 @@ class DouyinBarrage:
                         pass
                     break
 
-            # 用户互动消息静默检测（仅在已收到过至少一条互动消息时触发，防止因无活跃观众导致误判断连）
-            if self._last_user_msg_time > 0:
-                with self._last_user_msg_time_lock:
-                    user_silence = time.time() - self._last_user_msg_time
-                if user_silence > self._user_msg_timeout:
-                    logger.info(f"[看门狗] {user_silence:.0f}s 无用户互动消息 (阈值={self._user_msg_timeout}s)，触发重连")
-                    try:
-                        await self._ws.close()
-                    except Exception:
-                        pass
-                    break
+            # 用户互动消息静默检测（从连接建立起算，即使从未收到互动消息也会触发）
+            with self._last_user_msg_time_lock:
+                ref = self._last_user_msg_time if self._last_user_msg_time > 0 else self._ws_connected_at
+                user_silence = time.time() - ref
+            if user_silence > self._user_msg_timeout:
+                logger.info(f"[看门狗] {user_silence:.0f}s 无用户互动消息 (阈值={self._user_msg_timeout}s)，触发重连")
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+                break
 
     async def _stats_task(self):
         """å¼‚æ­¥ç»Ÿè®¡ï¼šæ¯ N ç§’æ‰“å°åžåé‡æŠ¥å‘Šã€‚"""
@@ -2141,7 +2146,6 @@ class DouyinBarrage:
                     flush_combo_buffer()
                 except Exception:
                     pass
-                # (flush_to_sqlite å·²ç§»è‡³ _process_item çº¿ç¨‹ï¼Œæ­¤å¤„ä¸å†è°ƒç”¨ä»¥å…äº‰æ‰§)
                 # â”€â”€ æ¯ 5 åˆ†é’Ÿå…³é—­é—²ç½® HTTP è¿žæŽ¥ï¼Œé˜²æ­¢ fd æ³„æ¼ â”€â”€
                 if int(time.time()) % 300 < self._stats_interval:
                     try:
