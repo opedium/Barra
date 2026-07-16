@@ -2119,7 +2119,7 @@ def main():
     print(f'[Flask] Starting http://{args.host}:{args.port}')
     print(f'[Flask] Database: {DB_PATH}')
     try:
-        app.run(host=args.host, port=args.port, debug=args.debug)
+        app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
     finally:
         _manager.shutdown_all()
 
