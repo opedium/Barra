@@ -1485,8 +1485,7 @@ class DouyinBarrage:
                                             self._anon_cooldown[cooldown_key] = now
                                             try:
                                                 if re.match(r'dou\d+$', uid, re.IGNORECASE):
-                                                    from service.network import fetch_user_info_by_unique_id
-                                                    info = fetch_user_info_by_unique_id(uid, session=self.session)
+                                                    info = self._resolve_dou_user(uid, self.session)
                                                 else:
                                                     info = fetch_user_info(uid, session=self.session)
                                                 if info and info.get('nickname') and not info['nickname'].startswith('ç¥žç§˜äºº') and not re.match(r'dou\d+$', info['nickname'], re.IGNORECASE):
@@ -1500,6 +1499,11 @@ class DouyinBarrage:
                                                             'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0 WHERE user_id = ?',
                                                             (resolved, resolved_sec, resolved_sec, resolved_avatar, resolved_avatar, muid)
                                                         )
+                                                    # 更新 gift_logs 和 chat_logs 中的 user_id 为真实 uid
+                                                    if resolved_uid and resolved_uid != uid and uid != resolved_uid:
+                                                        for tbl in ('gift_logs', 'chat_logs'):
+                                                            conn.execute(f'UPDATE {tbl} SET user_id = ? WHERE user_id = ? AND session_id = ?',
+                                                                         (resolved_uid, uid, self._session_id))
                                                     conn.commit()
                                                     logger.info(f"[åŒ¿å] å·²è§£æž {uid}: {uname} â†’ {resolved}")
                                             except Exception:
@@ -2186,6 +2190,36 @@ class DouyinBarrage:
 
     # â”€â”€ æ‰¹é‡åŒ¿åç”¨æˆ·è§£æž â”€â”€
 
+    def _resolve_dou_user(self, uid, session):
+        """Two-step resolve for douXXXXXX anonymous users.
+
+        Step 1: /aweme/v1/web/query/user/ by unique_id → get real user_uid
+        Step 2: fetch_user_info(user_uid) → get nickname + sec_uid + avatar
+        """
+        import json as _json
+        from service.network import fetch_user_info_by_unique_id
+        # Try step 1: query/user API to get mapping
+        try:
+            r = session.get(
+                f'https://www.douyin.com/aweme/v1/web/query/user/?unique_id={uid}',
+                timeout=15,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                real_uid = data.get('user_uid', '')
+                if real_uid and real_uid != uid:
+                    info = fetch_user_info(real_uid, session=session)
+                    if info and info.get('nickname'):
+                        info['user_id'] = real_uid
+                        return info
+        except Exception:
+            pass
+        # Fallback: direct unique_id lookup (iesdouyin, may fail)
+        info = fetch_user_info_by_unique_id(uid, session=session)
+        if info and info.get('nickname'):
+            return info
+        return None
+
     def _batch_resolve_anonymous(self):
         """åŽå°æ‰¹é‡è§£æžæœªè§£å†³çš„åŒ¿åç”¨æˆ·ï¼ˆdou/ç¥žç§˜äººå‰ç¼€ï¼‰ã€‚"""
         import re as _re
@@ -2207,7 +2241,7 @@ class DouyinBarrage:
                 uid = u['user_id']
                 try:
                     if _re.match(r'dou\d+$', uid, _re.IGNORECASE):
-                        info = fetch_user_info_by_unique_id(uid, session=self.session)
+                        info = self._resolve_dou_user(uid, self.session)
                     else:
                         info = fetch_user_info(uid, session=self.session)
                     if info and info.get('nickname'):
@@ -2225,6 +2259,8 @@ class DouyinBarrage:
                                     'UPDATE users SET user_name = ?, sec_uid = CASE WHEN ? != "" THEN ? ELSE sec_uid END, avatar_url = CASE WHEN ? != "" THEN ? ELSE avatar_url END, is_anonymous = 0 WHERE user_id = ?',
                                     (nick, sec, sec, avatar, avatar, rid)
                                 )
+                                for tbl in ('gift_logs', 'chat_logs'):
+                                    conn.execute(f'UPDATE {tbl} SET user_id = ? WHERE user_id = ?', (rid, uid))
                             conn.commit()
                             done += 1
                             import time

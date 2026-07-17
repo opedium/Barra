@@ -131,6 +131,16 @@ except Exception:
     with open(_secret_path, 'w') as _sf:
         _sf.write(app.secret_key)
 
+# Cookie config: Hetzner port forwarding means the external port differs from internal.
+# Set SESSION_COOKIE_PATH to '/' and make no domain restriction so it works regardless of port.
+app.config.update(
+    SESSION_COOKIE_SECURE=False,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_DOMAIN=False,
+    SESSION_COOKIE_PATH='/',
+)
+
 # ── 认证装饰器 ────────────────────────────────────
 
 def require_auth(f):

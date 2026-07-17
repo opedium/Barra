@@ -1991,7 +1991,7 @@ def _get_conn():
     if not hasattr(_local, 'conn') or _local.conn is None:
         os.makedirs(DB_DIR, exist_ok=True)
         conn = sqlite3.connect(DB_PATH, check_same_thread=False, factory=WeakrefableConnection)
-        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA journal_mode=DELETE')
         conn.execute('PRAGMA synchronous=NORMAL')
         conn.execute('PRAGMA busy_timeout=30000')
         conn.execute('PRAGMA cache_size=-4000')
@@ -2012,13 +2012,24 @@ def _get_conn():
 
 
 def init_db():
-    conn = _get_conn()
-    # 先做一次数据去重，防止因为历史数据重复导致创建唯一索引失败
-    try:
-        conn.execute('DELETE FROM gift_logs WHERE rowid NOT IN (SELECT MIN(rowid) FROM gift_logs GROUP BY session_id, user_id, gift_name, diamond_total, gift_count, group_id)')
-        conn.commit()
-    except sqlite3.Error:
+    """Initialize DB schema on a dedicated connection to avoid writer-thread lock races."""
+    conn = sqlite3.connect(DB_PATH, timeout=60)
+    conn.execute('PRAGMA journal_mode=DELETE')
+    conn.execute('PRAGMA synchronous=NORMAL')
+    conn.execute('PRAGMA busy_timeout=30000')
+    conn.execute('PRAGMA cache_size=-4000')
+    conn.execute('PRAGMA mmap_size=0')
+    conn.execute('PRAGMA temp_store=MEMORY')
+    conn.execute('PRAGMA foreign_keys=ON')
+    # 唯一索引已存在说明去重已完成，跳过全表扫描
+    if conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_gift_dedup_ts'").fetchone():
         pass
+    else:
+        try:
+            conn.execute('DELETE FROM gift_logs WHERE rowid NOT IN (SELECT MIN(rowid) FROM gift_logs GROUP BY session_id, user_id, gift_name, diamond_total, gift_count, group_id)')
+            conn.commit()
+        except sqlite3.Error:
+            pass
     conn.executescript('''
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2799,6 +2810,10 @@ def _flush_write_batch(conn, batch):
 
 
 # 启动写者线程（模块导入时自动启动）
+# 先初始化 schema，避免 writer 线程与主线程竞态
+init_db()
+init_gift_prices_table()
+_db_schema_inited = True
 _writer_thread = threading.Thread(target=_writer_loop, daemon=True, name='db-writer')
 _writer_thread.start()
 
