@@ -919,37 +919,31 @@ class DouyinBarrage:
             while not self._stop_event.is_set():
                 try:
                     logger.info(f"[è¿žæŽ¥] ç¬¬ {self._reconnect_count + 1} æ¬¡è¿žæŽ¥")
-            
-                    # â”€â”€ çŠ¶æ€æ„ŸçŸ¥ï¼ˆHTTP APIï¼Œåœ¨çº¿ç¨‹æ± æ‰§è¡Œï¼‰â”€â”€
-                    # é‡è¿žæ—¶å¤ç”¨ç¼“å­˜çš„ room_idï¼Œè·³è¿‡ enter_room_api ä»¥é¿å…
-                    # åŒä¸€ cookie å¤šæ¬¡"è¿›å…¥æˆ¿é—´"è§¦å‘æœåŠ¡ç«¯ session å†²çªï¼ˆå¯¼è‡´æ‰‹æœºè¢«è¸¢ï¼‰
-                    if self._reconnect_count == 1 and self._room_id:
-                        logger.info(f"[è¿žæŽ¥] é‡è¿žå¤ç”¨ room_id={self._room_id}ï¼Œè·³è¿‡ enter_room_api")
-                        status = 2
-                    else:
-                        self._room_id = None
-                        info = await asyncio.get_event_loop().run_in_executor(
-                            self._executor,
-                            lambda: enter_room_api(
-                                self.ttwid, self._ua, self._ua_version,
-                                self.live_id, self._http_timeout, session=self.session,
-                            )
+                    # ── 状态感知（HTTP API，每次重连必查）──
+                    # 总是调用 enter_room_api 确认房间状态，不跳过
+                    self._room_id = None
+                    info = await asyncio.get_event_loop().run_in_executor(
+                        self._executor,
+                        lambda: enter_room_api(
+                            self.ttwid, self._ua, self._ua_version,
+                            self.live_id, self._http_timeout, session=self.session,
                         )
-                        self._room_id = info['room_id']
-                        self._room_info = info
-                        set_anchor_name(self.live_id, info.get('anchor_name', ''))
+                    )
+                    self._room_id = info['room_id']
+                    self._room_info = info
+                    set_anchor_name(self.live_id, info.get('anchor_name', ''))
             
-                        anchor = info.get('anchor_name', '')
-                        if anchor:
-                            RoomLogFilter.update_anchor(self.live_id, anchor)
+                    anchor = info.get('anchor_name', '')
+                    if anchor:
+                        RoomLogFilter.update_anchor(self.live_id, anchor)
             
-                        if self._on_room_info and self._reconnect_count == 0:
-                            try:
-                                self._on_room_info(self.live_id, info.get('anchor_name', ''))
-                            except Exception:
-                                pass
+                    if self._on_room_info and self._reconnect_count == 0:
+                        try:
+                            self._on_room_info(self.live_id, info.get('anchor_name', ''))
+                        except Exception:
+                            pass
             
-                        status = info['status']
+                    status = info['status']
             
                     if status != 2:
                         poll_interval = self.config.get('live_check_interval', 30)
@@ -1348,7 +1342,9 @@ class DouyinBarrage:
                         to_user_id=data.get('to_user_id', ''),
                         to_user_name=data.get('to_user_name', ''),
                         badge_url=data.get('badge_url', ''),
-                        fansclub_badge=data.get('fansclub_badge', ''))
+                        fansclub_badge=data.get('fansclub_badge', ''),
+                        display_id=data.get('display_id', ''),
+                        sec_uid=data.get('sec_uid', ''))
                 except Exception as e:
                     logger.error(f"[DB] combo finalize write failed: {e}")
 
@@ -1502,8 +1498,8 @@ class DouyinBarrage:
                                                     # 更新 gift_logs 和 chat_logs 中的 user_id 为真实 uid
                                                     if resolved_uid and resolved_uid != uid and uid != resolved_uid:
                                                         for tbl in ('gift_logs', 'chat_logs'):
-                                                            conn.execute(f'UPDATE {tbl} SET user_id = ? WHERE user_id = ? AND session_id = ?',
-                                                                         (resolved_uid, uid, self._session_id))
+                                                            conn.execute(f'UPDATE {tbl} SET user_id = ? WHERE user_id = ? AND session_id = ? AND user_name = ?',
+                                                                         (resolved_uid, uid, self._session_id, uname))
                                                     conn.commit()
                                                     logger.info(f"[åŒ¿å] å·²è§£æž {uid}: {uname} â†’ {resolved}")
                                             except Exception:
@@ -1514,7 +1510,9 @@ class DouyinBarrage:
                                         rec_data.get('content', ''),
                                         ugrade, uclub,
                                         badge_url=rec_data.get('badge_url', ''),
-                                        fansclub_badge=rec_data.get('fansclub_badge', ''))
+                                        fansclub_badge=rec_data.get('fansclub_badge', ''),
+                                        display_id=rec_data.get('display_id', ''),
+                                        sec_uid=rec_data.get('sec_uid', ''))
                                 elif rec_type == 'gift' and rec_data.get('gift_name'):
                                     record_gift(self._session_id,
                                         uid, uname,
@@ -1527,7 +1525,9 @@ class DouyinBarrage:
                                         to_user_id=rec_data.get('to_user_id', ''),
                                         to_user_name=rec_data.get('to_user_name', ''),
                                         badge_url=rec_data.get('badge_url', ''),
-                                        fansclub_badge=rec_data.get('fansclub_badge', ''))
+                                        fansclub_badge=rec_data.get('fansclub_badge', ''),
+                                        display_id=rec_data.get('display_id', ''),
+                                        sec_uid=rec_data.get('sec_uid', ''))
                                 # â”€â”€ å‡çº§æ£€æµ‹ â”€â”€
                                 if uid and rec_type in ('gift', 'chat', 'fansclub'):
                                     try:
@@ -1617,7 +1617,9 @@ class DouyinBarrage:
                                     if final_uid:
                                         upsert_user(final_uid, sub_uname, final_grade, final_club, final_sec_uid, final_avatar, udisplay_id)
                                     record_gift(self._session_id, final_uid or '', sub_uname, sub_name or '订阅',
-                                                1, rec_data.get('diamond', 0), final_grade, final_club)
+                                                1, rec_data.get('diamond', 0), final_grade, final_club,
+                                                display_id=rec_data.get('douyin_id', ''),
+                                                sec_uid=rec_data.get('sec_uid', ''))
                                     if final_uid:
                                         logger.info(f"[订阅] {sub_uname} {sub_name} ({rec_data.get('diamond',0)}钻石) uid={final_uid}")
                                     else:
@@ -2191,14 +2193,19 @@ class DouyinBarrage:
     # â”€â”€ æ‰¹é‡åŒ¿åç”¨æˆ·è§£æž â”€â”€
 
     def _resolve_dou_user(self, uid, session):
-        """Two-step resolve for douXXXXXX anonymous users.
+        """Two-step resolve for douXXXXXX / 神秘人 anonymous users.
 
-        Step 1: /aweme/v1/web/query/user/ by unique_id → get real user_uid
-        Step 2: fetch_user_info(user_uid) → get nickname + sec_uid + avatar
+        Priority:
+        1. /aweme/v1/web/query/user/ by unique_id (nick_name like dou123456)
+        2. fetch_user_info_by_sec_uid(sec_uid) when available from protobuf
+        3. fetch_user_info_by_unique_id (iesdouyin, may fail)
+        4. fetch_user_info(user_id) — direct numeric ID lookup
         """
         import json as _json
-        from service.network import fetch_user_info_by_unique_id
-        # Try step 1: query/user API to get mapping
+        from service.network import fetch_user_info, fetch_user_info_by_unique_id, fetch_user_info_by_sec_uid
+        from base.utils import get_user_sec_uid, get_user_name
+
+        # Try step 1: query/user API (works for douXXXXXX users)
         try:
             r = session.get(
                 f'https://www.douyin.com/aweme/v1/web/query/user/?unique_id={uid}',
@@ -2214,7 +2221,25 @@ class DouyinBarrage:
                         return info
         except Exception:
             pass
-        # Fallback: direct unique_id lookup (iesdouyin, may fail)
+        # Try step 2: sec_uid-based resolution (works for 神秘人 with sec_uid in protobuf)
+        try:
+            sec_uid = None
+            # Check if we have a gift_log row with sec_uid for this user_name in the current session
+            from base.parser import _get_conn
+            conn = _get_conn()
+            row = conn.execute(
+                "SELECT sec_uid FROM gift_logs WHERE user_name=? AND session_id=? AND sec_uid != '' LIMIT 1",
+                (uid, self._session_id)
+            ).fetchone()
+            if row and row['sec_uid']:
+                sec_uid = row['sec_uid']
+                info = fetch_user_info_by_sec_uid(sec_uid, session=session)
+                if info and info.get('nickname') and info.get('user_id'):
+                    info['user_id'] = info['user_id']
+                    return info
+        except Exception:
+            pass
+        # Step 3: direct unique_id lookup (iesdouyin, may fail for dou/神秘人)
         info = fetch_user_info_by_unique_id(uid, session=session)
         if info and info.get('nickname'):
             return info

@@ -614,6 +614,22 @@ def parse_gift_msg(payload, enable_outputs=None):
     to_uname = get_user_name(to_user) if to_user else ''
     gift = msg.gift
 
+    # ── 匿名用户（111111）：立即查 users 表已知 sec_uid → 真实 user_id ──
+    if uid == '111111':
+        sec_uid = get_user_sec_uid(user)
+        if sec_uid:
+            try:
+                _row = _get_conn().execute(
+                    'SELECT user_id FROM users WHERE sec_uid = ? AND user_id != "111111" AND user_id != "" LIMIT 1',
+                    (sec_uid,)
+                ).fetchone()
+                if _row:
+                    uid = _row['user_id']
+            except Exception:
+                pass
+            except Exception:
+                pass
+
     # ── null/gift 回退保护（v3 DB 注册表，含 1503+ 条官方数据）──
     if gift is None or not gift.name:
         gft_id = msg.gift_id or 0
@@ -2075,9 +2091,13 @@ def init_db():
             session_id INTEGER REFERENCES sessions(id),
             user_id TEXT NOT NULL,
             user_name TEXT NOT NULL,
+            display_id TEXT DEFAULT '',
             content TEXT NOT NULL,
             grade TEXT DEFAULT '',
             fans_club TEXT DEFAULT '',
+            sec_uid TEXT DEFAULT '',
+            badge_url TEXT DEFAULT '',
+            fansclub_badge TEXT DEFAULT '',
             created_at DATETIME DEFAULT (datetime('now', '+8 hours'))
         );
         CREATE TABLE IF NOT EXISTS upgrade_logs (
@@ -2096,6 +2116,7 @@ def init_db():
             session_id INTEGER REFERENCES sessions(id),
             user_id TEXT NOT NULL,
             user_name TEXT NOT NULL,
+            display_id TEXT DEFAULT '',
             gift_id INTEGER DEFAULT 0,
             gift_name TEXT NOT NULL,
             gift_count INTEGER DEFAULT 1,
@@ -2103,6 +2124,9 @@ def init_db():
             group_id TEXT DEFAULT '',
             to_user_id TEXT DEFAULT '',
             to_user_name TEXT DEFAULT '',
+            sec_uid TEXT DEFAULT '',
+            badge_url TEXT DEFAULT '',
+            fansclub_badge TEXT DEFAULT '',
             created_at DATETIME DEFAULT (datetime('now', '+8 hours'))
         );
         CREATE TABLE IF NOT EXISTS daily_stats (
@@ -2206,23 +2230,13 @@ def init_db():
         conn.execute('ALTER TABLE gift_prices DROP COLUMN notes')
     except Exception:
         pass
-    # 迁移：补充 badge_url / fansclub_badge 列
-    try:
-        conn.execute('ALTER TABLE chat_logs ADD COLUMN badge_url TEXT DEFAULT ""')
-    except Exception:
-        pass
-    try:
-        conn.execute('ALTER TABLE chat_logs ADD COLUMN fansclub_badge TEXT DEFAULT ""')
-    except Exception:
-        pass
-    try:
-        conn.execute('ALTER TABLE gift_logs ADD COLUMN badge_url TEXT DEFAULT ""')
-    except Exception:
-        pass
-    try:
-        conn.execute('ALTER TABLE gift_logs ADD COLUMN fansclub_badge TEXT DEFAULT ""')
-    except Exception:
-        pass
+    # 迁移：补充新列（display_id，sec_uid，badge_url，fansclub_badge）
+    for tbl in ('chat_logs', 'gift_logs'):
+        for col, coltype in [('display_id', 'TEXT'), ('sec_uid', 'TEXT'), ('badge_url', 'TEXT'), ('fansclub_badge', 'TEXT')]:
+            try:
+                conn.execute(f'ALTER TABLE {tbl} ADD COLUMN {col} {coltype} DEFAULT ""')
+            except Exception:
+                pass
     # 清理僵尸场次：结束标记为"直播中"但开始时间超过 12 小时前的场次
     conn.execute("""
         UPDATE sessions SET end_time = start_time, status = 'ended'
@@ -2731,17 +2745,19 @@ def _flush_write_batch(conn, batch):
         op = item[0]
         try:
             if op == 'chat':
-                _, sid, uid, uname, content, grade, club = item[:7]
-                badge_url = item[7] if len(item) >= 8 else ''
-                fc_badge = item[8] if len(item) >= 9 else ''
-                r = conn.execute('INSERT OR IGNORE INTO chat_logs (session_id, user_id, user_name, content, grade, fans_club, badge_url, fansclub_badge) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                                 (sid, uid, uname, content, grade, club, badge_url, fc_badge))
+                _, sid, uid, uname, did, content, grade, club, secuid, bu, fcb = item
+                r = conn.execute('INSERT OR IGNORE INTO chat_logs (session_id, user_id, user_name, display_id, content, grade, fans_club, sec_uid, badge_url, fansclub_badge) VALUES (?,?,?,?,?,?,?,?,?,?)',
+                                 (sid, uid, uname, did, content, grade, club, secuid, bu, fcb))
                 _chat_written[sid] = _chat_written.get(sid, 0) + r.rowcount
             elif op == 'gift':
-                if len(item) >= 15:
+                if len(item) >= 17:
+                    _, sid, uid, uname, did, gname, cnt, dia, grade, club, gid, gft_id, to_uid, to_uname, secuid, bu, fcb = item
+                    r = conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, display_id, gift_name, gift_count, diamond_total, grade, fans_club, group_id, gift_id, to_user_id, to_user_name, sec_uid, badge_url, fansclub_badge) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                     (sid, uid, uname, did, gname, cnt, dia, grade, club, gid, gft_id, to_uid, to_uname, secuid, bu, fcb))
+                elif len(item) >= 15:
                     _, sid, uid, uname, gname, cnt, dia, grade, club, gid, gft_id, to_uid, to_uname, bu, fcb = item
-                    r = conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_id, gift_name, gift_count, diamond_total, grade, fans_club, group_id, to_user_id, to_user_name, badge_url, fansclub_badge) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                                     (sid, uid, uname, gft_id, gname, cnt, dia, grade, club, gid, to_uid, to_uname, bu, fcb))
+                    r = conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club, group_id, gift_id, to_user_id, to_user_name, badge_url, fansclub_badge) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                                     (sid, uid, uname, gname, cnt, dia, grade, club, gid, gft_id, to_uid, to_uname, bu, fcb))
                 elif len(item) >= 13:
                     _, sid, uid, uname, gname, cnt, dia, grade, club, gid, gft_id, to_uid, to_uname = item
                     r = conn.execute('INSERT OR IGNORE INTO gift_logs (session_id, user_id, user_name, gift_id, gift_name, gift_count, diamond_total, grade, fans_club, group_id, to_user_id, to_user_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -2846,11 +2862,11 @@ def get_flow_counters(session_id=None):
 
 
 def record_chat(session_id, user_id, user_name, content, grade='', fans_club='',
-                badge_url='', fansclub_badge=''):
+                badge_url='', fansclub_badge='', display_id='', sec_uid=''):
     global _chat_enqueued
     _chat_enqueued[session_id] = _chat_enqueued.get(session_id, 0) + 1
     try:
-        _write_queue.put_nowait(('chat', session_id, user_id, user_name, content, grade, fans_club, badge_url, fansclub_badge))
+        _write_queue.put_nowait(('chat', session_id, user_id, user_name, display_id, content, grade, fans_club, sec_uid, badge_url, fansclub_badge))
     except queue.Full:
         logger.warning(f"[DB] 写入队列已满，丢弃聊天: uid={user_id}")
 
@@ -2878,7 +2894,7 @@ def _prune_gift_dedup_cache():
 
 
 def record_gift(session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade='', fans_club='', group_id='', gift_id=0, to_user_id='', to_user_name='',
-                badge_url='', fansclub_badge=''):
+                badge_url='', fansclub_badge='', display_id='', sec_uid=''):
     """记录礼物（内存时间窗 + 写者队列双重去重）。
 
     去重 key 使用 (user_id, gift_name, group_id) 三元组。
@@ -2903,7 +2919,7 @@ def record_gift(session_id, user_id, user_name, gift_name, gift_count, diamond_t
                 _prune_gift_dedup_cache()
     try:
         global _gift_enqueued; _gift_enqueued[session_id] = _gift_enqueued.get(session_id, 0) + 1
-        _write_queue.put_nowait(('gift', session_id, user_id, user_name, gift_name, gift_count, diamond_total, grade, fans_club, group_id, gift_id, to_user_id, to_user_name, badge_url, fansclub_badge))
+        _write_queue.put_nowait(('gift', session_id, user_id, user_name, display_id, gift_name, gift_count, diamond_total, grade, fans_club, group_id, gift_id, to_user_id, to_user_name, sec_uid, badge_url, fansclub_badge))
     except queue.Full:
         logger.warning(f"[DB] 写入队列已满，丢弃礼物: {gift_name} uid={user_id}")
 _VALID_TIERS = {1000, 3000, 10000, 100000}

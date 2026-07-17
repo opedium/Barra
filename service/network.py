@@ -501,6 +501,7 @@ def fetch_user_info_by_sec_uid(sec_uid, ua=None, timeout=15, session=None):
 
         result = {
             'sec_uid': user_info.get('sec_uid', sec_uid),
+            'user_id': str(user_info.get('uid', '')),
             'nickname': user_info.get('nickname', ''),
             'avatar_medium': avatar_medium,
             'avatar_thumb': avatar_thumb,

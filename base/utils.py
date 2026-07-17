@@ -524,17 +524,40 @@ def rotate_ua(current_ua):
         return new_ua, extract_ua_version(new_ua)
 
 
-def get_user_id(user):
+def get_user_id(user, conn=None):
     """获取用户 ID 字符串，优先使用 id_str（大数精度更高）。
+
+    当 user_id 为 "111111"（匿名直播间占位符）时：
+    立即查 users 表已知的 sec_uid → user_id 映射，避免写入后再回头补填。
+    conn 参数为可选的 SQLite 连接，传入后可避免线程内新建连接。
 
     Args:
         user: protobuf User 对象。
+        conn: 可选的 sqlite3.Connection，用于查 users 表。
 
     Returns:
         用户 ID 字符串。
     """
-    s = user.id_str
-    return s if s else str(user.id)
+    s = user.id_str or str(user.id)
+    if s == '111111':
+        sec_uid = get_user_sec_uid(user)
+        if conn is not None and sec_uid:
+            try:
+                row = conn.execute('SELECT user_id FROM users WHERE sec_uid = ? AND user_id != "111111" AND user_id != "" LIMIT 1', (sec_uid,)).fetchone()
+                if row:
+                    return row['user_id']
+            except Exception:
+                pass
+        # Fallback: use sec_uid as permanent identifier (beats 111111)
+        if sec_uid:
+            return sec_uid
+        # Last resort: hash the nickname for temporal dedup within session
+        nick = getattr(user, 'nick_name', '') or ''
+        if nick:
+            import hashlib
+            h = hashlib.md5(nick.encode()).hexdigest()[:12]
+            return 'sec_' + h
+    return s
 
 
 def get_user_sec_uid(user):
