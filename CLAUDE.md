@@ -147,3 +147,13 @@ Web panel calls Douyin API (max 30/min via `RateLimiter`) to fill missing `sec_u
 
 ### 部署前冲突检查
 部署之前优先检查方案与当前项目是否存在逻辑冲突或互斥关系。如有冲突则停止部署，开始分析原因并形成建议。
+
+<!-- OPENWIKI:START -->
+
+## OpenWiki
+
+This repository uses OpenWiki for recurring code documentation. Start with `openwiki/quickstart.md`, then follow its links to architecture, workflows, domain concepts, operations, integrations, testing guidance, and source maps.
+
+The scheduled OpenWiki GitHub Actions workflow refreshes the repository wiki. Do not hand-edit generated OpenWiki pages unless explicitly asked; prefer updating source code/docs and letting OpenWiki regenerate.
+
+<!-- OPENWIKI:END -->

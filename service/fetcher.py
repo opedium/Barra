@@ -1438,6 +1438,7 @@ class DouyinBarrage:
                                 usec_uid = rec_data.get('sec_uid', '')
                                 uavatar = rec_data.get('avatar_url', '')
                                 udisplay_id = rec_data.get('display_id', '')
+                                uuser_sec_id = rec_data.get('user_sec_id', '')
                                 # åªè¦æœ‰ç”¨æˆ·ä¿¡æ¯å°±æ›´æ–° users è¡¨ï¼ˆè®°å½•è´¢å¯Œç­‰çº§ã€ç²‰ä¸å›¢ã€sec_uidã€å¤´åƒï¼‰
                                 if uid:
                                     # 升级检测前从 DB 读取旧值（upsert_user 会覆盖为新值）
@@ -1455,7 +1456,18 @@ class DouyinBarrage:
                                     except Exception:
                                         _old_lv_saved = 0
                                         _old_fc_saved = 0
-                                    upsert_user(uid, uname, ugrade, uclub, usec_uid, uavatar, udisplay_id)
+                                    upsert_user(uid, uname, ugrade, uclub, usec_uid, uavatar, udisplay_id, uuser_sec_id)
+                                    # Link: if user_sec_id (field 73) is set and uid is a real numeric ID,
+                                    # backfill old anon records that shared the same field 73.
+                                    if uuser_sec_id and uuser_sec_id != uid and uid != '111111':
+                                        try:
+                                            conn = _get_conn()
+                                            for tbl in ('gift_logs', 'chat_logs', 'contributions'):
+                                                conn.execute(f'UPDATE {tbl} SET user_id = ? WHERE user_id = ? AND session_id = ?',
+                                                             (uid, uuser_sec_id, self._session_id))
+                                            conn.commit()
+                                        except Exception:
+                                            pass
                                     if uid:
                                         self._fill_subscription_uid(uname, uid)
                                     # åŒ¿åç”¨æˆ·ï¼ˆç¥žç§˜äºº/douå‰ç¼€ï¼‰è‡ªåŠ¨è§£æžçœŸå®žæ˜µç§°

@@ -19,11 +19,12 @@ output:
   contribution: true
   control: true
   file_dir: data
+  dump_anon_payload: true
 network:
   http_timeout: 15
   ws_connect_timeout: 30
   silence_timeout: 60
-  user_msg_timeout: 600
+  user_msg_timeout: 30
   heartbeat_interval: 10
   rcvbuf_kb: 1024
   proxy: null

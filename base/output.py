@@ -68,17 +68,6 @@ class RoomLogFilter(logging.Filter):
             record.msg = f"[{label}] {record.msg}"
         return True
 
-class BarragePassFilter(logging.Filter):
-    """仅在 DEBUG / BARRAGE 级别显示弹幕，其余级别隐藏。"""
-    def __init__(self, user_level):
-        super().__init__()
-        self._user_level = user_level
-
-    def filter(self, record):
-        if record.levelno == BARRAGE:
-            return self._user_level in (logging.DEBUG, BARRAGE)
-        return record.levelno >= self._user_level
-
 class QueueHandler(logging.Handler):
     
     """异步日志处理器，将日志放入 deque，后台线程批量写出。
@@ -379,7 +368,6 @@ def setup_logger(log_dir='logs', log_level='INFO', multi_room=False):
     console = logging.StreamHandler()
     console.setFormatter(logging.Formatter('%(message)s'))
     console.setLevel(user_level)
-    console.addFilter(BarragePassFilter(user_level))
     queue_handler.add_handler(console)
 
     logger.addHandler(queue_handler)

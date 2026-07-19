@@ -34,7 +34,7 @@ from base.messages import (
     AssetEffectUtilMessage,
 )
 from base.utils import (
-    get_user_id, get_user_sec_uid, get_user_avatar_url,
+    get_user_id, get_user_sec_uid, get_user_sec_id73, get_user_avatar_url,
     get_user_name, sanitize_username,
     fmt_grade, fmt_fans_club, get_fans_club_anchor_id,
     get_badge_urls, make_badge_fallback, _merge_badges,
@@ -498,6 +498,7 @@ def _combo_finalize(key):
             'fans_club': buf.get('fans_club', ''),
             'fans_club_anchor_id': buf.get('fans_club_anchor_id', ''),
             'sec_uid': buf.get('sec_uid', ''),
+            'user_sec_id': buf.get('user_sec_id', ''),
             'avatar_url': buf.get('avatar_url', ''),
             'badge_url': buf.get('badge_url', ''),
             'fansclub_badge': buf.get('fansclub_badge', ''),
@@ -565,7 +566,7 @@ def parse_chat_msg(payload, enable_outputs=None):
         'gender': {1: "男", 2: "女"}.get(user.gender, "未知"),
         'grade': fmt_grade(user),
         'fans_club': fmt_fans_club(user),
-        'sec_uid': get_user_sec_uid(user),
+        'sec_uid': get_user_sec_uid(user), 'user_sec_id': get_user_sec_id73(user),
         'avatar_url': get_user_avatar_url(user),
         'badge_url': badge_url,
         'fansclub_badge': fansclub_badge,
@@ -615,20 +616,37 @@ def parse_gift_msg(payload, enable_outputs=None):
     gift = msg.gift
 
     # ── 匿名用户（111111）：立即查 users 表已知 sec_uid → 真实 user_id ──
+    # Gift 消息的 user 字段没有 field 46（sec_uid），但有 field 73（user_sec_id）。
+    # 如果同一用户的 chat/member 消息提前录入了真实数据（通过 tag73 匹配），查出来回写 uid。
     if uid == '111111':
-        sec_uid = get_user_sec_uid(user)
-        if sec_uid:
+        tag73 = get_user_sec_id73(user)
+        if tag73:
             try:
-                _row = _get_conn().execute(
-                    'SELECT user_id FROM users WHERE sec_uid = ? AND user_id != "111111" AND user_id != "" LIMIT 1',
-                    (sec_uid,)
+                # Try matching by user_sec_id (field 73) — this links gift → real uid
+                row = _get_conn().execute(
+                    'SELECT user_id, user_name, sec_uid, display_id FROM users WHERE user_sec_id = ? AND user_id != "111111" AND user_id != "" LIMIT 1',
+                    (tag73,)
                 ).fetchone()
-                if _row:
-                    uid = _row['user_id']
+                if row:
+                    uid = row['user_id']
+                    user_display_name = row['user_name']
+                    usec_uid = row['sec_uid']
+                    douyin_id = row['display_id']
             except Exception:
                 pass
-            except Exception:
-                pass
+        # Fallback: try field 46 sec_uid (will be empty for anon)
+        if uid == '111111':
+            sec_uid = get_user_sec_uid(user)
+            if sec_uid:
+                try:
+                    row = _get_conn().execute(
+                        'SELECT user_id FROM users WHERE sec_uid = ? AND user_id != "111111" AND user_id != "" LIMIT 1',
+                        (sec_uid,)
+                    ).fetchone()
+                    if row:
+                        uid = row['user_id']
+                except Exception:
+                    pass
 
     # ── null/gift 回退保护（v3 DB 注册表，含 1503+ 条官方数据）──
     if gift is None or not gift.name:
@@ -777,7 +795,7 @@ def parse_gift_msg(payload, enable_outputs=None):
                         'to_user_id': to_uid, 'to_user_name': to_uname,
                         'douyin_id': douyin_id, 'grade': fmt_grade(user),
                         'fans_club': fmt_fans_club(user), 'fans_club_anchor_id': fans_club_anchor_id,
-                        'sec_uid': get_user_sec_uid(user),
+                        'sec_uid': get_user_sec_uid(user), 'user_sec_id': get_user_sec_id73(user),
                         'avatar_url': get_user_avatar_url(user), 'group_id': gid, 'gift_id': gft_id,
                         'badge_url': badge_json, 'fansclub_badge': fansclub_json,
                         'timer': None, 'repeat_end_seen': bool(msg.repeat_end or 0), 'last_update': now,
@@ -864,7 +882,7 @@ def parse_gift_msg(payload, enable_outputs=None):
             'user_name': user_display_name, 'gender': {1: "男", 2: "女"}.get(user.gender, "未知"),
             'gift_id': gft_id, 'gift_name': display_name, 'gift_count': cnt, 'diamond_total': total_value,
             'grade': fmt_grade(user), 'fans_club': fmt_fans_club(user), 'fans_club_anchor_id': fans_club_anchor_id,
-            'sec_uid': get_user_sec_uid(user), 'avatar_url': get_user_avatar_url(user),
+            'sec_uid': get_user_sec_uid(user), 'user_sec_id': get_user_sec_id73(user), 'avatar_url': get_user_avatar_url(user),
             'badge_url': badge_json, 'fansclub_badge': fansclub_json,
             'group_id': gid, 'raw_repeat_count': msg.repeat_count, 'raw_repeat_end': msg.repeat_end,
             'raw_combo_count': msg.combo_count, 'raw_total_count': msg.total_count, 'raw_group_count': msg.group_count or 0,
@@ -949,7 +967,7 @@ def parse_like_msg(payload, enable_outputs=None):
             'user_id': uid, 'user_name': uname,
             'count': msg.count, 'total': msg.total,
             'grade': fmt_grade(user), 'fans_club': fmt_fans_club(user),
-            'sec_uid': get_user_sec_uid(user),
+            'sec_uid': get_user_sec_uid(user), 'user_sec_id': get_user_sec_id73(user),
             'avatar_url': get_user_avatar_url(user),
         },
     }]
@@ -980,7 +998,7 @@ def parse_member_msg(payload, enable_outputs=None):
             'time': time.strftime('%H:%M:%S'),
             'user_id': uid, 'user_name': uname, 'gender': gender,
             'grade': fmt_grade(user), 'fans_club': fmt_fans_club(user),
-            'sec_uid': get_user_sec_uid(user),
+            'sec_uid': get_user_sec_uid(user), 'user_sec_id': get_user_sec_id73(user),
             'avatar_url': get_user_avatar_url(user),
             'member_count': msg.member_count,
         },
@@ -1027,7 +1045,7 @@ def parse_social_msg(payload, enable_outputs=None):
             'share_type': msg.share_type if msg.action == 2 else '',
             'share_target': msg.share_target or '',
             'grade': fmt_grade(user), 'fans_club': fmt_fans_club(user),
-            'sec_uid': get_user_sec_uid(user),
+            'sec_uid': get_user_sec_uid(user), 'user_sec_id': get_user_sec_id73(user),
             'avatar_url': get_user_avatar_url(user),
             'badge_url': '',
             'fansclub_badge': '',
@@ -1107,7 +1125,7 @@ def parse_fansclub_msg(payload, enable_outputs=None):
             'user_id': uid, 'user_name': uname,
             'type': t, 'content': msg.content,
             'grade': fmt_grade(user), 'fans_club': fmt_fans_club(user),
-            'sec_uid': get_user_sec_uid(user),
+            'sec_uid': get_user_sec_uid(user), 'user_sec_id': get_user_sec_id73(user),
             'avatar_url': get_user_avatar_url(user),
         },
     }]
@@ -1138,7 +1156,7 @@ def parse_emoji_chat_msg(payload, enable_outputs=None):
             'user_id': uid, 'user_name': uname,
             'emoji_id': msg.emoji_id, 'content': content,
             'grade': fmt_grade(user), 'fans_club': fmt_fans_club(user),
-            'sec_uid': get_user_sec_uid(user),
+            'sec_uid': get_user_sec_uid(user), 'user_sec_id': get_user_sec_id73(user),
             'avatar_url': get_user_avatar_url(user),
         },
     }]
@@ -1974,6 +1992,11 @@ try:
         _migrate_conn.commit()
     except sqlite3.OperationalError:
         pass
+    try:
+        _migrate_conn.execute('ALTER TABLE users ADD COLUMN user_sec_id TEXT DEFAULT ""')
+        _migrate_conn.commit()
+    except sqlite3.OperationalError:
+        pass
     # 升级礼物去重索引：同一秒内同用户同礼物去重，不同秒的保留（防止 websocket 重放但不误伤连刷）
     try:
         _migrate_conn.execute('DROP INDEX IF EXISTS idx_gift_dedup')
@@ -2579,12 +2602,12 @@ def _merge_fans_club_strings(existing, new_val):
     return ' '.join(f'{n} Lv{merged[n]}' for n in sorted_names)
 
 
-def upsert_user(user_id, user_name, grade='', fans_club='', sec_uid='', avatar_url='', display_id=''):
-    """更新或插入用户信息（财富等级、粉丝团、sec_uid、头像URL、display_id等）。通过写者队列串行化。"""
+def upsert_user(user_id, user_name, grade='', fans_club='', sec_uid='', avatar_url='', display_id='', user_sec_id=''):
+    """更新或插入用户信息（财富等级、粉丝团、sec_uid、头像URL、display_id、user_sec_id等）。通过写者队列串行化。"""
     if not user_id:
         return
     try:
-        _write_queue.put_nowait(('upsert', user_id, user_name, grade, fans_club, sec_uid, avatar_url, display_id))
+        _write_queue.put_nowait(('upsert', user_id, user_name, grade, fans_club, sec_uid, avatar_url, display_id, user_sec_id))
     except queue.Full:
         logger.warning(f"[DB] upsert queue full: uid={user_id}")
 
@@ -2781,6 +2804,7 @@ def _flush_write_batch(conn, batch):
                 _gift_written[sid] = _gift_written.get(sid, 0) + r.rowcount
             elif op == 'upsert':
                 did = item[7] if len(item) >= 8 else ''
+                usid = item[8] if len(item) >= 9 else ''
                 _, uid, uname, grade, club, sec, av = item[:7]
                 is_anon, anon_label = _detect_anonymous(uname)
                 # 合并粉丝团（保留最高等级）
@@ -2789,8 +2813,8 @@ def _flush_write_batch(conn, batch):
                     if existing and existing['fans_club']:
                         club = _merge_fans_club_strings(existing['fans_club'], club)
                 conn.execute('''
-                    INSERT INTO users (user_id, user_name, grade, fans_club, sec_uid, avatar_url, display_id, is_anonymous, anonymous_label, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime("now", "+8 hours"))
+                    INSERT INTO users (user_id, user_name, grade, fans_club, sec_uid, avatar_url, display_id, user_sec_id, is_anonymous, anonymous_label, last_seen)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime("now", "+8 hours"))
                     ON CONFLICT(user_id) DO UPDATE SET
                         user_name = CASE WHEN ? != '' THEN ? ELSE user_name END,
                         grade = CASE WHEN ? != '' THEN ? ELSE grade END,
@@ -2798,12 +2822,13 @@ def _flush_write_batch(conn, batch):
                         sec_uid = CASE WHEN ? != '' THEN ? ELSE sec_uid END,
                         avatar_url = CASE WHEN ? != '' THEN ? ELSE avatar_url END,
                         display_id = CASE WHEN ? != '' THEN ? ELSE display_id END,
+                        user_sec_id = CASE WHEN ? != '' THEN ? ELSE user_sec_id END,
                         is_anonymous = CASE WHEN ? = 1 THEN 1 ELSE is_anonymous END,
                         anonymous_label = CASE WHEN ? != '' THEN ? ELSE anonymous_label END,
                         last_seen = datetime("now", "+8 hours")
-                ''', (uid, uname, grade, club, sec, av, did, is_anon, anon_label,
+                ''', (uid, uname, grade, club, sec, av, did, usid, is_anon, anon_label,
                       uname, uname, grade, grade, club, club, sec, sec, av, av,
-                      did, did,
+                      did, did, usid, usid,
                       is_anon, anon_label, anon_label))
             elif op == 'backfill_uid':
                 _, sid, uname, ruid = item

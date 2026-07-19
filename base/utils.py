@@ -548,10 +548,8 @@ def get_user_id(user, conn=None):
                     return row['user_id']
             except Exception:
                 pass
-        # Fallback: use sec_uid as permanent identifier (beats 111111)
         if sec_uid:
             return sec_uid
-        # Last resort: hash the nickname for temporal dedup within session
         nick = getattr(user, 'nick_name', '') or ''
         if nick:
             import hashlib
@@ -561,7 +559,7 @@ def get_user_id(user, conn=None):
 
 
 def get_user_sec_uid(user):
-    """从 User protobuf 中提取 sec_uid。
+    """从 User protobuf 中提取 field 46 sec_uid。
 
     sec_uid 是抖音用户的永久标识符（~50位字符串），可跨 session 追踪同一用户，
     也是调用抖音公开 API 获取用户信息的必需参数。
@@ -574,6 +572,25 @@ def get_user_sec_uid(user):
     """
     try:
         su = user.sec_uid
+        return su if su else ''
+    except (AttributeError, TypeError):
+        return ''
+
+
+def get_user_sec_id73(user):
+    """从 User protobuf 中提取 field 73 user_sec_id。
+
+    field 73 是会话级临时 ID，每场直播变化但同一场中一致，
+    存在所有用户（匿名/非匿名）的消息中。
+
+    Args:
+        user: protobuf User 对象。
+
+    Returns:
+        field 73 字符串，缺失时返回空字符串。
+    """
+    try:
+        su = user.user_sec_id
         return su if su else ''
     except (AttributeError, TypeError):
         return ''

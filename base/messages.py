@@ -311,6 +311,7 @@ class User(proto.Message):
     real_time_icons_list = proto.RepeatedField(Image, number=29)
     display_id = proto.Field(proto.STRING, number=38)
     sec_uid = proto.Field(proto.STRING, number=46)
+    user_sec_id = proto.Field(proto.STRING, number=73)
     fan_ticket_count = proto.Field(proto.UINT64, number=1022)
     id_str = proto.Field(proto.STRING, number=1028)
     age_range = proto.Field(proto.UINT32, number=1045)
