@@ -2248,10 +2248,12 @@ def init_db():
         );
     ''')
     # 兼容旧表：给 users 表补充 grade 字段
-    try:
-        conn.execute('ALTER TABLE users ADD COLUMN grade TEXT DEFAULT ""')
-    except Exception:
-        pass
+    for col, coltype in [('grade', 'TEXT DEFAULT ""'), ('display_id', 'TEXT DEFAULT ""'), ('sec_uid', 'TEXT DEFAULT ""'), ('avatar_url', 'TEXT DEFAULT ""'), ('notes', 'TEXT DEFAULT ""'), ('tags', 'TEXT DEFAULT ""'), ('is_anonymous', 'INTEGER DEFAULT 0'), ('anonymous_label', 'TEXT DEFAULT ""'), ('fans_club', 'TEXT DEFAULT ""')]:
+        if not conn.execute(f"SELECT name FROM pragma_table_info('users') WHERE name=?", (col,)).fetchone():
+            try:
+                conn.execute(f'ALTER TABLE users ADD COLUMN {col} {coltype}')
+            except Exception:
+                pass
     # 迁移旧版 gift_prices：移除废弃的 base_gift_name 和 notes 列
     try:
         conn.execute('ALTER TABLE gift_prices DROP COLUMN base_gift_name')
@@ -2264,10 +2266,11 @@ def init_db():
     # 迁移：补充新列（display_id，sec_uid，badge_url，fansclub_badge）
     for tbl in ('chat_logs', 'gift_logs'):
         for col, coltype in [('display_id', 'TEXT'), ('sec_uid', 'TEXT'), ('badge_url', 'TEXT'), ('fansclub_badge', 'TEXT')]:
-            try:
-                conn.execute(f'ALTER TABLE {tbl} ADD COLUMN {col} {coltype} DEFAULT ""')
-            except Exception:
-                pass
+            if not conn.execute(f"SELECT name FROM pragma_table_info('{tbl}') WHERE name=?", (col,)).fetchone():
+                try:
+                    conn.execute(f'ALTER TABLE {tbl} ADD COLUMN {col} {coltype} DEFAULT ""')
+                except Exception:
+                    pass
     # 清理僵尸场次：结束标记为"直播中"但开始时间超过 12 小时前的场次
     conn.execute("""
         UPDATE sessions SET end_time = start_time, status = 'ended'
