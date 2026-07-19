@@ -3850,6 +3850,8 @@ def query_audit():
             'SELECT created_at FROM gift_logs WHERE session_id = ? ORDER BY created_at',
             (row['id'],)
         ).fetchall()
+        if len(times) > 10000:
+            times = times[-10000:]
         for i in range(1, len(times)):
             try:
                 prev = times[i-1]['created_at']
