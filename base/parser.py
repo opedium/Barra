@@ -1935,7 +1935,7 @@ atexit.register(_close_all_connections)
 try:
     os.makedirs(DB_DIR, exist_ok=True)
     _migrate_conn = sqlite3.connect(DB_PATH)
-    _migrate_conn.execute('PRAGMA journal_mode=WAL')
+    _migrate_conn.execute('PRAGMA journal_mode=DELETE')
     try:
         _migrate_conn.execute('ALTER TABLE users ADD COLUMN grade TEXT DEFAULT ""')
         _migrate_conn.commit()
@@ -1998,19 +1998,23 @@ try:
     except sqlite3.OperationalError:
         pass
     # 升级礼物去重索引：同一秒内同用户同礼物去重，不同秒的保留（防止 websocket 重放但不误伤连刷）
-    try:
-        _migrate_conn.execute('DROP INDEX IF EXISTS idx_gift_dedup')
-        _migrate_conn.execute('DROP INDEX IF EXISTS idx_gift_logs_user')
-        _migrate_conn.execute('DROP INDEX IF EXISTS idx_gift_dedup_ts')
-        _migrate_conn.execute('DELETE FROM gift_logs WHERE rowid NOT IN (SELECT MIN(rowid) FROM gift_logs GROUP BY session_id, user_id, gift_name, diamond_total, gift_count, group_id)')
-        _migrate_conn.commit()
-    except sqlite3.Error:
-        pass
-    try:
-        _migrate_conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_gift_dedup_ts ON gift_logs(session_id, user_id, gift_name, diamond_total, gift_count, group_id)')
-        _migrate_conn.commit()
-    except sqlite3.Error:
-        pass
+    # 先检查索引是否已存在，避免 DROP 后被杀导致 orphan（无索引 → integrity_check 扫 1.5GB → HDD 死锁）
+    _migrate_has_idx = _migrate_conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_gift_dedup_ts'"
+    ).fetchone()
+    if not _migrate_has_idx:
+        try:
+            _migrate_conn.execute('DROP INDEX IF EXISTS idx_gift_dedup')
+            _migrate_conn.execute('DROP INDEX IF EXISTS idx_gift_logs_user')
+            _migrate_conn.execute('DELETE FROM gift_logs WHERE rowid NOT IN (SELECT MIN(rowid) FROM gift_logs GROUP BY session_id, user_id, gift_name, diamond_total, gift_count, group_id)')
+            _migrate_conn.commit()
+        except sqlite3.Error:
+            pass
+        try:
+            _migrate_conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_gift_dedup_ts ON gift_logs(session_id, user_id, gift_name, diamond_total, gift_count, group_id)')
+            _migrate_conn.commit()
+        except sqlite3.Error:
+            pass
     _migrate_conn.close()
 except Exception:
     pass
@@ -2060,15 +2064,19 @@ def init_db():
     conn.execute('PRAGMA mmap_size=0')
     conn.execute('PRAGMA temp_store=MEMORY')
     conn.execute('PRAGMA foreign_keys=ON')
-    # 唯一索引已存在说明去重已完成，跳过全表扫描
-    if conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_gift_dedup_ts'").fetchone():
+    # 去重索引已存在 → 数据库已完成初始化，跳过 CREATE/MIGRATION
+    idx_exists = conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_gift_dedup_ts'").fetchone()
+    if idx_exists:
+        conn.commit()
+        conn.close()
+        logger.info(f"[DB] 已初始化 (fast skip): {DB_PATH}")
+        return True
+    # 唯一索引不存在 → 执行全表去重
+    try:
+        conn.execute('DELETE FROM gift_logs WHERE rowid NOT IN (SELECT MIN(rowid) FROM gift_logs GROUP BY session_id, user_id, gift_name, diamond_total, gift_count, group_id)')
+        conn.commit()
+    except sqlite3.Error:
         pass
-    else:
-        try:
-            conn.execute('DELETE FROM gift_logs WHERE rowid NOT IN (SELECT MIN(rowid) FROM gift_logs GROUP BY session_id, user_id, gift_name, diamond_total, gift_count, group_id)')
-            conn.commit()
-        except sqlite3.Error:
-            pass
     conn.executescript('''
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2265,13 +2273,9 @@ def init_db():
         UPDATE sessions SET end_time = start_time, status = 'ended'
         WHERE status = 'live' AND start_time < datetime('now', '+8 hours', '-12 hours')
     """)
-    # 数据库完整性检查
-    try:
-        integrity = conn.execute('PRAGMA integrity_check').fetchone()[0]
-        if integrity != 'ok':
-            logger.error(f"[DB] 完整性检查失败: {integrity}")
-    except Exception:
-        pass
+    # 数据库完整性检查 — module-level 的 DROP+CREATE 逻辑已有存索引检查避免 orphan，
+    # 且 1.5GB HDD 上 integrity_check 会挂死进程（Ds 状态），故跳过。
+    # 如需手动检查，请用 sqlite3 命令行执行：PRAGMA integrity_check;
     # 开启自动增量 VACUUM，防止文件无限膨胀
     try:
         conn.execute('PRAGMA auto_vacuum=INCREMENTAL')
@@ -2851,10 +2855,15 @@ def _flush_write_batch(conn, batch):
 
 
 # 启动写者线程（模块导入时自动启动）
-# 先初始化 schema，避免 writer 线程与主线程竞态
-init_db()
-init_gift_prices_table()
-_db_schema_inited = True
+# init_db / init_gift_prices_table 改为惰性初始化（在首次 get_conn() 时执行），
+# 避免因旧进程锁库导致模块导入崩溃（systemd 重叠重启场景）。
+if not _db_schema_inited:
+    try:
+        init_db()
+        init_gift_prices_table()
+        _db_schema_inited = True
+    except Exception:
+        pass
 _writer_thread = threading.Thread(target=_writer_loop, daemon=True, name='db-writer')
 _writer_thread.start()
 
@@ -3716,8 +3725,8 @@ def query_session_detail(session_id, top_n=50):
                ) AS grade,
                u.sec_uid, u.avatar_url, u.notes, u.tags,
                c.qualified_1000, c.qualified_3000, c.qualified_10000, c.qualified_100000,
-               (SELECT COUNT(*) FROM gift_logs WHERE session_id = c.session_id AND user_id = c.user_id) as gift_count,
-               (SELECT COUNT(*) FROM chat_logs WHERE session_id = c.session_id AND user_id = c.user_id) as chat_count
+               COALESCE((SELECT COUNT(*) FROM gift_logs WHERE session_id = c.session_id AND user_id = c.user_id), 0) as gift_count,
+               COALESCE((SELECT COUNT(*) FROM chat_logs WHERE session_id = c.session_id AND user_id = c.user_id), 0) as chat_count
         FROM contributions c
         LEFT JOIN users u ON u.user_id = c.user_id
         JOIN sessions s ON s.id = c.session_id
@@ -3740,6 +3749,7 @@ def query_session_detail(session_id, top_n=50):
 def query_search(q, page=1, size=20):
     conn = _get_conn()
     offset = (page - 1) * size
+    # Step 1: try exact user_id match (fastest)
     rows = conn.execute('''
         SELECT DISTINCT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name,
                COALESCE(m.total_consume, 0) as total_consume,
@@ -3751,6 +3761,38 @@ def query_search(q, page=1, size=20):
         WHERE c.user_id = ?
         ORDER BY c.consume DESC LIMIT ? OFFSET ?
     ''', (q, size, offset)).fetchall()
+    if not rows and q.isdigit():
+        rows = conn.execute('''
+            SELECT DISTINCT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name,
+                   COALESCE(m.total_consume, 0) as total_consume,
+                   COALESCE(m.sessions_1000, 0) as sessions_1000, c.fans_club,
+                   u.sec_uid, u.avatar_url
+            FROM contributions c
+            LEFT JOIN monthly_stats m ON m.user_id = c.user_id AND m.year_month = strftime('%Y-%m', 'now')
+            LEFT JOIN users u ON u.user_id = c.user_id
+            WHERE c.user_id LIKE ?
+            ORDER BY c.consume DESC LIMIT ? OFFSET ?
+        ''', (f'%{q}%', size, offset)).fetchall()
+    # Step 2: try FTS5 full-text search on user name (fast)
+    if not rows:
+        uid_rows = conn.execute('''
+            SELECT rowid FROM users_fts WHERE users_fts MATCH ? ORDER BY rank LIMIT 20
+        ''', (q,)).fetchall()
+        if uid_rows:
+            ids = [r[0] for r in uid_rows]
+            placeholders = ','.join('?' * len(ids))
+            rows = conn.execute(f'''
+                SELECT DISTINCT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name,
+                       COALESCE(m.total_consume, 0) as total_consume,
+                       COALESCE(m.sessions_1000, 0) as sessions_1000, c.fans_club,
+                       u.sec_uid, u.avatar_url
+                FROM users u
+                LEFT JOIN contributions c ON c.user_id = u.user_id
+                LEFT JOIN monthly_stats m ON m.user_id = u.user_id AND m.year_month = strftime('%Y-%m', 'now')
+                WHERE u.rowid IN ({placeholders})
+                ORDER BY c.consume DESC LIMIT ? OFFSET ?
+            ''', (*ids, size, offset)).fetchall()
+    # Step 3: fall back to LIKE (HDD full scan, but limited to 20)
     if not rows:
         rows = conn.execute('''
             SELECT DISTINCT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name,

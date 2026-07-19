@@ -654,9 +654,9 @@ def index():
     total_gifts = conn.execute('SELECT COUNT(*) FROM gift_logs').fetchone()[0]
     total_chats = conn.execute('SELECT COUNT(*) FROM chat_logs').fetchone()[0]
     total_sessions = conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0]
-    today = conn.execute("SELECT COUNT(*) FROM gift_logs WHERE date(created_at)=date('now')").fetchone()[0]
-    today_chats = conn.execute("SELECT COUNT(*) FROM chat_logs WHERE date(created_at)=date('now')").fetchone()[0]
-    today_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM gift_logs WHERE date(created_at)=date('now')").fetchone()[0]
+    today = conn.execute("SELECT COUNT(*) FROM gift_logs WHERE created_at >= datetime('now', 'start of day')").fetchone()[0]
+    today_chats = conn.execute("SELECT COUNT(*) FROM chat_logs WHERE created_at >= datetime('now', 'start of day')").fetchone()[0]
+    today_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM gift_logs WHERE created_at >= datetime('now', 'start of day')").fetchone()[0]
     recent = conn.execute('SELECT s.*, (SELECT COUNT(*) FROM gift_logs WHERE session_id=s.id) as total_gifts, (SELECT COUNT(*) FROM chat_logs WHERE session_id=s.id) as total_chats FROM sessions s ORDER BY s.id DESC LIMIT 10').fetchall()
     recent_chats = conn.execute('''
         SELECT cl.user_name, cl.user_id, cl.content, cl.created_at as time,
