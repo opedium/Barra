@@ -8,6 +8,7 @@
 """
 
 import logging
+import logging.handlers
 import os
 import sys
 import threading
@@ -359,7 +360,7 @@ def setup_logger(log_dir='logs', log_level='INFO', multi_room=False):
     if log_enabled:
         os.makedirs(log_dir, exist_ok=True)
         log_file = os.path.join(log_dir, time.strftime('%Y-%m-%d') + '.log')
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler = build_log_file_handler(log_file)
         file_handler.setFormatter(logging.Formatter(
             '[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%m-%d %H:%M'
         ))
@@ -372,6 +373,19 @@ def setup_logger(log_dir='logs', log_level='INFO', multi_room=False):
 
     logger.addHandler(queue_handler)
     return logger, queue_handler
+
+
+def build_log_file_handler(log_file, max_bytes=64 * 1024 * 1024, backup_count=5):
+    """A size-capped rotating file handler for the app log.
+
+    Plain FileHandler grows a single per-day file without bound; on a slow
+    HDD a multi-hundred-MB log adds constant write pressure and makes
+    diagnostics painful. RotatingFileHandler caps each file at max_bytes
+    and keeps the last backup_count rotated files.
+    """
+    return logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=max_bytes, backupCount=backup_count, encoding='utf-8'
+    )
 
 
 logger = logging.getLogger(__name__)

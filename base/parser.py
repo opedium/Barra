@@ -346,6 +346,7 @@ _gift_enqueued = {}     # session_id -> record_gift 调用次数
 _chat_written = {}      # session_id -> _flush_write_batch 实际写入 chat_logs 行数
 _gift_written = {}      # session_id -> _flush_write_batch 实际写入 gift_logs 行数
 _combo_progress_count = 0  # 连击进度消息数（不计入 enq，被 buffer 吸收）
+_last_contrib_time = 0  # 上次提取贡献排行的时间戳（用于节流）
 
 
 def get_dedup_stats():
@@ -1096,6 +1097,44 @@ def parse_room_user_seq_msg(payload, enable_outputs=None):
                 'online_anchor': msg.online_user_for_anchor or '',
             },
         })
+
+    # ── 贡献排行（ranks_list）──
+    global _last_contrib_time
+    now = time.time()
+    if enable_outputs.get('contribution', True) and now - _last_contrib_time >= 10.0:
+        _last_contrib_time = now
+        contributors = list(msg.ranks_list)
+        if contributors:
+            seen = set()
+            for c in contributors:
+                if c.is_hidden:
+                    continue
+                uname = c.user.nickname or ''
+                uid = str(c.user.id) if c.user.id and str(c.user.id) != '0' else ''
+                if not uid and not uname:
+                    continue
+                dedup_key = uid or uname
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+
+                score = c.score or 0
+                rank = c.rank or 0
+                exactly_score = c.exactly_score or ''
+                score_desc = c.score_description or ''
+
+                results.append({
+                    'type': 'contribution',
+                    'msg': f"[贡献] #{rank} {uname} 值={score}" + (f' {score_desc}' if score_desc else ''),
+                    'data': {
+                        'user_id': uid,
+                        'user_name': uname,
+                        'score': score,
+                        'rank': rank,
+                        'exactly_score': exactly_score,
+                        'score_description': score_desc,
+                    },
+                })
 
     return results
 
@@ -1932,86 +1971,108 @@ import atexit
 atexit.register(_close_all_connections)
 
 # ── 启动时自动迁移旧表结构 ──
-try:
-    os.makedirs(DB_DIR, exist_ok=True)
-    _migrate_conn = sqlite3.connect(DB_PATH)
-    _migrate_conn.execute('PRAGMA journal_mode=WAL')
+# 只有旧库需要迁移时才执行。已迁移的库（存在 idx_gift_dedup_ts）直接跳过，
+# 避免每次启动都执行 journal_mode=DELETE —— 在 WAL 库上这会强制同步合并
+# 整个 WAL 文件（大 WAL + 慢磁盘 = 启动时 D 状态死锁，systemd 超时杀不掉）。
+def _migration_needed(conn):
+    """Whether the legacy schema migration block must run."""
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_gift_dedup_ts'"
+    ).fetchone()
+    return row is None
+
+
+def run_migration(conn):
+    """Run the legacy schema migrations (columns + dedup index).
+
+    Only called for DBs that still need migrating; the journal_mode switch
+    inside is what previously forced a full WAL checkpoint on every boot.
+    """
+    conn.execute('PRAGMA journal_mode=DELETE')
     try:
-        _migrate_conn.execute('ALTER TABLE users ADD COLUMN grade TEXT DEFAULT ""')
-        _migrate_conn.commit()
+        conn.execute('ALTER TABLE users ADD COLUMN grade TEXT DEFAULT ""')
+        conn.commit()
     except sqlite3.OperationalError:
         pass
     try:
-        _migrate_conn.execute('ALTER TABLE gift_logs ADD COLUMN grade TEXT DEFAULT ""')
-        _migrate_conn.execute('ALTER TABLE gift_logs ADD COLUMN fans_club TEXT DEFAULT ""')
-        _migrate_conn.commit()
+        conn.execute('ALTER TABLE gift_logs ADD COLUMN grade TEXT DEFAULT ""')
+        conn.execute('ALTER TABLE gift_logs ADD COLUMN fans_club TEXT DEFAULT ""')
+        conn.commit()
     except sqlite3.OperationalError:
         pass
     try:
-        _migrate_conn.execute('ALTER TABLE gift_logs ADD COLUMN group_id TEXT DEFAULT ""')
-        _migrate_conn.commit()
+        conn.execute('ALTER TABLE gift_logs ADD COLUMN group_id TEXT DEFAULT ""')
+        conn.commit()
     except sqlite3.OperationalError:
         pass
     try:
-        _migrate_conn.execute('ALTER TABLE gift_logs ADD COLUMN gift_id INTEGER DEFAULT 0')
-        _migrate_conn.commit()
+        conn.execute('ALTER TABLE gift_logs ADD COLUMN gift_id INTEGER DEFAULT 0')
+        conn.commit()
     except sqlite3.OperationalError:
         pass
     try:
-        _migrate_conn.execute('ALTER TABLE gift_logs ADD COLUMN to_user_id TEXT DEFAULT ""')
-        _migrate_conn.commit()
+        conn.execute('ALTER TABLE gift_logs ADD COLUMN to_user_id TEXT DEFAULT ""')
+        conn.commit()
     except sqlite3.OperationalError:
         pass
     try:
-        _migrate_conn.execute('ALTER TABLE gift_logs ADD COLUMN to_user_name TEXT DEFAULT ""')
-        _migrate_conn.commit()
+        conn.execute('ALTER TABLE gift_logs ADD COLUMN to_user_name TEXT DEFAULT ""')
+        conn.commit()
     except sqlite3.OperationalError:
         pass
     try:
-        _migrate_conn.execute('ALTER TABLE users ADD COLUMN sec_uid TEXT DEFAULT ""')
-        _migrate_conn.commit()
+        conn.execute('ALTER TABLE users ADD COLUMN sec_uid TEXT DEFAULT ""')
+        conn.commit()
     except sqlite3.OperationalError:
         pass
     try:
-        _migrate_conn.execute('ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT ""')
-        _migrate_conn.commit()
+        conn.execute('ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT ""')
+        conn.commit()
     except sqlite3.OperationalError:
         pass
     try:
-        _migrate_conn.execute('ALTER TABLE users ADD COLUMN notes TEXT DEFAULT ""')
-        _migrate_conn.commit()
+        conn.execute('ALTER TABLE users ADD COLUMN notes TEXT DEFAULT ""')
+        conn.commit()
     except sqlite3.OperationalError:
         pass
     try:
-        _migrate_conn.execute('ALTER TABLE users ADD COLUMN tags TEXT DEFAULT ""')
-        _migrate_conn.commit()
+        conn.execute('ALTER TABLE users ADD COLUMN tags TEXT DEFAULT ""')
+        conn.commit()
     except sqlite3.OperationalError:
         pass
     try:
-        _migrate_conn.execute('ALTER TABLE users ADD COLUMN display_id TEXT DEFAULT ""')
-        _migrate_conn.commit()
+        conn.execute('ALTER TABLE users ADD COLUMN display_id TEXT DEFAULT ""')
+        conn.commit()
     except sqlite3.OperationalError:
         pass
     try:
-        _migrate_conn.execute('ALTER TABLE users ADD COLUMN user_sec_id TEXT DEFAULT ""')
-        _migrate_conn.commit()
+        conn.execute('ALTER TABLE users ADD COLUMN user_sec_id TEXT DEFAULT ""')
+        conn.commit()
     except sqlite3.OperationalError:
         pass
     # 升级礼物去重索引：同一秒内同用户同礼物去重，不同秒的保留（防止 websocket 重放但不误伤连刷）
     try:
-        _migrate_conn.execute('DROP INDEX IF EXISTS idx_gift_dedup')
-        _migrate_conn.execute('DROP INDEX IF EXISTS idx_gift_logs_user')
-        _migrate_conn.execute('DROP INDEX IF EXISTS idx_gift_dedup_ts')
-        _migrate_conn.execute('DELETE FROM gift_logs WHERE rowid NOT IN (SELECT MIN(rowid) FROM gift_logs GROUP BY session_id, user_id, gift_name, diamond_total, gift_count, group_id)')
-        _migrate_conn.commit()
+        conn.execute('DROP INDEX IF EXISTS idx_gift_dedup')
+        conn.execute('DROP INDEX IF EXISTS idx_gift_logs_user')
+        conn.execute('DELETE FROM gift_logs WHERE rowid NOT IN (SELECT MIN(rowid) FROM gift_logs GROUP BY session_id, user_id, gift_name, diamond_total, gift_count, group_id)')
+        conn.commit()
     except sqlite3.Error:
         pass
     try:
-        _migrate_conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_gift_dedup_ts ON gift_logs(session_id, user_id, gift_name, diamond_total, gift_count, group_id)')
-        _migrate_conn.commit()
+        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_gift_dedup_ts ON gift_logs(session_id, user_id, gift_name, diamond_total, gift_count, group_id)')
+        conn.commit()
     except sqlite3.Error:
         pass
-    _migrate_conn.close()
+
+
+try:
+    os.makedirs(DB_DIR, exist_ok=True)
+    _migrate_conn = sqlite3.connect(DB_PATH)
+    try:
+        if _migration_needed(_migrate_conn):
+            run_migration(_migrate_conn)
+    finally:
+        _migrate_conn.close()
 except Exception:
     pass
 
@@ -2030,10 +2091,12 @@ def _get_conn():
     if not hasattr(_local, 'conn') or _local.conn is None:
         os.makedirs(DB_DIR, exist_ok=True)
         conn = sqlite3.connect(DB_PATH, check_same_thread=False, factory=WeakrefableConnection)
-        conn.execute('PRAGMA journal_mode=DELETE')
-        conn.execute('PRAGMA synchronous=NORMAL')
         conn.execute('PRAGMA busy_timeout=30000')
-        conn.execute('PRAGMA cache_size=-4000')
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA synchronous=NORMAL')
+        # Larger page cache keeps hot index pages resident in the process,
+        # cutting the 35s cold-read penalty on the slow HDD to ~instant.
+        conn.execute('PRAGMA cache_size=-20000')
         conn.execute('PRAGMA mmap_size=0')
         conn.execute('PRAGMA temp_store=MEMORY')
         conn.execute('PRAGMA foreign_keys=ON')
@@ -2053,22 +2116,26 @@ def _get_conn():
 def init_db():
     """Initialize DB schema on a dedicated connection to avoid writer-thread lock races."""
     conn = sqlite3.connect(DB_PATH, timeout=60)
-    conn.execute('PRAGMA journal_mode=DELETE')
-    conn.execute('PRAGMA synchronous=NORMAL')
     conn.execute('PRAGMA busy_timeout=30000')
-    conn.execute('PRAGMA cache_size=-4000')
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA synchronous=NORMAL')
+    conn.execute('PRAGMA cache_size=-20000')
     conn.execute('PRAGMA mmap_size=0')
     conn.execute('PRAGMA temp_store=MEMORY')
     conn.execute('PRAGMA foreign_keys=ON')
-    # 唯一索引已存在说明去重已完成，跳过全表扫描
-    if conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_gift_dedup_ts'").fetchone():
+    # 去重索引已存在 → 数据库已完成初始化，跳过 CREATE/MIGRATION
+    idx_exists = conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_gift_dedup_ts'").fetchone()
+    if idx_exists:
+        conn.commit()
+        conn.close()
+        logger.info(f"[DB] 已初始化 (fast skip): {DB_PATH}")
+        return True
+    # 唯一索引不存在 → 执行全表去重
+    try:
+        conn.execute('DELETE FROM gift_logs WHERE rowid NOT IN (SELECT MIN(rowid) FROM gift_logs GROUP BY session_id, user_id, gift_name, diamond_total, gift_count, group_id)')
+        conn.commit()
+    except sqlite3.Error:
         pass
-    else:
-        try:
-            conn.execute('DELETE FROM gift_logs WHERE rowid NOT IN (SELECT MIN(rowid) FROM gift_logs GROUP BY session_id, user_id, gift_name, diamond_total, gift_count, group_id)')
-            conn.commit()
-        except sqlite3.Error:
-            pass
     conn.executescript('''
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2240,10 +2307,12 @@ def init_db():
         );
     ''')
     # 兼容旧表：给 users 表补充 grade 字段
-    try:
-        conn.execute('ALTER TABLE users ADD COLUMN grade TEXT DEFAULT ""')
-    except Exception:
-        pass
+    for col, coltype in [('grade', 'TEXT DEFAULT ""'), ('display_id', 'TEXT DEFAULT ""'), ('sec_uid', 'TEXT DEFAULT ""'), ('avatar_url', 'TEXT DEFAULT ""'), ('notes', 'TEXT DEFAULT ""'), ('tags', 'TEXT DEFAULT ""'), ('is_anonymous', 'INTEGER DEFAULT 0'), ('anonymous_label', 'TEXT DEFAULT ""'), ('fans_club', 'TEXT DEFAULT ""')]:
+        if not conn.execute(f"SELECT name FROM pragma_table_info('users') WHERE name=?", (col,)).fetchone():
+            try:
+                conn.execute(f'ALTER TABLE users ADD COLUMN {col} {coltype}')
+            except Exception:
+                pass
     # 迁移旧版 gift_prices：移除废弃的 base_gift_name 和 notes 列
     try:
         conn.execute('ALTER TABLE gift_prices DROP COLUMN base_gift_name')
@@ -2256,22 +2325,19 @@ def init_db():
     # 迁移：补充新列（display_id，sec_uid，badge_url，fansclub_badge）
     for tbl in ('chat_logs', 'gift_logs'):
         for col, coltype in [('display_id', 'TEXT'), ('sec_uid', 'TEXT'), ('badge_url', 'TEXT'), ('fansclub_badge', 'TEXT')]:
-            try:
-                conn.execute(f'ALTER TABLE {tbl} ADD COLUMN {col} {coltype} DEFAULT ""')
-            except Exception:
-                pass
+            if not conn.execute(f"SELECT name FROM pragma_table_info('{tbl}') WHERE name=?", (col,)).fetchone():
+                try:
+                    conn.execute(f'ALTER TABLE {tbl} ADD COLUMN {col} {coltype} DEFAULT ""')
+                except Exception:
+                    pass
     # 清理僵尸场次：结束标记为"直播中"但开始时间超过 12 小时前的场次
     conn.execute("""
         UPDATE sessions SET end_time = start_time, status = 'ended'
         WHERE status = 'live' AND start_time < datetime('now', '+8 hours', '-12 hours')
     """)
-    # 数据库完整性检查
-    try:
-        integrity = conn.execute('PRAGMA integrity_check').fetchone()[0]
-        if integrity != 'ok':
-            logger.error(f"[DB] 完整性检查失败: {integrity}")
-    except Exception:
-        pass
+    # 数据库完整性检查 — module-level 的 DROP+CREATE 逻辑已有存索引检查避免 orphan，
+    # 且 1.5GB HDD 上 integrity_check 会挂死进程（Ds 状态），故跳过。
+    # 如需手动检查，请用 sqlite3 命令行执行：PRAGMA integrity_check;
     # 开启自动增量 VACUUM，防止文件无限膨胀
     try:
         conn.execute('PRAGMA auto_vacuum=INCREMENTAL')
@@ -2283,7 +2349,19 @@ def init_db():
     return True
 
 
-def init_gift_prices_table():
+def _auto_detect_needed(conn):
+    """Whether the gift_logs auto-detect scan must run.
+
+    The scan aggregates every gift_logs row to derive consensus prices.
+    On a large DB that takes minutes on slow disks, so it only runs when
+    gift_prices has no auto-detected rows yet (i.e. the very first boot).
+    Returns False once auto prices are present from a prior run.
+    """
+    row = conn.execute("SELECT COUNT(*) FROM gift_prices WHERE source = 'auto'").fetchone()
+    return (row[0] if row else 0) == 0
+
+
+def init_gift_prices_table(conn=None):
     """Populate gift_prices table from all available sources.
 
     Priority (higher = never overwritten by lower):
@@ -2295,7 +2373,8 @@ def init_gift_prices_table():
     Auto-detected entries are refreshed on each startup.
     Authoritative entries (override/registry) are INSERT OR IGNORE only.
     """
-    conn = _get_conn()
+    if conn is None:
+        conn = _get_conn()
 
     # Source 1: _GIFT_PRICE_OVERRIDE
     for name, price in _GIFT_PRICE_OVERRIDE.items():
@@ -2349,36 +2428,49 @@ def init_gift_prices_table():
         except Exception:
             pass
     # Source 4: Auto-detect from gift_logs (refresh on every startup)
-    auto_rows = conn.execute('''
-        SELECT gift_name, diamond_total / MAX(gift_count, 1) AS unit_price,
-               COUNT(*) AS occurrences
-        FROM gift_logs
-        WHERE gift_count > 0
-        GROUP BY gift_name
-        ORDER BY occurrences DESC
-    ''').fetchall()
+    # The scan aggregates ALL gift_logs rows — minutes on a large DB.
+    # Skip it once auto prices exist; authoritative sources above already
+    # seeded the table and the derived 'auto' rows persist across restarts.
+    if _auto_detect_needed(conn):
+        auto_rows = conn.execute('''
+            SELECT gift_name, diamond_total / MAX(gift_count, 1) AS unit_price,
+                   COUNT(*) AS occurrences
+            FROM gift_logs
+            WHERE gift_count > 0
+            GROUP BY gift_name
+            ORDER BY occurrences DESC
+        ''').fetchall()
 
-    # Upsert auto-detected prices (skip if authoritative source exists)
-    for row in auto_rows:
-        name = row['gift_name']
-        price = row['unit_price']
-        existing = conn.execute(
-            'SELECT source FROM gift_prices WHERE gift_name = ?', (name,)
-        ).fetchone()
-        if existing:
-            if existing['source'] == 'auto':
+        # Upsert auto-detected prices (skip if authoritative source exists)
+        for row in auto_rows:
+            name = row['gift_name']
+            price = row['unit_price']
+            existing = conn.execute(
+                'SELECT source FROM gift_prices WHERE gift_name = ?', (name,)
+            ).fetchone()
+            if existing:
+                if existing['source'] == 'auto':
+                    conn.execute('''
+                        UPDATE gift_prices
+                        SET diamond_count = ?, updated_at = datetime("now", "+8 hours")
+                        WHERE gift_name = ? AND source = 'auto'
+                    ''', (price, name))
+            else:
                 conn.execute('''
-                    UPDATE gift_prices
-                    SET diamond_count = ?, updated_at = datetime("now", "+8 hours")
-                    WHERE gift_name = ? AND source = 'auto'
-                ''', (price, name))
-        else:
-            conn.execute('''
-                INSERT INTO gift_prices (gift_name, diamond_count, source)
-                VALUES (?, ?, 'auto')
-            ''', (name, price))
+                    INSERT INTO gift_prices (gift_name, diamond_count, source)
+                    VALUES (?, ?, 'auto')
+                ''', (name, price))
 
-    conn.commit()
+        conn.commit()
+
+    # Ensure override/registry writes above are persisted even when the
+    # auto-detect scan was skipped (its commit only runs in the branch above).
+    try:
+        conn.commit()
+    except Exception:
+        pass
+
+    return conn
 
 
 def recalculate_gift_price(gift_name, new_price, old_price, notes=''):
@@ -2716,6 +2808,7 @@ def _writer_loop():
     conn = _get_conn()
     buf = []
     last_flush = time.time()
+    last_wal_check = time.time()
     while True:
         try:
             item = _write_queue.get(timeout=0.2)
@@ -2735,6 +2828,22 @@ def _writer_loop():
                 conn.commit()
                 _write_queue.task_done()
                 continue
+            if item[0] == 'upsert_rank':
+                _, session_id, uid, uname, score, rank = item
+                if uid:
+                    try:
+                        conn.execute('''
+                            INSERT INTO contributions
+                                (session_id, user_id, user_name, consume, rank, source)
+                            VALUES (?, ?, ?, ?, ?, 'websocket_rank')
+                            ON CONFLICT(session_id, user_id) DO UPDATE SET
+                                consume = MAX(contributions.consume, excluded.consume),
+                                rank = CASE WHEN excluded.rank > 0 THEN excluded.rank ELSE contributions.rank END
+                        ''', (session_id, uid, uname, score, rank))
+                    except Exception as _re:
+                        logger.error(f"[DB] upsert_rank error: {_re} | uid={uid} score={score}")
+                _write_queue.task_done()
+                continue
             buf.append(item)
             now = time.time()
             if len(buf) >= _WRITER_BATCH_SIZE or now - last_flush > _WRITER_FLUSH_INTERVAL:
@@ -2750,6 +2859,10 @@ def _writer_loop():
                     _write_queue.task_done()
                 buf = []
                 last_flush = time.time()
+            # Idle: bound the WAL so it never grows multi-GB on a slow disk.
+            if time.time() - last_wal_check > _WAL_CHECK_INTERVAL:
+                _bound_wal(conn)
+                last_wal_check = time.time()
         except Exception as _we:
             logger.error(f"[DB] 写者线程异常: {_we}")
             try:
@@ -2851,10 +2964,60 @@ def _flush_write_batch(conn, batch):
 
 
 # 启动写者线程（模块导入时自动启动）
-# 先初始化 schema，避免 writer 线程与主线程竞态
-init_db()
-init_gift_prices_table()
-_db_schema_inited = True
+# init_db / init_gift_prices_table 改为惰性初始化（在首次 get_conn() 时执行），
+# 避免因旧进程锁库导致模块导入崩溃（systemd 重叠重启场景）。
+
+# ── WAL 大小上限（防止 WAL 无限增长）──────────────────
+# 2026-08 事故根因：写者线程持续写入，autocheckpoint 在慢 HDD 上跟不上，
+# WAL 长到 1.5GB → 重启恢复要合并整个 WAL → 写路径死锁数小时。
+# 写者线程周期性做 PASSIVE checkpoint，把 WAL 控制在目标大小内。
+_WAL_TARGET_BYTES = 64 * 1024 * 1024   # 64MB，远小于灾难级的 GB
+_WAL_CHECK_INTERVAL = 30.0             # 每 30s 检查一次
+
+def _bound_wal(conn, target_bytes=None):
+    """Keep the WAL under ``target_bytes``.
+
+    Checks the on-disk WAL size (the ``wal_size`` pragma isn't available in
+    older SQLite builds). If it's over target, run a TRUNCATE checkpoint to
+    move committed frames into the main DB and reset the WAL file. Falls
+    back to PASSIVE (moves frames, no truncate) if the DB is busy.
+    """
+    if target_bytes is None:
+        target_bytes = _WAL_TARGET_BYTES
+    try:
+        wal_path = conn.execute('PRAGMA database_list').fetchall()
+        path = None
+        for row in wal_path:
+            if row[1] == 'main':
+                path = row[2]
+                break
+        if not path:
+            return
+        wal_file = path + '-wal'
+        if not os.path.exists(wal_file):
+            return
+        size = os.path.getsize(wal_file)
+        if size < target_bytes:
+            return
+        # Prefer TRUNCATE so the file physically shrinks; fall back to
+        # PASSIVE if another connection holds a read snapshot (busy>0).
+        try:
+            r = conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+            if r and r[0] > 0:
+                conn.execute('PRAGMA wal_checkpoint(PASSIVE)')
+        except Exception:
+            conn.execute('PRAGMA wal_checkpoint(PASSIVE)')
+    except Exception:
+        pass
+
+
+if not _db_schema_inited:
+    try:
+        init_db()
+        init_gift_prices_table()
+        _db_schema_inited = True
+    except Exception:
+        pass
 _writer_thread = threading.Thread(target=_writer_loop, daemon=True, name='db-writer')
 _writer_thread.start()
 
@@ -3716,8 +3879,8 @@ def query_session_detail(session_id, top_n=50):
                ) AS grade,
                u.sec_uid, u.avatar_url, u.notes, u.tags,
                c.qualified_1000, c.qualified_3000, c.qualified_10000, c.qualified_100000,
-               (SELECT COUNT(*) FROM gift_logs WHERE session_id = c.session_id AND user_id = c.user_id) as gift_count,
-               (SELECT COUNT(*) FROM chat_logs WHERE session_id = c.session_id AND user_id = c.user_id) as chat_count
+               COALESCE((SELECT COUNT(*) FROM gift_logs WHERE session_id = c.session_id AND user_id = c.user_id), 0) as gift_count,
+               COALESCE((SELECT COUNT(*) FROM chat_logs WHERE session_id = c.session_id AND user_id = c.user_id), 0) as chat_count
         FROM contributions c
         LEFT JOIN users u ON u.user_id = c.user_id
         JOIN sessions s ON s.id = c.session_id
@@ -3740,6 +3903,7 @@ def query_session_detail(session_id, top_n=50):
 def query_search(q, page=1, size=20):
     conn = _get_conn()
     offset = (page - 1) * size
+    # Step 1: try exact user_id match (fastest)
     rows = conn.execute('''
         SELECT DISTINCT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name,
                COALESCE(m.total_consume, 0) as total_consume,
@@ -3751,6 +3915,38 @@ def query_search(q, page=1, size=20):
         WHERE c.user_id = ?
         ORDER BY c.consume DESC LIMIT ? OFFSET ?
     ''', (q, size, offset)).fetchall()
+    if not rows and q.isdigit():
+        rows = conn.execute('''
+            SELECT DISTINCT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name,
+                   COALESCE(m.total_consume, 0) as total_consume,
+                   COALESCE(m.sessions_1000, 0) as sessions_1000, c.fans_club,
+                   u.sec_uid, u.avatar_url
+            FROM contributions c
+            LEFT JOIN monthly_stats m ON m.user_id = c.user_id AND m.year_month = strftime('%Y-%m', 'now')
+            LEFT JOIN users u ON u.user_id = c.user_id
+            WHERE c.user_id LIKE ?
+            ORDER BY c.consume DESC LIMIT ? OFFSET ?
+        ''', (f'%{q}%', size, offset)).fetchall()
+    # Step 2: try FTS5 full-text search on user name (fast)
+    if not rows:
+        uid_rows = conn.execute('''
+            SELECT rowid FROM users_fts WHERE users_fts MATCH ? ORDER BY rank LIMIT 20
+        ''', (q,)).fetchall()
+        if uid_rows:
+            ids = [r[0] for r in uid_rows]
+            placeholders = ','.join('?' * len(ids))
+            rows = conn.execute(f'''
+                SELECT DISTINCT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name,
+                       COALESCE(m.total_consume, 0) as total_consume,
+                       COALESCE(m.sessions_1000, 0) as sessions_1000, c.fans_club,
+                       u.sec_uid, u.avatar_url
+                FROM users u
+                LEFT JOIN contributions c ON c.user_id = u.user_id
+                LEFT JOIN monthly_stats m ON m.user_id = u.user_id AND m.year_month = strftime('%Y-%m', 'now')
+                WHERE u.rowid IN ({placeholders})
+                ORDER BY c.consume DESC LIMIT ? OFFSET ?
+            ''', (*ids, size, offset)).fetchall()
+    # Step 3: fall back to LIKE (HDD full scan, but limited to 20)
     if not rows:
         rows = conn.execute('''
             SELECT DISTINCT c.user_id, COALESCE(NULLIF(u.user_name, ''), c.user_name) AS user_name,
@@ -3766,20 +3962,39 @@ def query_search(q, page=1, size=20):
     return {'users': [dict(r) for r in rows], 'total': len(rows), 'page': page}
 
 
-def query_audit():
-    """审计诊断：去重健康、时间间隙、场次概览、损坏用户名检测。"""
-    conn = _get_conn()
-    result = {}
+def query_audit(db_path=None, cached_overview=None):
+    """审计诊断：去重健康、时间间隙、场次概览、损坏用户名检测。
 
+    Args:
+        db_path: 可选。用于测试或指向特定 DB；默认使用全局 DB。
+        cached_overview: 可选。传入已缓存的概览值（total_gifts 等），
+            避免每次打开审计页都全表扫描多 GB 的 gift_logs。
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    owns_conn = db_path != DB_PATH
+    conn = sqlite3.connect(db_path) if owns_conn else _get_conn()
+    conn.row_factory = sqlite3.Row
+    result = {}
     # ── 1. 总体概览 ──
-    overview = conn.execute('''
-        SELECT
-            (SELECT COUNT(*) FROM gift_logs) AS total_gifts,
-            (SELECT COALESCE(SUM(diamond_total), 0) FROM gift_logs) AS total_diamond,
-            (SELECT COUNT(*) FROM chat_logs) AS total_chats,
-            (SELECT COUNT(*) FROM sessions) AS total_sessions,
-            (SELECT COUNT(DISTINCT user_id) FROM gift_logs) AS gift_users
-    ''').fetchone()
+    if cached_overview:
+        # Use the cached dashboard snapshot — avoids 25s+ full-table scans.
+        overview = {
+            'total_gifts': cached_overview.get('total_gifts', 0),
+            'total_chats': cached_overview.get('total_chats', 0),
+            'total_sessions': cached_overview.get('total_sessions', 0),
+            'total_diamond': cached_overview.get('total_diamond', 0),
+            'gift_users': cached_overview.get('gift_users', 0),
+        }
+    else:
+        overview = conn.execute('''
+            SELECT
+                (SELECT COUNT(*) FROM gift_logs) AS total_gifts,
+                (SELECT COALESCE(SUM(diamond_total), 0) FROM gift_logs) AS total_diamond,
+                (SELECT COUNT(*) FROM chat_logs) AS total_chats,
+                (SELECT COUNT(*) FROM sessions) AS total_sessions,
+                (SELECT COUNT(DISTINCT user_id) FROM gift_logs) AS gift_users
+        ''').fetchone()
     result['overview'] = dict(overview)
 
     # ── 2. 去重健康状态 ──
@@ -3805,6 +4020,8 @@ def query_audit():
             'SELECT created_at FROM gift_logs WHERE session_id = ? ORDER BY created_at',
             (row['id'],)
         ).fetchall()
+        if len(times) > 10000:
+            times = times[-10000:]
         for i in range(1, len(times)):
             try:
                 prev = times[i-1]['created_at']
@@ -3921,7 +4138,36 @@ def query_audit():
         dedup_list.append(d)
     result['dedup_sessions'] = dedup_list
 
+    if owns_conn:
+        try:
+            conn.close()
+        except Exception:
+            pass
     return result
+
+
+# ── 审计结果缓存 ──
+# 审计页在每次打开时跑多个全表扫描（gap GROUP BY、场次聚合、坏名扫描），
+# 慢 HDD 上要 30s+ 导致页面超时。审计是诊断页，短 TTL 缓存完全够用。
+_audit_cache = {'data': None, 'ts': 0.0}
+_audit_cache_lock = threading.Lock()
+
+def cached_audit(ttl_seconds=60, cached_overview=None):
+    """Return the audit result, recomputed at most once per TTL."""
+    now = time.time()
+    with _audit_cache_lock:
+        if _audit_cache['data'] is not None and now - _audit_cache['ts'] < ttl_seconds:
+            return _audit_cache['data']
+        try:
+            data = query_audit(cached_overview=cached_overview)
+        except Exception as e:
+            # On failure, serve whatever we have; otherwise re-raise.
+            if _audit_cache['data'] is not None:
+                return _audit_cache['data']
+            raise
+        _audit_cache['data'] = data
+        _audit_cache['ts'] = time.time()
+        return data
 
 
 # ═══════════════════════════════════════════════════════════════
