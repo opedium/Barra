@@ -1,0 +1,95 @@
+﻿{% extends "base.html" %}
+{% block title %}用户消费与 LTV 预测{% endblock %}
+{% block content %}
+<div class="header">
+    <div class="header-left">
+        <h2>👤 用户消费 & LTV 预测</h2>
+        <span class="header-subtitle">单用户下场消费预测与生命周期价值 (LTV) 趋势模型</span>
+    </div>
+</div>
+
+<div class="card" style="margin-bottom: 20px;">
+    <div style="display: flex; gap: 12px; align-items: flex-end;">
+        <div style="flex: 1; max-width: 300px;">
+            <label style="display:block; font-size:12px; margin-bottom:4px; color:var(--text-muted);">用户 ID (UID)</label>
+            <input id="user-id-input" type="text" class="form-control" placeholder="输入用户 ID...">
+        </div>
+        <div>
+            <label style="display:block; font-size:12px; margin-bottom:4px; color:var(--text-muted);">预测期数 (场)</label>
+            <input id="n-input" type="number" class="form-control" value="5" min="1" max="20" style="width: 80px;">
+        </div>
+        <div>
+            <button class="btn btn-primary" onclick="queryUserPredict()">🔍 分析预测</button>
+        </div>
+    </div>
+</div>
+
+<div class="grid grid-2" style="margin-bottom: 20px;">
+    <div class="card">
+        <h3>💰 预测概览</h3>
+        <div id="user-summary" style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px;">
+            <div class="stat-box"><div class="stat-label">下场预计消费</div><div class="stat-value" id="val-next-spend">-</div></div>
+            <div class="stat-box"><div class="stat-label">消费趋势</div><div class="stat-value" id="val-trend">-</div></div>
+            <div class="stat-box"><div class="stat-label">历史平均单场</div><div class="stat-value" id="val-avg-spend">-</div></div>
+            <div class="stat-box"><div class="stat-label">预期追加 LTV (5场)</div><div class="stat-value" id="val-ltv">-</div></div>
+        </div>
+    </div>
+    <div class="card">
+        <h3>📈 累计 LTV 增长曲线</h3>
+        <div style="height: 250px; position: relative;">
+            <canvas id="ltv-chart"></canvas>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+var ltvChart = null;
+
+function queryUserPredict() {
+    const uid = document.getElementById('user-id-input').value.trim();
+    if (!uid) return;
+    const n = document.getElementById('n-input').value;
+
+    fetch(`/api/predict/user-spend?uid=${encodeURIComponent(uid)}`)
+        .then(r => r.json())
+        .then(d => {
+            if (d.error) return alert(d.error);
+            document.getElementById('val-next-spend').textContent = d.predicted_spend.toLocaleString() + ' 音浪';
+            document.getElementById('val-trend').textContent = d.trend;
+            document.getElementById('val-avg-spend').textContent = d.avg_spend.toLocaleString() + ' 音浪';
+        });
+
+    fetch(`/api/predict/user-ltv?uid=${encodeURIComponent(uid)}&n=${n}`)
+        .then(r => r.json())
+        .then(d => {
+            if (d.error) return;
+            document.getElementById('val-ltv').textContent = d.expected_additional_ltv.toLocaleString() + ' 音浪';
+            renderLtvChart(d);
+        });
+}
+
+function renderLtvChart(data) {
+    const ctx = document.getElementById('ltv-chart').getContext('2d');
+    const proj = data.projected_sessions || [];
+    const labels = proj.map(p => '未来第' + p.session_step + '场');
+    const values = proj.map(p => p.cumulative_ltv);
+
+    if (ltvChart) ltvChart.destroy();
+    ltvChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: '累计增量 LTV (音浪)',
+                data: values,
+                borderColor: '#10b981',
+                backgroundColor: 'rgba(16, 185, 129, 0.15)',
+                fill: true
+            }]
+        },
+        options: { responsive: true, maintainAspectRatio: false }
+    });
+}
+</script>
+{% endblock %}

@@ -1,0 +1,60 @@
+﻿{% extends "base.html" %}
+{% block title %}直播场次聚类画像{% endblock %}
+{% block content %}
+<div class="header">
+    <div class="header-left">
+        <h2>🔬 直播场次聚类画像 (K-Means)</h2>
+        <span class="header-subtitle">基于多维指标的场次模式归类与特征透视</span>
+    </div>
+</div>
+
+<div class="grid grid-2" style="margin-bottom: 20px;">
+    <div class="card">
+        <h3>📍 场次分布投影 (PCA 降维)</h3>
+        <div style="height: 320px; position: relative;">
+            <canvas id="cluster-chart"></canvas>
+        </div>
+    </div>
+    <div class="card">
+        <h3>📑 各类目场次均值特征</h3>
+        <div id="cluster-profiles" style="margin-top: 12px;"></div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+var clusterChart = null;
+fetch('/api/predict/clusters?k=4')
+    .then(r => r.json())
+    .then(d => {
+        if (d.error) return alert(d.error);
+        const ctx = document.getElementById('cluster-chart').getContext('2d');
+        const colors = ['#3b82f6', '#10b981', '#f59e0b', '#ec4899'];
+        const datasets = [];
+        for (let k = 0; k < d.n_clusters; k++) {
+            const pts = (d.sessions || []).filter(s => s.cluster === k).map(s => ({ x: s.pca_x, y: s.pca_y }));
+            datasets.push({
+                label: '类别 ' + (k + 1),
+                data: pts,
+                backgroundColor: colors[k % colors.length]
+            });
+        }
+        if (clusterChart) clusterChart.destroy();
+        clusterChart = new Chart(ctx, {
+            type: 'scatter',
+            data: { datasets: datasets },
+            options: { responsive: true, maintainAspectRatio: false }
+        });
+
+        const profDiv = document.getElementById('cluster-profiles');
+        profDiv.innerHTML = '';
+        (d.profiles || []).forEach((p, idx) => {
+            const card = document.createElement('div');
+            card.className = 'stat-box';
+            card.style.marginBottom = '8px';
+            card.innerHTML = `<b>类别 ${p.cluster_id + 1} (${p.count}场)</b>: 均音浪 ${p.avg_consume.toLocaleString()} | 均观众 ${p.avg_users} | 均礼物 ${p.avg_gifts}`;
+            profDiv.appendChild(card);
+        });
+    });
+</script>
+{% endblock %}

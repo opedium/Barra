@@ -1,0 +1,50 @@
+﻿{% extends "base.html" %}
+{% block title %}大客流失预警{% endblock %}
+{% block content %}
+<div class="header">
+    <div class="header-left">
+        <h2>⚠️ 大客流失预警</h2>
+        <span class="header-subtitle">监控核心大客活跃度与未到场流失风险</span>
+    </div>
+</div>
+
+<div class="card">
+    <table class="table">
+        <thead>
+            <tr>
+                <th>大客用户</th>
+                <th>历史总消费</th>
+                <th>活跃场次</th>
+                <th>最近到场</th>
+                <th>未活跃天数</th>
+                <th>流失风险评级</th>
+            </tr>
+        </thead>
+        <tbody id="churn-tbody">
+            <tr><td colspan="6" style="text-align:center;">正在评估流失风险...</td></tr>
+        </tbody>
+    </table>
+</div>
+
+<script>
+fetch('/api/predict/churn')
+    .then(r => r.json())
+    .then(d => {
+        const tbody = document.getElementById('churn-tbody');
+        tbody.innerHTML = '';
+        (d.whales || []).forEach(w => {
+            const tr = document.createElement('tr');
+            const badgeClass = w.risk_label === 'HIGH' ? 'badge-danger' : (w.risk_label === 'MEDIUM' ? 'badge-warning' : 'badge-success');
+            tr.innerHTML = `
+                <td><a href="/user?uid=${w.user_id}"><b>${w.user_name}</b></a></td>
+                <td>${w.total_consume.toLocaleString()}</td>
+                <td>${w.session_count}</td>
+                <td>${w.last_seen}</td>
+                <td>${w.days_inactive} 天</td>
+                <td><span class="badge ${badgeClass}">${w.risk_label} (${(w.churn_risk * 100).toFixed(0)}%)</span></td>
+            `;
+            tbody.appendChild(tr);
+        });
+    });
+</script>
+{% endblock %}

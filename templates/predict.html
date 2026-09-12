@@ -1,0 +1,215 @@
+﻿{% extends "base.html" %}
+{% block title %}AI 时序预测 (ARIMAX){% endblock %}
+{% block content %}
+<div class="header">
+    <div class="header-left">
+        <h2>📈 AI 时序预测 (ARIMAX)</h2>
+        <span class="header-subtitle">基于自回归移动平均与外生变量的直播音浪/收益预测模型</span>
+    </div>
+</div>
+
+<div class="card" style="margin-bottom: 20px;">
+    <div style="display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end;">
+        <div>
+            <label style="display:block; font-size:12px; margin-bottom:4px; color:var(--text-muted);">主播选择</label>
+            <select id="anchor-select" class="form-control" style="min-width: 150px;">
+                <option value="">全部主播</option>
+            </select>
+        </div>
+        <div>
+            <label style="display:block; font-size:12px; margin-bottom:4px; color:var(--text-muted);">预测期数 (Steps)</label>
+            <input id="steps-input" type="number" class="form-control" value="3" min="1" max="10" style="width: 80px;">
+        </div>
+        <div>
+            <label style="display:block; font-size:12px; margin-bottom:4px; color:var(--text-muted);">ARIMA 参数 (p,d,q)</label>
+            <input id="order-input" type="text" class="form-control" value="1,1,1" style="width: 100px;">
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px; padding-bottom: 8px;">
+            <input type="checkbox" id="auto-order" checked>
+            <label for="auto-order" style="cursor: pointer; font-size: 13px;">自动寻优 (Auto-ARIMA)</label>
+        </div>
+        <div>
+            <button class="btn btn-primary" onclick="loadPrediction()">🚀 运行预测</button>
+        </div>
+    </div>
+</div>
+
+<div class="grid grid-2" style="margin-bottom: 20px;">
+    <div class="card">
+        <h3>📊 场次音浪预测及置信区间</h3>
+        <div style="height: 350px; position: relative;">
+            <canvas id="session-chart"></canvas>
+        </div>
+    </div>
+    <div class="card">
+        <h3>📅 日度总音浪趋势预测</h3>
+        <div style="height: 350px; position: relative;">
+            <canvas id="daily-chart"></canvas>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <h3>⚙️ 模型评估指标与参数</h3>
+    <div id="metrics-container" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-top: 12px;">
+        <div class="stat-box">
+            <div class="stat-label">最佳阶数 (Order)</div>
+            <div class="stat-value" id="val-order">-</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-label">AIC / BIC 指标</div>
+            <div class="stat-value" id="val-aic">-</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-label">样本内 RMSE</div>
+            <div class="stat-value" id="val-rmse-in">-</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-label">测试集 RMSE</div>
+            <div class="stat-value" id="val-rmse-test">-</div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+var sessionChart = null;
+var dailyChart = null;
+
+function initAnchors() {
+    fetch('/api/predict/anchors')
+        .then(r => r.json())
+        .then(data => {
+            const sel = document.getElementById('anchor-select');
+            data.forEach(a => {
+                const opt = document.createElement('option');
+                opt.value = a.name;
+                opt.textContent = `${a.name} (${a.sessions}场)`;
+                sel.appendChild(opt);
+            });
+        });
+}
+
+function loadPrediction() {
+    const anchor = document.getElementById('anchor-select').value;
+    const steps = document.getElementById('steps-input').value;
+    const order = document.getElementById('order-input').value;
+    const auto = document.getElementById('auto-order').checked ? '1' : '0';
+
+    fetch(`/api/predict/session?anchor=${encodeURIComponent(anchor)}&steps=${steps}&order=${order}&auto=${auto}`)
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                alert('预测失败: ' + data.error);
+                return;
+            }
+            renderSessionChart(data);
+            document.getElementById('val-order').textContent = (data.order || []).join(',');
+            document.getElementById('val-aic').textContent = (data.aic || '-') + ' / ' + (data.bic || '-');
+            document.getElementById('val-rmse-in').textContent = (data.metrics && data.metrics.rmse_in_sample) || '-';
+            document.getElementById('val-rmse-test').textContent = (data.metrics && data.metrics.rmse_test) || '-';
+        });
+
+    fetch(`/api/predict/daily?steps=${steps}`)
+        .then(r => r.json())
+        .then(data => {
+            if (!data.error) {
+                renderDailyChart(data);
+            }
+        });
+}
+
+function renderSessionChart(data) {
+    const ctx = document.getElementById('session-chart').getContext('2d');
+    const hist = data.historical || [];
+    const labels = hist.map(h => '#' + h.session_id);
+    const histValues = hist.map(h => h.total_consume);
+    
+    const fc = data.forecast || [];
+    for (let i = 1; i <= fc.length; i++) {
+        labels.push('未来第' + i + '场');
+    }
+
+    const forecastData = new Array(hist.length - 1).fill(null);
+    if (histValues.length > 0) {
+        forecastData.push(histValues[histValues.length - 1]);
+    }
+    fc.forEach(v => forecastData.push(v));
+
+    if (sessionChart) sessionChart.destroy();
+    sessionChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    label: '历史音浪',
+                    data: histValues,
+                    borderColor: '#3b82f6',
+                    backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                    tension: 0.2,
+                    fill: true
+                },
+                {
+                    label: '预测音浪',
+                    data: forecastData,
+                    borderColor: '#10b981',
+                    borderDash: [5, 5],
+                    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                    tension: 0.2,
+                    fill: true
+                }
+            ]
+        },
+        options: { responsive: true, maintainAspectRatio: false }
+    });
+}
+
+function renderDailyChart(data) {
+    const ctx = document.getElementById('daily-chart').getContext('2d');
+    const hist = data.historical || [];
+    const labels = hist.map(h => h.date);
+    const histValues = hist.map(h => h.total_consume);
+    
+    const fc = data.forecast || [];
+    for (let i = 1; i <= fc.length; i++) {
+        labels.push('未来第' + i + '天');
+    }
+
+    const forecastData = new Array(hist.length - 1).fill(null);
+    if (histValues.length > 0) {
+        forecastData.push(histValues[histValues.length - 1]);
+    }
+    fc.forEach(v => forecastData.push(v));
+
+    if (dailyChart) dailyChart.destroy();
+    dailyChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    label: '日度历史',
+                    data: histValues,
+                    borderColor: '#8b5cf6',
+                    tension: 0.2
+                },
+                {
+                    label: '日度预测',
+                    data: forecastData,
+                    borderColor: '#f59e0b',
+                    borderDash: [5, 5],
+                    tension: 0.2
+                }
+            ]
+        },
+        options: { responsive: true, maintainAspectRatio: false }
+    });
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    initAnchors();
+    loadPrediction();
+});
+</script>
+{% endblock %}

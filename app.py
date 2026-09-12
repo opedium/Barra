@@ -38,6 +38,13 @@ from base.parser import (
     query_user_retention, query_big_spenders, query_silent_whales,
     get_flow_counters, get_combo_buffer_size,
 )
+from analysis.predictor import (
+    build_session_ts, fit_arimax, fit_arimax_generic, forecast_from_model, auto_arimax,
+    get_anchors as get_predict_anchors, get_daily_ts,
+    predict_layered, predict_counts,
+    predict_whale_logistic, predict_whale_churn, cluster_sessions,
+    predict_user_next_spend, predict_user_ltv,
+)
 from service.fetcher import DouyinBarrage
 from service.network import fetch_user_info_by_sec_uid, fetch_user_info_by_user_id, fetch_user_info
 
@@ -130,16 +137,6 @@ except Exception:
     os.makedirs(os.path.dirname(_secret_path), exist_ok=True)
     with open(_secret_path, 'w') as _sf:
         _sf.write(app.secret_key)
-
-# Cookie config: Hetzner port forwarding means the external port differs from internal.
-# Set SESSION_COOKIE_PATH to '/' and make no domain restriction so it works regardless of port.
-app.config.update(
-    SESSION_COOKIE_SECURE=False,
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE='Lax',
-    SESSION_COOKIE_DOMAIN=False,
-    SESSION_COOKIE_PATH='/',
-)
 
 # ── 认证装饰器 ────────────────────────────────────
 
@@ -2104,6 +2101,248 @@ def api_analytics_silent_whales():
         return jsonify({'error': str(e)}), 500
 
 
+# ═══════════════════════════════════════════════════════════════
+#  Time Series Prediction (ARIMAX)
+# ═══════════════════════════════════════════════════════════════
+
+@app.route('/predict')
+@require_auth
+def predict():
+    return render_template('predict.html', auth_enabled=bool(_web_config['password']))
+
+
+@app.route('/api/predict/anchors')
+@require_auth
+def api_predict_anchors():
+    try:
+        return jsonify([{'name': a, 'sessions': c} for a, c in get_predict_anchors()])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/predict/session')
+@require_auth
+def api_predict_session():
+    anchor = request.args.get('anchor', '')
+    steps = request.args.get('steps', 3, type=int)
+    order_str = request.args.get('order', '1,1,1')
+    auto = request.args.get('auto', '0') == '1'
+    try:
+        order = tuple(int(x) for x in order_str.split(','))
+    except Exception:
+        return jsonify({'error': 'Invalid order, use p,d,q format e.g. 1,1,1'}), 400
+
+    df = build_session_ts(anchor=anchor if anchor else None)
+    if df.empty:
+        return jsonify({'error': 'No session data found'}), 400
+
+    if auto:
+        result = auto_arimax(df)
+    else:
+        result = fit_arimax_generic(df, target_col='total_consume', order=order, log_transform=True)
+
+    if result is None or 'error' in result:
+        return jsonify({'error': result.get('error', 'Model failed') if result else 'No model converged'}), 400
+
+    ci_alpha = request.args.get('ci', 0.5, type=float)
+    fc = forecast_from_model(result, steps=steps, alpha=ci_alpha)
+
+    metrics = result.get('metrics', {})
+    return jsonify({
+        'n_obs': result.get('n_obs', 0),
+        'n_train': result.get('n_train', 0),
+        'n_test': result.get('n_test', 0),
+        'aic': round(result.get('aic', 0), 2) if result.get('aic') else None,
+        'bic': round(result.get('bic', 0), 2) if result.get('bic') else None,
+        'order': list(result.get('order', [])),
+        'exog_cols': result.get('exog_cols', []),
+        'params': {str(k): round(v, 4) if isinstance(v, (int, float)) else v for k, v in result.get('params', {}).items()},
+        'fitted_values': [round(v, 2) for v in result['fitted_values']],
+        'residuals': [round(v, 2) for v in result['residuals']],
+        'forecast': fc.get('forecast_values', []),
+        'conf_int_lower': fc.get('conf_int_lower', []),
+        'conf_int_upper': fc.get('conf_int_upper', []),
+        'historical': df[['session_id', 'start_time', 'total_consume']].to_dict(orient='records'),
+        'log_transformed': True,
+        'metrics': {
+            'rmse_in_sample': round(metrics['rmse_in_sample'], 2) if metrics.get('rmse_in_sample') is not None else None,
+            'smape_in_sample': round(metrics['smape_in_sample'], 2) if metrics.get('smape_in_sample') is not None else None,
+            'rmse_test': round(metrics['rmse_test'], 2) if metrics.get('rmse_test') is not None else None,
+            'smape_test': round(metrics['smape_test'], 2) if metrics.get('smape_test') is not None else None,
+            'test_predictions': [round(v, 2) for v in metrics.get('test_predictions', [])],
+        },
+    })
+
+
+@app.route('/api/predict/daily')
+@require_auth
+def api_predict_daily():
+    steps = request.args.get('steps', 3, type=int)
+    order_str = request.args.get('order', '1,1,1')
+    try:
+        order = tuple(int(x) for x in order_str.split(','))
+    except Exception:
+        return jsonify({'error': 'Invalid order'}), 400
+
+    df = get_daily_ts()
+    if df.empty or len(df) < 5:
+        return jsonify({'error': 'Not enough daily data'}), 400
+
+    result = fit_arimax_generic(df, target_col='total_consume',
+                                 exog_cols=['day_of_week', 'is_weekend', 'num_sessions'],
+                                 log_transform=True)
+    if 'error' in result:
+        return jsonify({'error': result['error']}), 400
+
+    fc = forecast_from_model(result, steps=steps)
+
+    return jsonify({
+        'n_obs': result['n_obs'],
+        'aic': round(result['aic'], 2),
+        'bic': round(result['bic'], 2),
+        'order': list(result['order']),
+        'params': {str(k): round(v, 4) if isinstance(v, (int, float)) else v for k, v in result['params'].items()},
+        'fitted_values': [round(v, 2) for v in result['fitted_values']],
+        'forecast': fc.get('forecast_values', []),
+        'conf_int_lower': fc.get('conf_int_lower', []),
+        'conf_int_upper': fc.get('conf_int_upper', []),
+        'historical': df[['date', 'total_consume', 'num_users', 'num_sessions']].to_dict(orient='records'),
+    })
+
+
+@app.route('/api/predict/layered')
+@require_auth
+def api_predict_layered():
+    anchor = request.args.get('anchor', '')
+    steps = request.args.get('steps', 3, type=int)
+    whale_threshold = request.args.get('whale_threshold', 50000, type=int)
+    exclude_top_n = request.args.get('exclude_top_n', 1, type=int)
+    try:
+        data = predict_layered(anchor=anchor if anchor else None,
+                               steps=steps,
+                               whale_threshold=whale_threshold,
+                               exclude_top_n=exclude_top_n)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/predict/counts')
+@require_auth
+def api_predict_counts():
+    anchor = request.args.get('anchor', '')
+    steps = request.args.get('steps', 3, type=int)
+    try:
+        data = predict_counts(anchor=anchor if anchor else None, steps=steps)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/user-predict')
+@require_auth
+def user_predict():
+    return render_template('user_predict.html', auth_enabled=bool(_web_config['password']))
+
+
+@app.route('/layer-predict')
+@require_auth
+def layer_predict():
+    return render_template('layer_predict.html', auth_enabled=bool(_web_config['password']))
+
+
+# ── Logistic Regression: 高消费用户到场概率预测 ──
+
+@app.route('/api/predict/whale-prob')
+@require_auth
+def api_whale_prob():
+    anchor = request.args.get('anchor', '')
+    try:
+        data = predict_whale_logistic(anchor=anchor if anchor else None)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/whale-prob')
+@require_auth
+def whale_prob_page():
+    return render_template('whale_prob.html', auth_enabled=bool(_web_config['password']))
+
+
+# ── 高消费用户流失预测 ──
+
+@app.route('/api/predict/churn')
+@require_auth
+def api_whale_churn():
+    anchor = request.args.get('anchor', '')
+    threshold = request.args.get('threshold', 50000, type=int)
+    try:
+        data = predict_whale_churn(anchor=anchor if anchor else None, whale_threshold=threshold)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/whale-churn')
+@require_auth
+def whale_churn_page():
+    return render_template('whale_churn.html', auth_enabled=bool(_web_config['password']))
+
+
+# ── 直播场次聚类 ──
+
+@app.route('/api/predict/clusters')
+@require_auth
+def api_session_clusters():
+    anchor = request.args.get('anchor', '')
+    n_clusters = request.args.get('k', 4, type=int)
+    try:
+        data = cluster_sessions(anchor=anchor if anchor else None, n_clusters=n_clusters)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/session-clusters')
+@require_auth
+def session_clusters_page():
+    return render_template('session_clusters.html', auth_enabled=bool(_web_config['password']))
+
+
+# ── 用户下一场消费预测 ──
+
+@app.route('/api/predict/user-spend')
+@require_auth
+def api_user_next_spend():
+    user_id = request.args.get('uid', '').strip()
+    if not user_id:
+        return jsonify({'error': 'Missing uid'}), 400
+    anchor = request.args.get('anchor', '')
+    try:
+        data = predict_user_next_spend(user_id, anchor=anchor if anchor else None)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ── 用户生命周期价值 (LTV) 预测 ──
+
+@app.route('/api/predict/user-ltv')
+@require_auth
+def api_user_ltv():
+    user_id = request.args.get('uid', '').strip()
+    if not user_id:
+        return jsonify({'error': 'Missing uid'}), 400
+    anchor = request.args.get('anchor', '')
+    n = request.args.get('n', 5, type=int)
+    try:
+        data = predict_user_ltv(user_id, anchor=anchor if anchor else None, n_sessions=n)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 def main():
     parser = argparse.ArgumentParser(description='弹幕后台管理面板')
     parser.add_argument('--host', default=_web_config['host'])
@@ -2129,7 +2368,7 @@ def main():
     print(f'[Flask] Starting http://{args.host}:{args.port}')
     print(f'[Flask] Database: {DB_PATH}')
     try:
-        app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
+        app.run(host=args.host, port=args.port, debug=args.debug)
     finally:
         _manager.shutdown_all()
 

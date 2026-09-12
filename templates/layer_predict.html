@@ -1,0 +1,77 @@
+﻿{% extends "base.html" %}
+{% block title %}分层消费预测{% endblock %}
+{% block content %}
+<div class="header">
+    <div class="header-left">
+        <h2>📊 分层消费预测 (Whale vs Regular)</h2>
+        <span class="header-subtitle">将直播场次收益解耦为高净值大客与大众用户的独立时序预测</span>
+    </div>
+</div>
+
+<div class="card" style="margin-bottom: 20px;">
+    <div style="display: flex; gap: 12px; align-items: flex-end;">
+        <div>
+            <label style="display:block; font-size:12px; margin-bottom:4px; color:var(--text-muted);">大客阈值 (音浪)</label>
+            <input id="whale-thresh" type="number" class="form-control" value="50000" style="width: 120px;">
+        </div>
+        <div>
+            <label style="display:block; font-size:12px; margin-bottom:4px; color:var(--text-muted);">预测期数</label>
+            <input id="layer-steps" type="number" class="form-control" value="3" style="width: 80px;">
+        </div>
+        <div>
+            <button class="btn btn-primary" onclick="loadLayerPredict()">🚀 预测</button>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div style="height: 380px; position: relative;">
+        <canvas id="layer-chart"></canvas>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+var layerChart = null;
+function loadLayerPredict() {
+    const t = document.getElementById('whale-thresh').value;
+    const s = document.getElementById('layer-steps').value;
+    fetch(`/api/predict/layered?whale_threshold=${t}&steps=${s}`)
+        .then(r => r.json())
+        .then(d => {
+            if (d.error) return alert(d.error);
+            const ctx = document.getElementById('layer-chart').getContext('2d');
+            const hist = d.historical || [];
+            const labels = hist.map(h => '#' + h.session_id);
+            for (let i = 1; i <= d.steps; i++) labels.push('预测+' + i);
+
+            const regHist = hist.map(h => h.regular_consume);
+            const whaleHist = hist.map(h => h.whale_consume);
+
+            const regFc = new Array(hist.length - 1).fill(null);
+            regFc.push(regHist[regHist.length - 1]);
+            (d.forecast_regular || []).forEach(v => regFc.push(v));
+
+            const whaleFc = new Array(hist.length - 1).fill(null);
+            whaleFc.push(whaleHist[whaleHist.length - 1]);
+            (d.forecast_whale || []).forEach(v => whaleFc.push(v));
+
+            if (layerChart) layerChart.destroy();
+            layerChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [
+                        { label: '大众历史', data: regHist, borderColor: '#3b82f6' },
+                        { label: '大客历史', data: whaleHist, borderColor: '#ec4899' },
+                        { label: '大众预测', data: regFc, borderColor: '#60a5fa', borderDash: [5, 5] },
+                        { label: '大客预测', data: whaleFc, borderColor: '#f472b6', borderDash: [5, 5] }
+                    ]
+                },
+                options: { responsive: true, maintainAspectRatio: false }
+            });
+        });
+}
+document.addEventListener('DOMContentLoaded', loadLayerPredict);
+</script>
+{% endblock %}
