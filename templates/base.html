@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
@@ -9,7 +9,7 @@
             if (t === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
         })();
     </script>
-    <title>{% block title %}弹幕后台{% endblock %} · StreamDash</title>
+    <title>{% block title %}å¼¹å¹•åŽå°{% endblock %} Â· StreamDash</title>
     <style>
         /* ================================================================
            DESIGN TOKENS
@@ -150,7 +150,7 @@
             box-shadow: 0 0 8px rgba(99,102,241,0.7);
         }
 
-        /* ── Nav dropdown ── */
+        /* â”€â”€ Nav dropdown â”€â”€ */
         .nav-dropdown {
             position: relative;
             display: inline-flex;
@@ -227,7 +227,7 @@
         .nav-search button:hover { background: var(--primary-dark); }
         .nav-search button:active { transform: scale(0.96); }
 
-        /* ── Search Autocomplete ── */
+        /* â”€â”€ Search Autocomplete â”€â”€ */
         .search-autocomplete {
             position: absolute; top: 100%; right: 0; width: 340px;
             max-height: 360px; overflow-y: auto;
@@ -973,7 +973,7 @@
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script>
-        /* ── Fetch with Timeout (must load before child template scripts) ── */
+        /* â”€â”€ Fetch with Timeout (must load before child template scripts) â”€â”€ */
         function fetchWithTimeout(url, options, timeoutMs) {
             timeoutMs = timeoutMs || 15000;
             var controller = new AbortController();
@@ -989,7 +989,7 @@
             }).catch(function(err) {
                 clearTimeout(timeoutId);
                 if (err.name === 'AbortError') {
-                    throw new Error('请求超时，请检查网络连接');
+                    throw new Error('è¯·æ±‚è¶…æ—¶ï¼Œè¯·æ£€æŸ¥ç½‘ç»œè¿žæŽ¥');
                 }
                 throw err;
             });
@@ -1003,7 +1003,7 @@
             <span class="brand-text">StreamDash</span>
         </div>
         <button class="nav-toggle" onclick="this.nextElementSibling.classList.toggle('open')" aria-label="Toggle navigation">&#9776;</button>
-        <div class="nav-links">
+                <div class="nav-links">
             <a href="/" class="{% if request.path == '/' %}active{% endif %}">仪表盘</a>
             <a href="/leaderboard" class="{% if request.path == '/leaderboard' %}active{% endif %}">积分榜</a>
             <div class="nav-dropdown">
@@ -1017,6 +1017,17 @@
             <a href="/sessions" class="{% if request.path == '/sessions' %}active{% endif %}">场次</a>
             <a href="/compare" class="{% if request.path == '/compare' %}active{% endif %}">对比</a>
             <div class="nav-dropdown">
+                <a class="{% if request.path in ['/predict','/user-predict','/layer-predict','/whale-prob','/whale-churn','/session-clusters'] %}active{% endif %}">预测 &#9662;</a>
+                <div class="nav-dropdown-content">
+                    <a href="/predict">📈 时序预测 (ARIMAX)</a>
+                    <a href="/user-predict">👤 用户消费 & LTV</a>
+                    <a href="/layer-predict">📊 分层消费预测</a>
+                    <a href="/whale-prob">🎯 高潜大客转化</a>
+                    <a href="/whale-churn">⚠️ 大客流失预警</a>
+                    <a href="/session-clusters">🔬 场次聚类画像</a>
+                </div>
+            </div>
+            <div class="nav-dropdown">
                 <a class="{% if request.path in ['/audit','/gift-prices'] %}active{% endif %}">审计 &#9662;</a>
                 <div class="nav-dropdown-content">
                     <a href="/audit">诊断</a>
@@ -1024,20 +1035,20 @@
                 </div>
             </div>
             <a href="/settings" class="{% if request.path == '/settings' %}active{% endif %}">设置</a>
-            {% if auth_enabled %}<a href="/logout" style="color:#f87171;">&#10149; 登出</a>{% endif %}
+            {% if auth_enabled %}<a href="/logout" style="color:#f87171;">&#10149; 退出</a>{% endif %}
         </div>
         <div class="nav-search">
             <div class="search-wrap" style="position:relative;">
                 <span class="search-icon">&#128269;</span>
-                <input name="uid" id="search-input" placeholder="搜索用户ID或昵称..." autocomplete="off"
+                <input name="uid" id="search-input" placeholder="æœç´¢ç”¨æˆ·IDæˆ–æ˜µç§°..." autocomplete="off"
                        oninput="handleSearchInput(this.value)"
                        onkeydown="handleSearchKeydown(event)"
                        onfocus="handleSearchFocus()">
                 <div class="search-autocomplete" id="search-dropdown"></div>
             </div>
-            <button type="button" onclick="return doSearch(document.getElementById('search-input').value.trim())">搜索</button>
+            <button type="button" onclick="return doSearch(document.getElementById('search-input').value.trim())">æœç´¢</button>
         </div>
-        <button id="theme-toggle" onclick="toggleTheme()" style="background:none;border:none;color:var(--text-muted);font-size:16px;cursor:pointer;padding:4px 8px;border-radius:4px;transition:color var(--transition-fast);margin-left:6px;" title="切换主题" aria-label="切换暗色/亮色模式">&#9728;&#65039;</button>
+        <button id="theme-toggle" onclick="toggleTheme()" style="background:none;border:none;color:var(--text-muted);font-size:16px;cursor:pointer;padding:4px 8px;border-radius:4px;transition:color var(--transition-fast);margin-left:6px;" title="åˆ‡æ¢ä¸»é¢˜" aria-label="åˆ‡æ¢æš—è‰²/äº®è‰²æ¨¡å¼">&#9728;&#65039;</button>
     </nav>
     <div class="container">
         {% block content %}{% endblock %}
@@ -1046,7 +1057,7 @@
     <div class="modal-overlay" id="csv-modal">
         <div class="modal-dialog">
             <div class="modal-header">
-                <h3>&#128196; 选择导出列</h3>
+                <h3>&#128196; é€‰æ‹©å¯¼å‡ºåˆ—</h3>
                 <button class="modal-close" onclick="closeCsvModal()">&times;</button>
             </div>
             <div class="modal-body">
@@ -1054,17 +1065,17 @@
             </div>
             <div class="modal-footer">
                 <div class="btn-group-sm">
-                    <button class="btn-ghost" onclick="csvModalSelectAll()">全选</button>
-                    <button class="btn-ghost" onclick="csvModalDeselectAll()">取消全选</button>
+                    <button class="btn-ghost" onclick="csvModalSelectAll()">å…¨é€‰</button>
+                    <button class="btn-ghost" onclick="csvModalDeselectAll()">å–æ¶ˆå…¨é€‰</button>
                 </div>
-                <button class="btn-primary" id="csv-modal-export" onclick="csvModalExport()">&#x2B06; 导出</button>
+                <button class="btn-primary" id="csv-modal-export" onclick="csvModalExport()">&#x2B06; å¯¼å‡º</button>
             </div>
         </div>
     </div>
 
     <div class="toast-container" id="toast-container"></div>
     <script>
-        /* ── Dark Mode ── */
+        /* â”€â”€ Dark Mode â”€â”€ */
         function toggleTheme() {
             var current = document.documentElement.getAttribute('data-theme');
             var next = current === 'dark' ? '' : 'dark';
@@ -1082,7 +1093,7 @@
             }
         })();
 
-        /* ── Toast System ── */
+        /* â”€â”€ Toast System â”€â”€ */
         function showToast(msg, type) {
             var container = document.getElementById('toast-container');
             var t = document.createElement('div');
@@ -1098,7 +1109,7 @@
             }, 3000);
         }
 
-        /* ── Nav Search ── */
+        /* â”€â”€ Nav Search â”€â”€ */
         function doSearch(q) {
             if (!q) return false;
             hideDropdown();
@@ -1121,7 +1132,7 @@
             return false;
         }
 
-        /* ── Search Autocomplete ── */
+        /* â”€â”€ Search Autocomplete â”€â”€ */
         var _searchTimer = null;
         var _searchActiveIndex = -1;
         var _searchResults = [];
@@ -1145,7 +1156,7 @@
         function renderDropdown(users, query) {
             var dd = document.getElementById('search-dropdown');
             if (!users || users.length === 0) {
-                dd.innerHTML = '<div class="ac-empty">未找到匹配用户</div>';
+                dd.innerHTML = '<div class="ac-empty">æœªæ‰¾åˆ°åŒ¹é…ç”¨æˆ·</div>';
                 dd.classList.add('open');
                 _searchVisible = true;
                 return;
@@ -1161,7 +1172,7 @@
                         '<div class="ac-name">' + highlightMatch(u.user_name, query) + '</div>' +
                         '<div class="ac-id">' + u.user_id + '</div>' +
                     '</div>' +
-                    '<div style="font-size:11px;color:var(--text-muted);">' + ((u.consume || u.total_consume || 0)).toLocaleString() + ' 音浪</div>' +
+                    '<div style="font-size:11px;color:var(--text-muted);">' + ((u.consume || u.total_consume || 0)).toLocaleString() + ' éŸ³æµª</div>' +
                 '</div>';
             });
             dd.innerHTML = html;
@@ -1235,7 +1246,7 @@
             }
         });
 
-        /* ── Close mobile nav on link click ── */
+        /* â”€â”€ Close mobile nav on link click â”€â”€ */
         document.querySelectorAll('.nav-links a').forEach(function(a) {
             if (!a.getAttribute('href')) return;
             a.addEventListener('click', function() {
@@ -1252,7 +1263,7 @@
             });
         });
 
-        /* ── CSV Column Selector Modal ── */
+        /* â”€â”€ CSV Column Selector Modal â”€â”€ */
         var _csvExportUrl = '';
         function showCsvColumnSelector(url, columns) {
             _csvExportUrl = url;
@@ -1261,7 +1272,7 @@
             columns.forEach(function(col) {
                 var item = document.createElement('div');
                 item.className = 'col-item';
-                var id = 'csv-col-' + col.replace(/[^a-zA-Z0-9一-鿿]/g, '_');
+                var id = 'csv-col-' + col.replace(/[^a-zA-Z0-9ä¸€-é¿¿]/g, '_');
                 item.innerHTML =
                     '<input type="checkbox" id="' + id + '" value="' + col + '" checked>' +
                     '<label for="' + id + '">' + col + '</label>';
@@ -1290,7 +1301,7 @@
                 checked.push(cb.value);
             });
             if (checked.length === 0) {
-                showToast('请至少选择一列', 'warning');
+                showToast('è¯·è‡³å°‘é€‰æ‹©ä¸€åˆ—', 'warning');
                 return;
             }
             var sep = _csvExportUrl.indexOf('?') === -1 ? '?' : '&';

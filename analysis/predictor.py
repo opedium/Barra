@@ -41,7 +41,7 @@ def _calculate_metrics(y_true, y_pred):
     denom = (np.abs(y_true) + np.abs(y_pred)) / 2.0
     denom[denom == 0] = 1e-8
     smape = float(np.mean(np.abs(y_pred - y_true) / denom) * 100)
-    return {'rmse': rmse, 'smape': smape}
+    return {'rmse': round(rmse, 2), 'smape': round(smape, 2)}
 
 
 def get_anchors():
@@ -63,26 +63,25 @@ def get_anchors():
 
 def build_session_ts(anchor=None):
     """
-    Query sessions table and construct a DataFrame suitable for time series forecasting.
-    Columns: session_id, start_time, anchor_name, total_consume, total_users, total_messages, total_gifts, day_of_week, is_weekend, hour
+    Query sessions table and aggregate contributions/logs to build a time-series DataFrame.
     """
     conn = _get_conn()
     try:
         query = """
-            SELECT id AS session_id, anchor_name, start_time, end_time,
-                   COALESCE(total_consume, 0) as total_consume,
-                   COALESCE(total_users, 0) as total_users,
-                   COALESCE(total_messages, 0) as total_messages,
-                   COALESCE(total_gifts, 0) as total_gifts
-            FROM sessions
-            WHERE start_time IS NOT NULL
+            SELECT s.id AS session_id, s.anchor_name, s.start_time, s.end_time,
+                   COALESCE((SELECT SUM(consume) FROM contributions WHERE session_id = s.id), 0) AS total_consume,
+                   COALESCE((SELECT COUNT(DISTINCT user_id) FROM contributions WHERE session_id = s.id), 0) AS total_users,
+                   COALESCE((SELECT COUNT(*) FROM chat_logs WHERE session_id = s.id), 0) AS total_messages,
+                   COALESCE((SELECT COUNT(*) FROM gift_logs WHERE session_id = s.id), 0) AS total_gifts
+            FROM sessions s
+            WHERE s.start_time IS NOT NULL
         """
         params = []
         if anchor:
-            query += " AND anchor_name = ?"
+            query += " AND s.anchor_name = ?"
             params.append(anchor)
-        query += " ORDER BY datetime(start_time) ASC"
-        
+        query += " ORDER BY datetime(s.start_time) ASC"
+
         df = pd.read_sql_query(query, conn, params=params)
         if df.empty:
             return df
@@ -100,21 +99,21 @@ def build_session_ts(anchor=None):
 def get_daily_ts(anchor=None):
     """
     Aggregate session statistics daily.
-    Columns: date, total_consume, num_users, num_sessions, day_of_week, is_weekend
     """
     conn = _get_conn()
     try:
         query = """
-            SELECT strftime('%Y-%m-%d', start_time) AS date,
-                   SUM(COALESCE(total_consume, 0)) AS total_consume,
-                   SUM(COALESCE(total_users, 0)) AS num_users,
-                   COUNT(id) AS num_sessions
-            FROM sessions
-            WHERE start_time IS NOT NULL
+            SELECT strftime('%Y-%m-%d', s.start_time) AS date,
+                   COALESCE(SUM(c.consume), 0) AS total_consume,
+                   COUNT(DISTINCT s.id) AS num_sessions,
+                   COUNT(DISTINCT c.user_id) AS num_users
+            FROM sessions s
+            LEFT JOIN contributions c ON c.session_id = s.id
+            WHERE s.start_time IS NOT NULL
         """
         params = []
         if anchor:
-            query += " AND anchor_name = ?"
+            query += " AND s.anchor_name = ?"
             params.append(anchor)
         query += " GROUP BY date ORDER BY date ASC"
 
@@ -166,7 +165,6 @@ def fit_arimax_generic(df, target_col='total_consume', exog_cols=None, order=(1,
             best_res = model.fit()
         except Exception:
             try:
-                # Try simple AR(1)
                 model = ARIMA(y_train, order=(1, 0, 0))
                 best_res = model.fit()
             except Exception:
@@ -175,7 +173,6 @@ def fit_arimax_generic(df, target_col='total_consume', exog_cols=None, order=(1,
         fallback = True
 
     if fallback or best_res is None:
-        # Fallback simple exponential smoothing / moving average
         fitted = []
         last = y_train[0] if len(y_train) > 0 else 0
         for val in y_train:
@@ -187,13 +184,12 @@ def fit_arimax_generic(df, target_col='total_consume', exog_cols=None, order=(1,
         params = {'alpha': 0.6}
         residuals = y_train - fitted
     else:
-        fitted = best_res.fittedvalues
-        residuals = best_res.resid
-        aic = float(best_res.aic) if hasattr(best_res, 'aic') else 0.0
-        bic = float(best_res.bic) if hasattr(best_res, 'bic') else 0.0
-        params = {k: float(v) for k, v in dict(best_res.params).items()} if hasattr(best_res, 'params') else {}
+        fitted = np.array(best_res.fittedvalues)
+        residuals = np.array(best_res.resid)
+        aic = float(best_res.aic) if hasattr(best_res, 'aic') and not math.isnan(best_res.aic) else 0.0
+        bic = float(best_res.bic) if hasattr(best_res, 'bic') and not math.isnan(best_res.bic) else 0.0
+        params = {str(k): float(v) for k, v in dict(best_res.params).items()} if hasattr(best_res, 'params') else {}
 
-    # Inverse log transform for fitted values
     if log_transform:
         fitted_raw = np.expm1(np.clip(fitted, -20, 25))
         residuals_raw = y_raw[:len(fitted)] - fitted_raw
@@ -211,30 +207,29 @@ def fit_arimax_generic(df, target_col='total_consume', exog_cols=None, order=(1,
             try:
                 fc_test = best_res.forecast(steps=n_test, exog=exog_test)
                 if log_transform:
-                    test_preds = list(np.expm1(np.clip(fc_test, -20, 25)))
+                    test_preds = [round(float(x), 2) for x in np.expm1(np.clip(fc_test, -20, 25))]
                 else:
-                    test_preds = list(fc_test)
+                    test_preds = [round(float(x), 2) for x in fc_test]
             except Exception:
-                test_preds = [float(fitted_raw[-1])] * n_test
+                test_preds = [round(float(fitted_raw[-1]), 2)] * n_test
         else:
-            test_preds = [float(fitted_raw[-1])] * n_test
+            test_preds = [round(float(fitted_raw[-1]), 2)] * n_test
         test_metrics = _calculate_metrics(y_raw[n_train:], test_preds)
 
     return {
         'n_obs': n_obs,
         'n_train': n_train,
         'n_test': n_test,
-        'aic': aic,
-        'bic': bic,
-        'order': order,
+        'aic': round(aic, 2),
+        'bic': round(bic, 2),
+        'order': list(order),
         'exog_cols': exog_cols or [],
         'params': params,
-        'fitted_values': [float(x) for x in fitted_raw],
-        'residuals': [float(x) for x in residuals_raw],
+        'fitted_values': [round(float(x), 2) for x in fitted_raw],
+        'residuals': [round(float(x), 2) for x in residuals_raw],
         'model_res': best_res if not fallback else None,
         'log_transformed': log_transform,
         'last_value': float(y_raw[-1]),
-        'last_log_value': float(y[-1]),
         'metrics': {
             'rmse_in_sample': in_sample_metrics['rmse'],
             'smape_in_sample': in_sample_metrics['smape'],
@@ -250,7 +245,6 @@ def fit_arimax(df, order=(1, 1, 1), log_transform=True):
 
 
 def auto_arimax(df, target_col='total_consume', exog_cols=None, log_transform=True):
-    """Grid search ARIMA orders to find best AIC."""
     candidates = [(1, 1, 1), (1, 0, 1), (0, 1, 1), (1, 1, 0), (2, 1, 1), (1, 0, 0), (0, 1, 0)]
     best_result = None
     best_aic = float('inf')
@@ -271,7 +265,6 @@ def auto_arimax(df, target_col='total_consume', exog_cols=None, log_transform=Tr
 
 
 def forecast_from_model(result, steps=3, alpha=0.5):
-    """Generate future forecast and confidence intervals."""
     if not result or 'error' in result:
         return {'forecast_values': [], 'conf_int_lower': [], 'conf_int_upper': []}
 
@@ -302,7 +295,6 @@ def forecast_from_model(result, steps=3, alpha=0.5):
         except Exception:
             pass
 
-    # Simple trend / mean forecast fallback
     preds = [round(float(last_val * (1.0 + 0.02 * i)), 2) for i in range(1, steps + 1)]
     spread = last_val * 0.15
     lowers = [round(float(max(0, p - spread)), 2) for p in preds]
@@ -315,24 +307,12 @@ def forecast_from_model(result, steps=3, alpha=0.5):
 
 
 def predict_layered(anchor=None, steps=3, whale_threshold=50000, exclude_top_n=1):
-    """
-    Layered decomposition prediction: Whale spenders vs Regular spenders.
-    """
     conn = _get_conn()
     try:
-        # Get sessions
-        query = "SELECT id as session_id, start_time, COALESCE(total_consume, 0) as total_consume FROM sessions WHERE start_time IS NOT NULL"
-        params = []
-        if anchor:
-            query += " AND anchor_name = ?"
-            params.append(anchor)
-        query += " ORDER BY datetime(start_time) ASC"
-        sess_df = pd.read_sql_query(query, conn, params=params)
-
+        sess_df = build_session_ts(anchor=anchor)
         if sess_df.empty or len(sess_df) < 3:
             return {'error': 'Insufficient sessions for layered forecasting'}
 
-        # Calculate whale vs regular per session
         records = []
         for _, s in sess_df.iterrows():
             sid = s['session_id']
@@ -377,7 +357,6 @@ def predict_layered(anchor=None, steps=3, whale_threshold=50000, exclude_top_n=1
 
 
 def predict_counts(anchor=None, steps=3):
-    """Forecast user count and gift message counts."""
     df = build_session_ts(anchor=anchor)
     if df.empty or len(df) < 3:
         return {'error': 'Insufficient data'}
@@ -397,9 +376,6 @@ def predict_counts(anchor=None, steps=3):
 
 
 def predict_whale_logistic(anchor=None):
-    """
-    Logistic Regression model to predict likelihood of active users becoming high spenders (Whales).
-    """
     conn = _get_conn()
     try:
         query = """
@@ -418,10 +394,9 @@ def predict_whale_logistic(anchor=None):
         query += " GROUP BY c.user_id HAVING total_consume > 0"
 
         df = pd.read_sql_query(query, conn, params=params)
-        if df.empty or len(df) < 5:
+        if df.empty:
             return {'users': [], 'accuracy': 0, 'auc': 0, 'features': []}
 
-        # Whale threshold
         whale_thresh = 10000
         df['is_whale'] = (df['total_consume'] >= whale_thresh).astype(int)
 
@@ -436,10 +411,9 @@ def predict_whale_logistic(anchor=None):
             clf.fit(X_scaled, y)
             probs = clf.predict_proba(X_scaled)[:, 1]
             acc = float(accuracy_score(y, clf.predict(X_scaled)))
-            auc = float(roc_auc_score(y, probs))
-            weights = dict(zip(feature_cols, [float(w) for w in clf.coef_[0]]))
+            auc = float(roc_auc_score(y, probs)) if len(np.unique(y)) > 1 else 1.0
+            weights = dict(zip(feature_cols, [round(float(w), 4) for w in clf.coef_[0]]))
         else:
-            # Heuristic calculation
             probs = np.clip(df['total_consume'].values / float(whale_thresh), 0.01, 0.99)
             acc = 0.9
             auc = 0.85
@@ -472,12 +446,8 @@ def predict_whale_logistic(anchor=None):
 
 
 def predict_whale_churn(anchor=None, whale_threshold=50000):
-    """
-    Identify whales and predict risk of churn based on session recency and trend.
-    """
     conn = _get_conn()
     try:
-        # Get top whales
         query = """
             SELECT c.user_id, c.user_name,
                    COUNT(DISTINCT c.session_id) as session_count,
@@ -508,7 +478,6 @@ def predict_whale_churn(anchor=None, whale_threshold=50000):
             last_seen_dt = pd.to_datetime(r['last_seen'], errors='coerce')
             days_inactive = (now - last_seen_dt).days if pd.notnull(last_seen_dt) else 999
 
-            # Score churn risk: 0 (safe) to 1 (high risk)
             risk_score = min(1.0, max(0.0, days_inactive / 30.0))
             if risk_score >= 0.6:
                 churn_cnt += 1
@@ -542,9 +511,6 @@ def predict_whale_churn(anchor=None, whale_threshold=50000):
 
 
 def cluster_sessions(anchor=None, n_clusters=4):
-    """
-    Cluster stream sessions based on audience engagement and revenue dynamics.
-    """
     df = build_session_ts(anchor=anchor)
     if df.empty or len(df) < n_clusters:
         return {'error': 'Not enough session records to form clusters'}
@@ -558,7 +524,6 @@ def cluster_sessions(anchor=None, n_clusters=4):
         km = KMeans(n_clusters=min(n_clusters, len(df)), random_state=42, n_init=10)
         labels = km.fit_predict(X_s)
         
-        # 2D projection for plot
         pca = PCA(n_components=2)
         coords = pca.fit_transform(X_s)
     else:
@@ -589,9 +554,6 @@ def cluster_sessions(anchor=None, n_clusters=4):
 
 
 def predict_user_next_spend(user_id, anchor=None):
-    """
-    Predict next session spend for a specific user.
-    """
     conn = _get_conn()
     try:
         query = """
@@ -617,7 +579,6 @@ def predict_user_next_spend(user_id, anchor=None):
             pred = spends[0]
             trend = 'flat'
         else:
-            # Exponentially weighted average + linear trend
             weights = np.exp(np.linspace(-1, 0, len(spends)))
             weights /= weights.sum()
             exp_avg = float(np.sum(spends * weights))
@@ -641,15 +602,10 @@ def predict_user_next_spend(user_id, anchor=None):
 
 
 def predict_user_ltv(user_id, anchor=None, n_sessions=5):
-    """
-    Predict user Lifetime Value (LTV) across next N sessions.
-    """
     res = predict_user_next_spend(user_id, anchor=anchor)
     pred_spend = res.get('predicted_spend', 0.0)
-    avg_spend = res.get('avg_spend', 0.0)
     history = res.get('history', [])
     
-    # Decaying session participation expectation
     projected = []
     cum = 0.0
     for i in range(1, n_sessions + 1):
